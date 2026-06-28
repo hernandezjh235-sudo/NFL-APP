@@ -10,7 +10,7 @@ when no NFL prop feed is available, it shows clearly labeled preseason/demo exam
 the UI and workflow can be tested without confusing them as real bets.
 """
 
-import os, json, math, time, difflib, unicodedata
+import os, json, math, time, difflib, unicodedata, hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v1.4 — FULL PROP ECOSYSTEM + UNDERDOG MONEY LINE TAB"
+APP_VERSION = "NFL v1.5 — PHASE 6 DATABASE + MLB-STYLE LOGS + NO DEFENSIVE PROPS"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -33,6 +33,18 @@ REQUEST_LOG = LOCAL_DIR / "request_log.json"
 USAGE_FILE = LOCAL_DIR / "nfl_player_usage.csv"
 TEAM_CONTEXT_FILE = LOCAL_DIR / "nfl_team_context.json"
 INJURY_FILE = LOCAL_DIR / "nfl_injuries.json"
+
+# Phase 6 database outputs. These are built from last-season NFL data and then reused
+# by the projection engine the same way the MLB app reuses saved pitcher/team context.
+PHASE6_DIR = LOCAL_DIR / "phase6_nfl_database"
+PHASE6_DIR.mkdir(parents=True, exist_ok=True)
+PHASE6_PLAYER_LOG_FILE = PHASE6_DIR / "nfl_player_logs_last_season.csv"
+PHASE6_PLAYER_SUMMARY_FILE = PHASE6_DIR / "nfl_player_summary_last_season.csv"
+PHASE6_TEAM_CONTEXT_FILE = PHASE6_DIR / "nfl_team_context_last_season.json"
+PHASE6_DEFENSE_RANK_FILE = PHASE6_DIR / "nfl_defense_ranks_last_season.csv"
+PHASE6_TRAVEL_FILE = PHASE6_DIR / "nfl_travel_stadium_context.csv"
+
+NFL_LAST_SEASON = int(os.getenv("NFL_LAST_SEASON", "2025"))
 
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
@@ -148,6 +160,31 @@ ROLE_SAFETY_MINIMUMS = {
     "Field Goals Made": {},
     "Tackles + Assists": {"snap_share":60},
     "Sacks": {"snap_share":48, "pressure_rate":8},
+}
+
+# Offensive/Underdog-focused board. Defensive props were intentionally removed
+# because tackles/sacks are less stable and do not fit the MLB-style projection workflow.
+EXCLUDED_NFL_PROPS = {"Tackles + Assists", "Sacks"}
+for _excluded_prop in list(EXCLUDED_NFL_PROPS):
+    NFL_PROP_ALIASES.pop(_excluded_prop, None)
+    PROP_CONFIG.pop(_excluded_prop, None)
+    MIN_NFL_EDGE_UNITS.pop(_excluded_prop, None)
+    ROLE_SAFETY_MINIMUMS.pop(_excluded_prop, None)
+
+# Full 32-team stadium/travel map for Phase 6. Noise factors are intentionally small:
+# they tax road QB/pass volume and feed player-card context without overpowering usage data.
+TEAM_STADIUM_COORDS = {
+    "ARI": (33.5276, -112.2626), "ATL": (33.7554, -84.4008), "BAL": (39.2780, -76.6227),
+    "BUF": (42.7738, -78.7869), "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
+    "CIN": (39.0955, -84.5160), "CLE": (41.5061, -81.6995), "DAL": (32.7473, -97.0945),
+    "DEN": (39.7439, -105.0201), "DET": (42.3400, -83.0456), "GB": (44.5013, -88.0622),
+    "HOU": (29.6847, -95.4107), "IND": (39.7601, -86.1639), "JAX": (30.3239, -81.6373),
+    "KC": (39.0490, -94.4839), "LAC": (33.9535, -118.3392), "LAR": (33.9535, -118.3392),
+    "LV": (36.0908, -115.1830), "MIA": (25.9580, -80.2389), "MIN": (44.9738, -93.2580),
+    "NE": (42.0909, -71.2643), "NO": (29.9511, -90.0812), "NYG": (40.8135, -74.0745),
+    "NYJ": (40.8135, -74.0745), "PHI": (39.9008, -75.1675), "PIT": (40.4468, -80.0158),
+    "SEA": (47.5952, -122.3316), "SF": (37.4030, -121.9700), "TB": (27.9759, -82.5033),
+    "TEN": (36.1665, -86.7713), "WAS": (38.9077, -76.8645),
 }
 
 STADIUM_ENV = {
@@ -595,6 +632,261 @@ def fetch_underdog_nfl_moneylines():
     request_log("UNDERDOG_NFL_MONEYLINE_PULL", "FOUND" if clean else "NO_MONEYLINE_ROWS", endpoint_debug)
     return clean[:200]
 
+
+# ---------- MLB-style stable seeds + Phase 6 NFL database ----------
+def stable_projection_seed(*parts):
+    """Deterministic simulation seed borrowed from the MLB engine pattern.
+
+    Same player/prop/line/input context = same projection on refresh.
+    This avoids random card movement when nothing meaningful changed.
+    """
+    try:
+        raw = "|".join([str(p) for p in parts])
+        digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16)
+    except Exception:
+        return 20260628
+
+def great_circle_miles(team_a, team_b):
+    a = TEAM_STADIUM_COORDS.get(str(team_a or "").upper())
+    b = TEAM_STADIUM_COORDS.get(str(team_b or "").upper())
+    if not a or not b:
+        return None
+    lat1, lon1 = np.radians(a[0]), np.radians(a[1])
+    lat2, lon2 = np.radians(b[0]), np.radians(b[1])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    h = np.sin(dlat/2)**2 + np.cos(lat1)*np.cos(lat2)*np.sin(dlon/2)**2
+    return round(float(3958.8 * 2 * np.arcsin(np.sqrt(h))), 1)
+
+def nflverse_url(release, filename):
+    return f"https://github.com/nflverse/nflverse-data/releases/download/{release}/{filename}"
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nflverse_player_weekly_stats(season=NFL_LAST_SEASON):
+    url = nflverse_url("player_stats", f"stats_player_week_{int(season)}.csv")
+    try:
+        df = pd.read_csv(url)
+        request_log("NFLVERSE_PLAYER_WEEKLY", "OK", f"{season} rows={len(df)}")
+        return df
+    except Exception as e:
+        request_log("NFLVERSE_PLAYER_WEEKLY", "ERROR", e)
+        return pd.DataFrame()
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nflverse_schedules(season=NFL_LAST_SEASON):
+    url = nflverse_url("schedules", "schedules.csv")
+    try:
+        df = pd.read_csv(url)
+        if "season" in df.columns:
+            df = df[df["season"] == int(season)].copy()
+        request_log("NFLVERSE_SCHEDULES", "OK", f"{season} rows={len(df)}")
+        return df
+    except Exception as e:
+        request_log("NFLVERSE_SCHEDULES", "ERROR", e)
+        return pd.DataFrame()
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_nflverse_snap_counts(season=NFL_LAST_SEASON):
+    url = nflverse_url("snap_counts", f"snap_counts_{int(season)}.csv")
+    try:
+        df = pd.read_csv(url)
+        request_log("NFLVERSE_SNAP_COUNTS", "OK", f"{season} rows={len(df)}")
+        return df
+    except Exception as e:
+        request_log("NFLVERSE_SNAP_COUNTS", "ERROR", e)
+        return pd.DataFrame()
+
+def _phase6_sum_cols(df, cols):
+    return [c for c in cols if c in df.columns]
+
+def build_phase6_nfl_database(season=NFL_LAST_SEASON):
+    """Build last-season NFL player logs, player summaries, team context, defense ranks, and travel.
+
+    The output files are intentionally named to plug directly into the existing app hooks:
+    - nfl_player_usage.csv
+    - nfl_team_context.json
+    plus richer Phase 6 files under phase6_nfl_database/.
+    """
+    weekly = fetch_nflverse_player_weekly_stats(season)
+    schedules = fetch_nflverse_schedules(season)
+    snaps = fetch_nflverse_snap_counts(season)
+
+    diag = {"season": int(season), "status": "STARTED", "player_week_rows": int(len(weekly)), "schedule_rows": int(len(schedules)), "snap_rows": int(len(snaps))}
+    if weekly.empty:
+        diag["status"] = "NO_PLAYER_WEEKLY_DATA"
+        return diag
+
+    # Clean player logs for grading/backtesting by week.
+    logs = weekly.copy()
+    rename_candidates = {
+        "player_display_name": "player", "recent_team": "team", "opponent_team": "opp",
+        "position": "position", "week": "week", "season": "season"
+    }
+    for old, new in rename_candidates.items():
+        if old in logs.columns and new not in logs.columns:
+            logs[new] = logs[old]
+    for c in ["player", "team", "opp", "position"]:
+        if c not in logs.columns:
+            logs[c] = ""
+
+    # Add snap data when available.
+    if not snaps.empty:
+        snap_cols = [c for c in snaps.columns if c in ["season","week","team","player","player_display_name","pfr_player_name","offense_snaps","offense_pct","defense_snaps","defense_pct","st_snaps","st_pct"]]
+        s = snaps[snap_cols].copy()
+        if "player_display_name" in s.columns and "player" not in s.columns:
+            s["player"] = s["player_display_name"]
+        elif "pfr_player_name" in s.columns and "player" not in s.columns:
+            s["player"] = s["pfr_player_name"]
+        join_cols = [c for c in ["season","week","team","player"] if c in logs.columns and c in s.columns]
+        if len(join_cols) >= 3:
+            logs = logs.merge(s.drop_duplicates(join_cols), on=join_cols, how="left", suffixes=("","_snap"))
+
+    # Position-aware season summary.
+    group_cols = ["player","team","position"]
+    sum_cols = _phase6_sum_cols(logs, [
+        "attempts","completions","passing_yards","passing_tds","interceptions","sacks",
+        "carries","rushing_yards","rushing_tds","targets","receptions","receiving_yards",
+        "receiving_tds","air_yards","fantasy_points","fantasy_points_ppr",
+        "offense_snaps"
+    ])
+    summary = logs.groupby(group_cols, dropna=False)[sum_cols].sum(numeric_only=True).reset_index() if sum_cols else logs[group_cols].drop_duplicates()
+    games = logs.groupby(group_cols, dropna=False)["week"].nunique().reset_index(name="games_played")
+    summary = summary.merge(games, on=group_cols, how="left")
+    gp = summary["games_played"].replace(0, np.nan)
+    per_game_map = {
+        "attempts": "pass_attempts_pg", "completions": "completions_pg", "passing_yards": "passing_yards_pg",
+        "passing_tds": "passing_tds_pg", "interceptions": "interceptions_pg", "carries": "rush_attempts_pg",
+        "rushing_yards": "rushing_yards_pg", "targets": "targets_pg", "receptions": "receptions_pg",
+        "receiving_yards": "receiving_yards_pg", "air_yards": "air_yards_pg", "fantasy_points_ppr": "fantasy_points_pg",
+        "fantasy_points": "fantasy_points_std_pg"
+    }
+    for src, dst in per_game_map.items():
+        if src in summary.columns:
+            summary[dst] = (summary[src] / gp).round(3)
+
+    # Create app-ready usage features from last-season volume.
+    if "targets" in summary.columns:
+        team_targets = summary.groupby("team")["targets"].transform("sum").replace(0, np.nan)
+        summary["target_share"] = ((summary["targets"] / team_targets) * 100).round(2)
+    if "air_yards" in summary.columns:
+        team_air = summary.groupby("team")["air_yards"].transform("sum").replace(0, np.nan)
+        summary["air_yards_share"] = ((summary["air_yards"] / team_air) * 100).round(2)
+    if "carries" in summary.columns:
+        team_carries = summary.groupby("team")["carries"].transform("sum").replace(0, np.nan)
+        summary["carries_share"] = ((summary["carries"] / team_carries) * 100).round(2)
+    if "offense_snaps" in summary.columns:
+        team_max_snap = summary.groupby("team")["offense_snaps"].transform("max").replace(0, np.nan)
+        summary["snap_share"] = ((summary["offense_snaps"] / team_max_snap) * 100).round(2)
+    # Route participation needs charting route data later; use a conservative proxy now.
+    summary["route_participation"] = np.where(summary.get("position","").astype(str).isin(["WR","TE"]), np.minimum(98, summary.get("snap_share", 70).fillna(70) + 6), summary.get("snap_share", 60).fillna(60))
+    summary["red_zone_touch_share"] = np.nan
+
+    # Team offense context from player weekly stats.
+    team_rows = []
+    for team, g in logs.groupby("team"):
+        if not str(team).strip():
+            continue
+        games_team = max(1, g["week"].nunique() if "week" in g.columns else 17)
+        pass_att = safe_float(g["attempts"].sum()) if "attempts" in g.columns else 0
+        rush_att = safe_float(g["carries"].sum()) if "carries" in g.columns else 0
+        plays = (pass_att or 0) + (rush_att or 0)
+        team_rows.append({
+            "team": team,
+            "plays_pg": round(plays/games_team,2),
+            "pass_rate": round(100*(pass_att or 0)/max(1,plays),2),
+            "rush_rate": round(100*(rush_att or 0)/max(1,plays),2),
+            "pass_attempts_pg": round((pass_att or 0)/games_team,2),
+            "rush_attempts_pg": round((rush_att or 0)/games_team,2),
+        })
+    team_df = pd.DataFrame(team_rows)
+
+    # Defense ranks allowed by opponent, useful for prop matchup gates.
+    def_rows = []
+    if "opp" in logs.columns and str(logs["opp"].fillna("").sum()).strip():
+        for opp, g in logs.groupby("opp"):
+            games_opp = max(1, g["week"].nunique() if "week" in g.columns else 17)
+            def_rows.append({
+                "team": opp,
+                "pass_yards_allowed_pg": round((g["passing_yards"].sum() if "passing_yards" in g.columns else 0)/games_opp,2),
+                "rush_yards_allowed_pg": round((g["rushing_yards"].sum() if "rushing_yards" in g.columns else 0)/games_opp,2),
+                "rec_yards_allowed_pg": round((g["receiving_yards"].sum() if "receiving_yards" in g.columns else 0)/games_opp,2),
+                "receptions_allowed_pg": round((g["receptions"].sum() if "receptions" in g.columns else 0)/games_opp,2),
+            })
+    defense = pd.DataFrame(def_rows)
+    if not defense.empty:
+        # Low rank number = tougher defense.
+        defense["def_pass_rank"] = defense["pass_yards_allowed_pg"].rank(method="min", ascending=True).astype(int)
+        defense["def_run_rank"] = defense["rush_yards_allowed_pg"].rank(method="min", ascending=True).astype(int)
+        defense["def_role_rank"] = defense["rec_yards_allowed_pg"].rank(method="min", ascending=True).astype(int)
+
+    team_context = {}
+    for _, r in team_df.iterrows():
+        team = str(r["team"])
+        d = {k: (None if pd.isna(v) else float(v) if isinstance(v, (np.floating, float)) else int(v) if isinstance(v, (np.integer, int)) else v) for k,v in r.items() if k != "team"}
+        if not defense.empty and team in set(defense["team"].astype(str)):
+            dr = defense[defense["team"].astype(str) == team].iloc[0].to_dict()
+            for k in ["def_pass_rank","def_run_rank","def_role_rank"]:
+                d[k] = int(dr.get(k)) if pd.notna(dr.get(k)) else None
+        team_context[team] = d
+
+    # Travel/stadium context from schedules.
+    travel_rows = []
+    if not schedules.empty:
+        for _, r in schedules.iterrows():
+            away = r.get("away_team")
+            home = r.get("home_team")
+            if not away or not home:
+                continue
+            env = STADIUM_ENV.get(str(home), {})
+            travel_rows.append({
+                "season": int(season),
+                "week": r.get("week"),
+                "matchup": f"{away} @ {home}",
+                "away_team": away,
+                "home_team": home,
+                "travel_miles": great_circle_miles(away, home),
+                "stadium": env.get("stadium", ""),
+                "crowd": env.get("crowd", ""),
+                "noise": env.get("noise", 1.0),
+                "roof": env.get("roof", ""),
+                "surface": env.get("surface", ""),
+                "altitude": env.get("altitude", 0),
+                "game_date": r.get("gameday") or r.get("game_date") or r.get("game_id"),
+            })
+    travel = pd.DataFrame(travel_rows)
+
+    # Save Phase 6 files and app-ready hooks.
+    logs.to_csv(PHASE6_PLAYER_LOG_FILE, index=False)
+    summary.to_csv(PHASE6_PLAYER_SUMMARY_FILE, index=False)
+    if not defense.empty:
+        defense.to_csv(PHASE6_DEFENSE_RANK_FILE, index=False)
+    if not travel.empty:
+        travel.to_csv(PHASE6_TRAVEL_FILE, index=False)
+
+    app_usage_cols = [c for c in [
+        "player","team","position","snap_share","route_participation","target_share","air_yards_share",
+        "red_zone_touch_share","targets_pg","receptions_pg","rush_attempts_pg","carries_share",
+        "pass_attempts_pg","passing_yards_pg","rushing_yards_pg","receiving_yards_pg","fantasy_points_pg"
+    ] if c in summary.columns]
+    if app_usage_cols:
+        summary[app_usage_cols].to_csv(USAGE_FILE, index=False)
+    save_json(TEAM_CONTEXT_FILE, team_context)
+    save_json(PHASE6_TEAM_CONTEXT_FILE, team_context)
+
+    diag.update({
+        "status": "BUILT",
+        "player_log_file": str(PHASE6_PLAYER_LOG_FILE),
+        "player_summary_file": str(PHASE6_PLAYER_SUMMARY_FILE),
+        "usage_file": str(USAGE_FILE),
+        "team_context_file": str(TEAM_CONTEXT_FILE),
+        "defense_rank_file": str(PHASE6_DEFENSE_RANK_FILE),
+        "travel_file": str(PHASE6_TRAVEL_FILE),
+        "players": int(summary["player"].nunique()) if "player" in summary.columns else int(len(summary)),
+        "teams": int(len(team_context)),
+    })
+    return diag
+
 # ---------- optional real NFL data loaders ----------
 def _read_optional_csv(path):
     try:
@@ -889,7 +1181,7 @@ def project_row(row, sims=12000):
     if game_script_risk=="HIGH": sigma*=1.08
     if usage_quality < 72: sigma*=1.07
     collapse_prob, ceiling_prob = simulation_branch_rates(row, prop, injury_risk, game_script_risk)
-    seed=abs(hash(str(row.get('player','x'))+prop+str(line)))%(2**32)
+    seed=stable_projection_seed(row.get("player","x"), prop, line, row.get("team",""), row.get("opp",""), row.get("source",""))
     sim=simulate_prop_distribution(base, sigma, prop, sims, seed, collapse_prob, ceiling_prob)
 
     mean=float(np.mean(sim)); p50=float(np.percentile(sim,50)); p75=float(np.percentile(sim,75)); p90=float(np.percentile(sim,90)); p10=float(np.percentile(sim,10))
@@ -1022,7 +1314,7 @@ if 'show_feed_debug' in globals() and show_feed_debug:
     st.caption("Latest Underdog/API request log")
     st.dataframe(pd.DataFrame(req_log[-25:]), use_container_width=True, hide_index=True)
 
-tabs=st.tabs(["Today / Weekly Board", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Official Filter", "Save + Grade", "Learning Dashboard", "System Notes", "Money Line"])
+tabs=st.tabs(["Today / Weekly Board", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Official Filter", "Save + Grade", "Learning Dashboard", "Phase 6 Database", "System Notes", "Money Line"])
 
 with tabs[0]:
     st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
@@ -1177,10 +1469,55 @@ with tabs[7]:
     if learn: st.json(learn)
 
 with tabs[8]:
+    st.markdown("<div class='section-title-pro'>Phase 6 NFL Database</div>", unsafe_allow_html=True)
+    st.write("Builds last-season player logs, player summaries, team offense context, defensive ranks, stadium noise, and travel context.")
+    c1, c2 = st.columns([1,2])
+    with c1:
+        season_to_build = st.number_input("Last season to build", min_value=1999, max_value=2030, value=NFL_LAST_SEASON, step=1)
+        if st.button("Build / Refresh Phase 6 Database", use_container_width=True):
+            diag = build_phase6_nfl_database(int(season_to_build))
+            if diag.get("status") == "BUILT":
+                st.success(f"Phase 6 database built for {season_to_build}. Players: {diag.get('players')} · Teams: {diag.get('teams')}")
+            else:
+                st.warning(f"Phase 6 database not built: {diag.get('status')}")
+            st.json(diag)
+    with c2:
+        st.info("These files plug directly into the current projection engine: nfl_player_usage.csv and nfl_team_context.json. The richer logs stay in phase6_nfl_database for backtesting and learning.")
+        st.write("Generated files:")
+        st.code("\\n".join([
+            str(PHASE6_PLAYER_LOG_FILE),
+            str(PHASE6_PLAYER_SUMMARY_FILE),
+            str(PHASE6_TEAM_CONTEXT_FILE),
+            str(PHASE6_DEFENSE_RANK_FILE),
+            str(PHASE6_TRAVEL_FILE),
+            str(USAGE_FILE),
+            str(TEAM_CONTEXT_FILE),
+        ]))
+    if PHASE6_PLAYER_SUMMARY_FILE.exists():
+        st.subheader("Player Summary Preview")
+        try:
+            st.dataframe(pd.read_csv(PHASE6_PLAYER_SUMMARY_FILE).head(75), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not preview player summary: {e}")
+    if PHASE6_DEFENSE_RANK_FILE.exists():
+        st.subheader("Defense Rank Preview")
+        try:
+            st.dataframe(pd.read_csv(PHASE6_DEFENSE_RANK_FILE).head(40), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not preview defense ranks: {e}")
+    if PHASE6_TRAVEL_FILE.exists():
+        st.subheader("Travel / Stadium Context Preview")
+        try:
+            st.dataframe(pd.read_csv(PHASE6_TRAVEL_FILE).head(75), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not preview travel context: {e}")
+
+with tabs[9]:
     st.markdown("<div class='section-title-pro'>System Notes</div>", unsafe_allow_html=True)
     st.write("Built-in NFL modules included in this starter:")
     st.write("- Real snap %, route participation, target share, carries, air-yard share, red-zone usage")
     st.write("- Optional CSV/JSON data hooks: nfl_player_usage.csv, nfl_team_context.json, nfl_injuries.json")
+    st.write("- Phase 6 builder: last-season player logs, team offense, defensive ranks, snap usage, travel miles, stadium noise")
     st.write("- OL vs pass-rush, pressure rate, coverage grade, defensive role matchup, pass/run defense ranking")
     st.write("- Vegas total/spread, pace, pass rate, blowout branches, weather collapse games")
     st.write("- Injury exits and asymmetric collapse/ceiling simulation branches")
@@ -1188,7 +1525,7 @@ with tabs[8]:
     st.write("- Pure upside simulation: P10/P50/P75/P90")
     st.write("- Alt-line ladder and correlation builder")
     st.write("- Before/after snapshots, CLV-ready logs, final grading, learning scale")
-    st.write("- Expanded props: pass attempts, completions, rush attempts, longest reception/rush, kicking, tackles, sacks")
+    st.write("- Expanded offensive props: pass attempts, completions, rush attempts, longest reception/rush, kicking. Defensive tackles/sacks intentionally removed")
     st.write("- MLB-style Official Play Filter 2.0: probability, edge, data score, volatility, stability, and role-risk gates")
     st.write("- True calibration warmup from graded results with capped projection shifts")
     st.write("- Asymmetric NFL simulation with collapse/ceiling branches instead of clean normal-only outcomes")
