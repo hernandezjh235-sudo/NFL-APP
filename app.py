@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v1.5 — PHASE 6 DATABASE + MLB-STYLE LOGS + NO DEFENSIVE PROPS"
+APP_VERSION = "NFL v2.4 — PHASE 6 BUILDER 3.0 VERIFIED + SAVED DATABASE"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -43,6 +43,14 @@ PHASE6_PLAYER_SUMMARY_FILE = PHASE6_DIR / "nfl_player_summary_last_season.csv"
 PHASE6_TEAM_CONTEXT_FILE = PHASE6_DIR / "nfl_team_context_last_season.json"
 PHASE6_DEFENSE_RANK_FILE = PHASE6_DIR / "nfl_defense_ranks_last_season.csv"
 PHASE6_TRAVEL_FILE = PHASE6_DIR / "nfl_travel_stadium_context.csv"
+
+PHASE6_RAW_DIR = PHASE6_DIR / "_raw_cache"
+PHASE6_RAW_DIR.mkdir(parents=True, exist_ok=True)
+PHASE6_MANIFEST_FILE = PHASE6_DIR / "phase6_manifest.json"
+PHASE6_TEAM_ADVANCED_FILE = PHASE6_DIR / "nfl_team_advanced_last_season.csv"
+PHASE6_TRENCH_FILE = PHASE6_DIR / "nfl_trench_context_last_season.csv"
+PHASE6_RED_ZONE_FILE = PHASE6_DIR / "nfl_red_zone_usage_last_season.csv"
+PHASE6_OT_FILE = PHASE6_DIR / "nfl_overtime_context_last_season.csv"
 
 NFL_LAST_SEASON = int(os.getenv("NFL_LAST_SEASON", "2025"))
 
@@ -662,62 +670,498 @@ def great_circle_miles(team_a, team_b):
 def nflverse_url(release, filename):
     return f"https://github.com/nflverse/nflverse-data/releases/download/{release}/{filename}"
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_nflverse_player_weekly_stats(season=NFL_LAST_SEASON):
-    url = nflverse_url("player_stats", f"stats_player_week_{int(season)}.csv")
-    try:
-        df = pd.read_csv(url)
-        request_log("NFLVERSE_PLAYER_WEEKLY", "OK", f"{season} rows={len(df)}")
-        return df
-    except Exception as e:
-        request_log("NFLVERSE_PLAYER_WEEKLY", "ERROR", e)
-        return pd.DataFrame()
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_nflverse_schedules(season=NFL_LAST_SEASON):
-    url = nflverse_url("schedules", "schedules.csv")
+def _phase6_existing_database_ready():
+    """True when the saved Phase 6 database can be reused without downloading again."""
+    required = [PHASE6_PLAYER_LOG_FILE, PHASE6_PLAYER_SUMMARY_FILE, USAGE_FILE, TEAM_CONTEXT_FILE]
+    return all(Path(x).exists() and Path(x).stat().st_size > 50 for x in required)
+
+def _read_csv_cached(cache_path):
     try:
-        df = pd.read_csv(url)
+        if Path(cache_path).exists() and Path(cache_path).stat().st_size > 50:
+            return pd.read_csv(cache_path)
+    except Exception as e:
+        request_log(cache_path, "CACHE_READ_ERROR", e)
+    return pd.DataFrame()
+
+def _download_csv_with_persistent_cache(label, urls, cache_name, force_refresh=False):
+    """Download once, save locally, and reuse on every future app run.
+
+    This is intentionally different from st.cache_data: it writes the raw dataset into
+    nfl_engine/phase6_nfl_database/_raw_cache so Railway/GitHub/Streamlit deployments
+    can run from saved files instead of pulling the same last-season data every day.
+    """
+    cache_path = PHASE6_RAW_DIR / cache_name
+    if cache_path.exists() and not force_refresh:
+        df = _read_csv_cached(cache_path)
+        if not df.empty:
+            request_log(label, "LOCAL_CACHE", f"{cache_name} rows={len(df)}")
+            return df
+    last_error = ""
+    for url in urls:
+        try:
+            df = pd.read_csv(url)
+            if not df.empty:
+                df.to_csv(cache_path, index=False)
+                request_log(label, "DOWNLOADED", f"{url} rows={len(df)} -> {cache_path}")
+                return df
+        except Exception as e:
+            last_error = str(e)[:300]
+            request_log(label, "URL_FAILED", f"{url} :: {last_error}")
+    # If fresh download fails, keep using the prior saved copy instead of wiping the app.
+    df = _read_csv_cached(cache_path)
+    if not df.empty:
+        request_log(label, "FALLBACK_LOCAL_CACHE", f"download failed but cache exists rows={len(df)}")
+        return df
+    request_log(label, "NO_DATA", last_error)
+    return pd.DataFrame()
+
+def fetch_nflverse_player_weekly_stats(season=NFL_LAST_SEASON, force_refresh=False):
+    season = int(season)
+    urls = [
+        nflverse_url("player_stats", f"stats_player_week_{season}.csv"),
+        nflverse_url("player_stats", f"player_stats_{season}.csv"),
+        nflverse_url("player_stats", f"stats_player_week_{season}.csv.gz"),
+    ]
+    df = _download_csv_with_persistent_cache("NFLVERSE_PLAYER_WEEKLY", urls, f"stats_player_week_{season}.csv", force_refresh)
+    if not df.empty:
         if "season" in df.columns:
-            df = df[df["season"] == int(season)].copy()
-        request_log("NFLVERSE_SCHEDULES", "OK", f"{season} rows={len(df)}")
-        return df
-    except Exception as e:
-        request_log("NFLVERSE_SCHEDULES", "ERROR", e)
-        return pd.DataFrame()
+            df = df[df["season"].astype(str) == str(season)].copy()
+        if "week" in df.columns:
+            df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
+        # Keep regular-season rows when a game/season type column exists.
+        for tcol in ["season_type", "game_type"]:
+            if tcol in df.columns:
+                vals = df[tcol].astype(str).str.upper()
+                reg_mask = vals.isin(["REG", "REGULAR", "REGULAR_SEASON", "R"])
+                if reg_mask.any():
+                    df = df[reg_mask].copy()
+                break
+    return df
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_nflverse_snap_counts(season=NFL_LAST_SEASON):
-    url = nflverse_url("snap_counts", f"snap_counts_{int(season)}.csv")
-    try:
-        df = pd.read_csv(url)
-        request_log("NFLVERSE_SNAP_COUNTS", "OK", f"{season} rows={len(df)}")
-        return df
-    except Exception as e:
-        request_log("NFLVERSE_SNAP_COUNTS", "ERROR", e)
-        return pd.DataFrame()
+def fetch_nflverse_schedules(season=NFL_LAST_SEASON, force_refresh=False):
+    season = int(season)
+    urls = [
+        nflverse_url("schedules", "schedules.csv"),
+        nflverse_url("schedules", f"schedules_{season}.csv"),
+        nflverse_url("schedules", "schedules.csv.gz"),
+    ]
+    df = _download_csv_with_persistent_cache("NFLVERSE_SCHEDULES", urls, f"schedules_{season}.csv", force_refresh)
+    if not df.empty:
+        if "season" in df.columns:
+            df = df[df["season"].astype(str) == str(season)].copy()
+        for tcol in ["game_type", "season_type"]:
+            if tcol in df.columns:
+                vals = df[tcol].astype(str).str.upper()
+                reg_mask = vals.isin(["REG", "REGULAR", "REGULAR_SEASON", "R"])
+                if reg_mask.any():
+                    df = df[reg_mask].copy()
+                break
+    request_log("NFLVERSE_SCHEDULES", "READY", f"{season} rows={len(df)}")
+    return df
+
+def fetch_nflverse_snap_counts(season=NFL_LAST_SEASON, force_refresh=False):
+    season = int(season)
+    urls = [
+        nflverse_url("snap_counts", f"snap_counts_{season}.csv"),
+        nflverse_url("snap_counts", f"snap_counts_{season}.csv.gz"),
+    ]
+    df = _download_csv_with_persistent_cache("NFLVERSE_SNAP_COUNTS", urls, f"snap_counts_{season}.csv", force_refresh)
+    if not df.empty:
+        if "season" in df.columns:
+            df = df[df["season"].astype(str) == str(season)].copy()
+        if "week" in df.columns:
+            df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
+    return df
+
+def fetch_nflverse_pbp(season=NFL_LAST_SEASON, force_refresh=False):
+    """Optional full play-by-play pull for penalties, fumbles, red zone, EPA, OT, and trench proxies.
+
+    If this file is too large or unavailable in a deployment, the builder still completes from
+    weekly player stats + schedules + snaps. If it succeeds once, it is saved and reused.
+    """
+    season = int(season)
+    urls = [
+        nflverse_url("pbp", f"play_by_play_{season}.csv.gz"),
+        nflverse_url("play_by_play", f"play_by_play_{season}.csv.gz"),
+        nflverse_url("pbp", f"play_by_play_{season}.csv"),
+        nflverse_url("play_by_play", f"play_by_play_{season}.csv"),
+    ]
+    df = _download_csv_with_persistent_cache("NFLVERSE_PBP", urls, f"play_by_play_{season}.csv", force_refresh)
+    if not df.empty:
+        if "season" in df.columns:
+            df = df[df["season"].astype(str) == str(season)].copy()
+        if "week" in df.columns:
+            df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
+        for tcol in ["season_type", "game_type"]:
+            if tcol in df.columns:
+                vals = df[tcol].astype(str).str.upper()
+                reg_mask = vals.isin(["REG", "REGULAR", "REGULAR_SEASON", "R"])
+                if reg_mask.any():
+                    df = df[reg_mask].copy()
+                break
+    return df
 
 def _phase6_sum_cols(df, cols):
     return [c for c in cols if c in df.columns]
 
-def build_phase6_nfl_database(season=NFL_LAST_SEASON):
-    """Build last-season NFL player logs, player summaries, team context, defense ranks, and travel.
 
-    The output files are intentionally named to plug directly into the existing app hooks:
-    - nfl_player_usage.csv
-    - nfl_team_context.json
-    plus richer Phase 6 files under phase6_nfl_database/.
+def _clean_numeric(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df
+
+
+def _safe_group_sum(df, group_cols, sum_map):
+    """Aggregate only columns that exist and return a clean dataframe."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    work = df.copy()
+    actual = {}
+    for src, out in sum_map.items():
+        if src in work.columns:
+            work[src] = pd.to_numeric(work[src], errors="coerce").fillna(0)
+            actual[src] = out
+    if not actual:
+        return pd.DataFrame()
+    grouped = work.groupby(group_cols, dropna=False)[list(actual.keys())].sum(numeric_only=True).reset_index()
+    grouped = grouped.rename(columns=actual)
+    return grouped
+
+def _build_player_weekly_from_pbp(pbp, season=NFL_LAST_SEASON):
+    """Fallback player weekly builder from nflfastR play-by-play.
+
+    This fixes the NO_PLAYER_WEEKLY_DATA case. If the nflverse weekly-player file
+    fails or is missing for the selected season, the app builds weekly player logs
+    directly from play-by-play, saves them locally, and then uses them just like the
+    normal weekly-stat file on every future run.
     """
-    weekly = fetch_nflverse_player_weekly_stats(season)
-    schedules = fetch_nflverse_schedules(season)
-    snaps = fetch_nflverse_snap_counts(season)
+    if pbp is None or pbp.empty:
+        return pd.DataFrame()
+    df = pbp.copy()
+    if "season" in df.columns:
+        df = df[df["season"].astype(str) == str(int(season))].copy()
+    if "week" in df.columns:
+        df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
+    for tcol in ["season_type", "game_type"]:
+        if tcol in df.columns:
+            vals = df[tcol].astype(str).str.upper()
+            reg_mask = vals.isin(["REG", "REGULAR", "REGULAR_SEASON", "R"])
+            if reg_mask.any():
+                df = df[reg_mask].copy()
+            break
+    if df.empty:
+        return pd.DataFrame()
+    for c in ["pass_attempt","complete_pass","pass_touchdown","interception","sack","rush_attempt","rush_touchdown","air_yards","receiving_yards","rushing_yards","passing_yards","yards_gained","fumble","fumble_lost"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    base_cols = [c for c in ["season","week"] if c in df.columns]
+    if "posteam" not in df.columns:
+        return pd.DataFrame()
+    # Passing logs
+    pass_df = pd.DataFrame()
+    if "passer_player_name" in df.columns:
+        pdf = df[df["passer_player_name"].notna() & (df["passer_player_name"].astype(str).str.len() > 1)].copy()
+        if not pdf.empty:
+            if "passing_yards" not in pdf.columns:
+                pdf["passing_yards"] = np.where(pd.to_numeric(pdf.get("pass_attempt",0), errors="coerce").fillna(0).eq(1), pd.to_numeric(pdf.get("yards_gained",0), errors="coerce").fillna(0), 0)
+            pass_df = _safe_group_sum(pdf, base_cols+["posteam","defteam","passer_player_name"], {
+                "pass_attempt":"attempts", "complete_pass":"completions", "passing_yards":"passing_yards",
+                "pass_touchdown":"passing_tds", "interception":"interceptions", "sack":"sacks"
+            })
+            if not pass_df.empty:
+                pass_df = pass_df.rename(columns={"posteam":"team","defteam":"opp","passer_player_name":"player"})
+                pass_df["position"] = "QB"
+    # Rushing logs
+    rush_df = pd.DataFrame()
+    if "rusher_player_name" in df.columns:
+        rdf = df[df["rusher_player_name"].notna() & (df["rusher_player_name"].astype(str).str.len() > 1)].copy()
+        if not rdf.empty:
+            if "rushing_yards" not in rdf.columns:
+                rdf["rushing_yards"] = np.where(pd.to_numeric(rdf.get("rush_attempt",0), errors="coerce").fillna(0).eq(1), pd.to_numeric(rdf.get("yards_gained",0), errors="coerce").fillna(0), 0)
+            rush_df = _safe_group_sum(rdf, base_cols+["posteam","defteam","rusher_player_name"], {
+                "rush_attempt":"carries", "rushing_yards":"rushing_yards", "rush_touchdown":"rushing_tds", "fumble":"fumbles", "fumble_lost":"fumbles_lost"
+            })
+            if not rush_df.empty:
+                rush_df = rush_df.rename(columns={"posteam":"team","defteam":"opp","rusher_player_name":"player"})
+                rush_df["position"] = "RB"
+    # Receiving logs
+    rec_df = pd.DataFrame()
+    if "receiver_player_name" in df.columns:
+        cdf = df[df["receiver_player_name"].notna() & (df["receiver_player_name"].astype(str).str.len() > 1)].copy()
+        if not cdf.empty:
+            if "receiving_yards" not in cdf.columns:
+                cdf["receiving_yards"] = np.where(pd.to_numeric(cdf.get("complete_pass",0), errors="coerce").fillna(0).eq(1), pd.to_numeric(cdf.get("yards_gained",0), errors="coerce").fillna(0), 0)
+            cdf["targets_src"] = np.where(pd.to_numeric(cdf.get("pass_attempt",0), errors="coerce").fillna(0).eq(1), 1, 0)
+            rec_df = _safe_group_sum(cdf, base_cols+["posteam","defteam","receiver_player_name"], {
+                "targets_src":"targets", "complete_pass":"receptions", "receiving_yards":"receiving_yards",
+                "pass_touchdown":"receiving_tds", "air_yards":"air_yards", "fumble":"fumbles", "fumble_lost":"fumbles_lost"
+            })
+            if not rec_df.empty:
+                rec_df = rec_df.rename(columns={"posteam":"team","defteam":"opp","receiver_player_name":"player"})
+                rec_df["position"] = "REC"
+    keys = [c for c in ["season","week","team","opp","player"] if c in df.columns or c in ["team","opp","player"]]
+    frames = [x for x in [pass_df, rush_df, rec_df] if x is not None and not x.empty]
+    if not frames:
+        return pd.DataFrame()
+    # Outer merge all roles for dual-threat players; keep the most specific useful position.
+    out = frames[0]
+    for nxt in frames[1:]:
+        out = out.merge(nxt.drop(columns=["position"], errors="ignore"), on=[c for c in ["season","week","team","opp","player"] if c in out.columns and c in nxt.columns], how="outer")
+        if "position" not in out.columns:
+            out["position"] = ""
+    numeric_cols = [c for c in out.columns if c not in ["season","week","team","opp","player","position"]]
+    out[numeric_cols] = out[numeric_cols].apply(pd.to_numeric, errors="coerce").fillna(0)
+    # Improve position labels: QBs have attempts; receivers have targets/receptions; rush-only remains RB.
+    out["position"] = np.where(out.get("attempts",0).fillna(0) > 0, "QB", out.get("position", ""))
+    out["position"] = np.where((out.get("targets",0).fillna(0) > 0) & (out["position"].astype(str).isin(["", "RB"])), "WR/TE", out["position"])
+    out["position"] = out["position"].replace({"REC":"WR/TE", "":"RB"})
+    if "fantasy_points_ppr" not in out.columns:
+        out["fantasy_points_ppr"] = (
+            out.get("passing_yards",0)*0.04 + out.get("passing_tds",0)*4 - out.get("interceptions",0)*1 +
+            out.get("rushing_yards",0)*0.1 + out.get("rushing_tds",0)*6 +
+            out.get("receptions",0)*1 + out.get("receiving_yards",0)*0.1 + out.get("receiving_tds",0)*6 -
+            out.get("fumbles_lost",0)*2
+        ).round(3)
+    if "fantasy_points" not in out.columns:
+        out["fantasy_points"] = (out["fantasy_points_ppr"] - out.get("receptions",0)).round(3)
+    out = out.sort_values([c for c in ["season","week","team","player"] if c in out.columns]).reset_index(drop=True)
+    return out
 
-    diag = {"season": int(season), "status": "STARTED", "player_week_rows": int(len(weekly)), "schedule_rows": int(len(schedules)), "snap_rows": int(len(snaps))}
+def _build_schedules_from_pbp(pbp, season=NFL_LAST_SEASON):
+    """Fallback schedule builder from PBP when schedules.csv fails."""
+    if pbp is None or pbp.empty or "game_id" not in pbp.columns:
+        return pd.DataFrame()
+    df = pbp.copy()
+    if "season" in df.columns:
+        df = df[df["season"].astype(str) == str(int(season))].copy()
+    if "week" in df.columns:
+        df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
+    cols = [c for c in ["game_id","season","week","home_team","away_team","gameday","game_date","roof","surface"] if c in df.columns]
+    if not {"game_id","home_team","away_team"}.issubset(set(cols)):
+        return pd.DataFrame()
+    sched = df[cols].drop_duplicates("game_id").copy()
+    return sched
+
+def _save_position_specific_phase6_tables(summary):
+    """Cleaner previews and model inputs: no more generic all-zero tables."""
+    try:
+        if summary is None or summary.empty or "position" not in summary.columns:
+            return
+        work = summary.copy()
+        pos = work["position"].astype(str).str.upper()
+        qb_cols = [c for c in ["player","team","position","games_played","pass_attempts_pg","completions_pg","passing_yards_pg","passing_tds_pg","interceptions_pg","rush_attempts_pg","rushing_yards_pg","snap_share","red_zone_pass_attempts","fantasy_points_pg"] if c in work.columns]
+        rb_cols = [c for c in ["player","team","position","games_played","rush_attempts_pg","rushing_yards_pg","rushing_tds","targets_pg","receptions_pg","receiving_yards_pg","carries_share","snap_share","red_zone_carries","goal_line_touches","fantasy_points_pg"] if c in work.columns]
+        rec_cols = [c for c in ["player","team","position","games_played","targets_pg","receptions_pg","receiving_yards_pg","receiving_tds","target_share","air_yards_share","air_yards_pg","snap_share","route_participation","red_zone_targets","goal_line_touches","fantasy_points_pg"] if c in work.columns]
+        if qb_cols:
+            qbs = work[(pos == "QB") & (pd.to_numeric(work.get("pass_attempts_pg",0), errors="coerce").fillna(0) > 0)][qb_cols]
+            qbs.to_csv(PHASE6_DIR / "qb_summary_last_season.csv", index=False)
+        if rb_cols:
+            rbs = work[(pd.to_numeric(work.get("rush_attempts_pg",0), errors="coerce").fillna(0) > 0) & ~pos.eq("QB")][rb_cols]
+            rbs.to_csv(PHASE6_DIR / "rb_summary_last_season.csv", index=False)
+        if rec_cols:
+            recs = work[pd.to_numeric(work.get("targets_pg",0), errors="coerce").fillna(0) > 0][rec_cols]
+            recs.to_csv(PHASE6_DIR / "receiver_te_summary_last_season.csv", index=False)
+    except Exception as e:
+        request_log("PHASE6_POSITION_TABLES", "ERROR", e)
+
+def _first_present(df, names):
+    for n in names:
+        if n in df.columns:
+            return n
+    return None
+
+def _build_pbp_context(pbp):
+    """Create advanced team, defense, red-zone, OT, penalty, fumble, and trench context."""
+    empty = pd.DataFrame()
+    if pbp is None or pbp.empty:
+        return {}, empty, empty, empty, empty, empty
+    df = pbp.copy()
+    for c in ["pass_attempt","rush_attempt","penalty","fumble_lost","fumble","sack","qb_hit","touchdown","epa","success","yards_gained","air_yards","complete_pass"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    if "down" in df.columns:
+        df["down_num"] = pd.to_numeric(df["down"], errors="coerce")
+    else:
+        df["down_num"] = np.nan
+    if "yardline_100" in df.columns:
+        df["yardline_100_num"] = pd.to_numeric(df["yardline_100"], errors="coerce")
+    else:
+        df["yardline_100_num"] = np.nan
+    if "qtr" in df.columns:
+        df["qtr_num"] = pd.to_numeric(df["qtr"], errors="coerce")
+    else:
+        df["qtr_num"] = np.nan
+
+    team_context = {}
+    team_rows = []
+    if "posteam" in df.columns:
+        for team, g in df.dropna(subset=["posteam"]).groupby("posteam"):
+            plays_mask = ((g.get("pass_attempt",0)==1) | (g.get("rush_attempt",0)==1)) if "pass_attempt" in g.columns and "rush_attempt" in g.columns else pd.Series(True, index=g.index)
+            gp = max(1, g["game_id"].nunique() if "game_id" in g.columns else g["week"].nunique() if "week" in g.columns else 17)
+            plays = max(1, int(plays_mask.sum()))
+            pass_att = float(g.loc[plays_mask, "pass_attempt"].sum()) if "pass_attempt" in g.columns else 0.0
+            rush_att = float(g.loc[plays_mask, "rush_attempt"].sum()) if "rush_attempt" in g.columns else 0.0
+            early = g[g["down_num"].isin([1,2])] if "down_num" in g.columns else g.iloc[0:0]
+            rz = g[g["yardline_100_num"].between(1,20, inclusive="both")] if "yardline_100_num" in g.columns else g.iloc[0:0]
+            gl = g[g["yardline_100_num"].between(1,5, inclusive="both")] if "yardline_100_num" in g.columns else g.iloc[0:0]
+            row = {
+                "team": str(team),
+                "pbp_plays_pg": round(plays/gp,2),
+                "pbp_pass_rate": round(100*pass_att/max(1,pass_att+rush_att),2),
+                "pbp_rush_rate": round(100*rush_att/max(1,pass_att+rush_att),2),
+                "epa_per_play": round(float(g.loc[plays_mask,"epa"].mean()) if "epa" in g.columns and plays else 0,4),
+                "success_rate": round(100*float(g.loc[plays_mask,"success"].mean()) if "success" in g.columns and plays else 0,2),
+                "early_down_pass_rate": round(100*float(early.get("pass_attempt", pd.Series(dtype=float)).sum())/max(1,float(early.get("pass_attempt", pd.Series(dtype=float)).sum())+float(early.get("rush_attempt", pd.Series(dtype=float)).sum())),2) if not early.empty else 0,
+                "early_down_success_rate": round(100*float(early.get("success", pd.Series(dtype=float)).mean()),2) if not early.empty and "success" in early.columns else 0,
+                "red_zone_pass_rate": round(100*float(rz.get("pass_attempt", pd.Series(dtype=float)).sum())/max(1,float(rz.get("pass_attempt", pd.Series(dtype=float)).sum())+float(rz.get("rush_attempt", pd.Series(dtype=float)).sum())),2) if not rz.empty else 0,
+                "goal_line_rush_rate": round(100*float(gl.get("rush_attempt", pd.Series(dtype=float)).sum())/max(1,float(gl.get("pass_attempt", pd.Series(dtype=float)).sum())+float(gl.get("rush_attempt", pd.Series(dtype=float)).sum())),2) if not gl.empty else 0,
+                "penalties_pg": round(float(g.get("penalty", pd.Series(dtype=float)).sum())/gp,2) if "penalty" in g.columns else 0,
+                "fumbles_pg": round(float(g.get("fumble", pd.Series(dtype=float)).sum())/gp,2) if "fumble" in g.columns else 0,
+                "sacks_allowed_pg": round(float(g.get("sack", pd.Series(dtype=float)).sum())/gp,2) if "sack" in g.columns else 0,
+                "qb_hits_allowed_pg": round(float(g.get("qb_hit", pd.Series(dtype=float)).sum())/gp,2) if "qb_hit" in g.columns else 0,
+                "explosive_pass_rate": round(100*float(((g.get("pass_attempt",0)==1) & (g.get("yards_gained",0)>=20)).mean()),2) if "yards_gained" in g.columns and "pass_attempt" in g.columns else 0,
+                "explosive_rush_rate": round(100*float(((g.get("rush_attempt",0)==1) & (g.get("yards_gained",0)>=10)).mean()),2) if "yards_gained" in g.columns and "rush_attempt" in g.columns else 0,
+                "ot_games": int(g[g["qtr_num"]>=5]["game_id"].nunique()) if "game_id" in g.columns and "qtr_num" in g.columns else 0,
+                "ot_rate": round(100*int(g[g["qtr_num"]>=5]["game_id"].nunique())/gp,2) if "game_id" in g.columns and "qtr_num" in g.columns else 0,
+            }
+            # Team identity labels for app notes/cards.
+            row["team_identity"] = "PASS-FIRST" if row["pbp_pass_rate"] >= 59 else "RUN-FIRST" if row["pbp_rush_rate"] >= 45 else "BALANCED"
+            row["coach_pace_proxy"] = "FAST" if row["pbp_plays_pg"] >= 64 else "SLOW" if row["pbp_plays_pg"] <= 58 else "NEUTRAL"
+            team_rows.append(row)
+            team_context[str(team)] = {k:v for k,v in row.items() if k != "team"}
+    team_adv = pd.DataFrame(team_rows)
+
+    # Defensive allowed/team front context.
+    def_rows = []
+    if "defteam" in df.columns:
+        for team, g in df.dropna(subset=["defteam"]).groupby("defteam"):
+            gp = max(1, g["game_id"].nunique() if "game_id" in g.columns else g["week"].nunique() if "week" in g.columns else 17)
+            pass_mask = g.get("pass_attempt", pd.Series(0,index=g.index)) == 1
+            rush_mask = g.get("rush_attempt", pd.Series(0,index=g.index)) == 1
+            row = {
+                "team": str(team),
+                "def_epa_allowed_per_play": round(float(g.get("epa", pd.Series(dtype=float)).mean()),4) if "epa" in g.columns else 0,
+                "def_success_allowed_rate": round(100*float(g.get("success", pd.Series(dtype=float)).mean()),2) if "success" in g.columns else 0,
+                "def_sacks_pg": round(float(g.get("sack", pd.Series(dtype=float)).sum())/gp,2) if "sack" in g.columns else 0,
+                "def_qb_hits_pg": round(float(g.get("qb_hit", pd.Series(dtype=float)).sum())/gp,2) if "qb_hit" in g.columns else 0,
+                "def_fumbles_forced_pg": round(float(g.get("fumble", pd.Series(dtype=float)).sum())/gp,2) if "fumble" in g.columns else 0,
+                "explosive_pass_allowed_rate": round(100*float(((pass_mask) & (g.get("yards_gained",0)>=20)).mean()),2) if "yards_gained" in g.columns else 0,
+                "explosive_rush_allowed_rate": round(100*float(((rush_mask) & (g.get("yards_gained",0)>=10)).mean()),2) if "yards_gained" in g.columns else 0,
+            }
+            def_rows.append(row)
+    defense_adv = pd.DataFrame(def_rows)
+    if not defense_adv.empty:
+        for col, asc, out in [
+            ("def_epa_allowed_per_play", True, "def_epa_rank"),
+            ("def_sacks_pg", False, "def_pass_rush_rank"),
+            ("explosive_rush_allowed_rate", True, "def_explosive_run_rank"),
+            ("explosive_pass_allowed_rate", True, "def_explosive_pass_rank"),
+        ]:
+            if col in defense_adv.columns:
+                defense_adv[out] = defense_adv[col].rank(method="min", ascending=asc).astype(int)
+
+    # Red-zone/goal-line player usage.
+    rz_rows = []
+    rz = df[df["yardline_100_num"].between(1,20, inclusive="both")] if "yardline_100_num" in df.columns else pd.DataFrame()
+    if not rz.empty:
+        player_sources = [
+            ("rusher_player_name", "red_zone_carries"),
+            ("receiver_player_name", "red_zone_targets"),
+            ("passer_player_name", "red_zone_pass_attempts"),
+        ]
+        team_totals = {}
+        for team, tg in rz.groupby("posteam") if "posteam" in rz.columns else []:
+            team_totals[str(team)] = max(1, len(tg))
+        tmp = {}
+        for col, stat in player_sources:
+            if col not in rz.columns:
+                continue
+            for (team, player), g in rz.dropna(subset=[col]).groupby(["posteam", col]) if "posteam" in rz.columns else []:
+                key=(str(team), str(player))
+                tmp.setdefault(key, {"team":str(team), "player":str(player), "red_zone_carries":0, "red_zone_targets":0, "red_zone_pass_attempts":0, "goal_line_touches":0})
+                tmp[key][stat] += len(g)
+                gl = g[g["yardline_100_num"].between(1,5, inclusive="both")]
+                if stat in ["red_zone_carries", "red_zone_targets"]:
+                    tmp[key]["goal_line_touches"] += len(gl)
+        for (team, player), row in tmp.items():
+            row["red_zone_touch_share"] = round(100*(row.get("red_zone_carries",0)+row.get("red_zone_targets",0))/team_totals.get(team,1),2)
+            rz_rows.append(row)
+    red_zone = pd.DataFrame(rz_rows)
+
+    # OT context as its own table.
+    ot = team_adv[["team","ot_games","ot_rate"]].copy() if not team_adv.empty and "ot_rate" in team_adv.columns else pd.DataFrame()
+
+    # Trench context proxy from PBP.
+    trench = pd.DataFrame()
+    if not team_adv.empty:
+        cols = [c for c in ["team","sacks_allowed_pg","qb_hits_allowed_pg","explosive_rush_rate"] if c in team_adv.columns]
+        trench = team_adv[cols].copy()
+        if "sacks_allowed_pg" in trench.columns:
+            trench["ol_pass_pro_rank"] = trench["sacks_allowed_pg"].rank(method="min", ascending=True).astype(int)
+        if "qb_hits_allowed_pg" in trench.columns:
+            trench["pressure_allowed_rank"] = trench["qb_hits_allowed_pg"].rank(method="min", ascending=True).astype(int)
+        if "explosive_rush_rate" in trench.columns:
+            trench["ol_run_block_proxy_rank"] = trench["explosive_rush_rate"].rank(method="min", ascending=False).astype(int)
+    return team_context, team_adv, defense_adv, red_zone, ot, trench
+
+def build_phase6_nfl_database(season=NFL_LAST_SEASON, force_refresh=False):
+    """Build and persist a full last-season NFL database.
+
+    Default behavior: if the saved Phase 6 database already exists, reuse it and do not pull
+    again. Press Force Rebuild in the UI only when you intentionally want to refresh/recreate
+    last-season files.
+    """
+    season = int(season)
+    if _phase6_existing_database_ready() and not force_refresh:
+        manifest = load_json(PHASE6_MANIFEST_FILE, {})
+        return {"season": season, "status": "USING_SAVED_DATABASE", "message": "Saved Phase 6 files found, so no download was needed.", **manifest}
+
+    # Pull raw sources. Player-weekly is preferred, but if it fails, build player logs
+    # from play-by-play so the database does not get stuck at player_week_rows = 0.
+    weekly = fetch_nflverse_player_weekly_stats(season, force_refresh=force_refresh)
+    schedules = fetch_nflverse_schedules(season, force_refresh=force_refresh)
+    snaps = fetch_nflverse_snap_counts(season, force_refresh=force_refresh)
+    pbp = fetch_nflverse_pbp(season, force_refresh=force_refresh)
+
+    weekly_source = "nflverse_player_stats"
+    if weekly.empty and not pbp.empty:
+        weekly = _build_player_weekly_from_pbp(pbp, season)
+        weekly_source = "pbp_fallback_player_logs" if not weekly.empty else "missing"
+        if not weekly.empty:
+            weekly.to_csv(PHASE6_RAW_DIR / f"player_weekly_from_pbp_{season}.csv", index=False)
+            request_log("PHASE6_PBP_FALLBACK", "BUILT_PLAYER_WEEKLY", f"rows={len(weekly)}")
+
+    schedule_source = "nflverse_schedules"
+    if schedules.empty and not pbp.empty:
+        schedules = _build_schedules_from_pbp(pbp, season)
+        schedule_source = "pbp_fallback_schedule" if not schedules.empty else "missing"
+        if not schedules.empty:
+            schedules.to_csv(PHASE6_RAW_DIR / f"schedules_from_pbp_{season}.csv", index=False)
+            request_log("PHASE6_PBP_FALLBACK", "BUILT_SCHEDULES", f"rows={len(schedules)}")
+
+    diag = {
+        "season": season,
+        "status": "STARTED",
+        "player_week_rows": int(len(weekly)),
+        "player_week_source": weekly_source,
+        "schedule_rows": int(len(schedules)),
+        "schedule_source": schedule_source,
+        "snap_rows": int(len(snaps)),
+        "pbp_rows": int(len(pbp)),
+        "cache_dir": str(PHASE6_RAW_DIR),
+    }
     if weekly.empty:
-        diag["status"] = "NO_PLAYER_WEEKLY_DATA"
+        # Never delete existing working files if a new pull fails.
+        if _phase6_existing_database_ready():
+            manifest = load_json(PHASE6_MANIFEST_FILE, {})
+            diag.update({"status": "PULL_FAILED_USING_SAVED_DATABASE", "message": "Player weekly data did not download, but saved Phase 6 files are still being used.", **manifest})
+            return diag
+        diag["status"] = "NO_PLAYER_WEEKLY_OR_PBP_DATA"
+        diag["message"] = "Neither weekly player stats nor play-by-play fallback produced logs. Check request_log.json and try Force Refresh."
         return diag
 
-    # Clean player logs for grading/backtesting by week.
     logs = weekly.copy()
     rename_candidates = {
         "player_display_name": "player", "recent_team": "team", "opponent_team": "opp",
@@ -730,28 +1174,31 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
         if c not in logs.columns:
             logs[c] = ""
 
+    numeric_cols = [
+        "attempts","completions","passing_yards","passing_tds","interceptions","sacks",
+        "carries","rushing_yards","rushing_tds","targets","receptions","receiving_yards",
+        "receiving_tds","air_yards","fantasy_points","fantasy_points_ppr","fumbles","fumbles_lost"
+    ]
+    logs = _clean_numeric(logs, numeric_cols)
+
     # Add snap data when available.
     if not snaps.empty:
-        snap_cols = [c for c in snaps.columns if c in ["season","week","team","player","player_display_name","pfr_player_name","offense_snaps","offense_pct","defense_snaps","defense_pct","st_snaps","st_pct"]]
-        s = snaps[snap_cols].copy()
+        s = snaps.copy()
         if "player_display_name" in s.columns and "player" not in s.columns:
             s["player"] = s["player_display_name"]
         elif "pfr_player_name" in s.columns and "player" not in s.columns:
             s["player"] = s["pfr_player_name"]
+        snap_cols = [c for c in ["season","week","team","player","offense_snaps","offense_pct","defense_snaps","defense_pct","st_snaps","st_pct"] if c in s.columns]
+        s = s[snap_cols].copy()
         join_cols = [c for c in ["season","week","team","player"] if c in logs.columns and c in s.columns]
         if len(join_cols) >= 3:
             logs = logs.merge(s.drop_duplicates(join_cols), on=join_cols, how="left", suffixes=("","_snap"))
 
-    # Position-aware season summary.
+    # Build player summaries.
     group_cols = ["player","team","position"]
-    sum_cols = _phase6_sum_cols(logs, [
-        "attempts","completions","passing_yards","passing_tds","interceptions","sacks",
-        "carries","rushing_yards","rushing_tds","targets","receptions","receiving_yards",
-        "receiving_tds","air_yards","fantasy_points","fantasy_points_ppr",
-        "offense_snaps"
-    ])
+    sum_cols = _phase6_sum_cols(logs, numeric_cols + ["offense_snaps","defense_snaps","st_snaps"])
     summary = logs.groupby(group_cols, dropna=False)[sum_cols].sum(numeric_only=True).reset_index() if sum_cols else logs[group_cols].drop_duplicates()
-    games = logs.groupby(group_cols, dropna=False)["week"].nunique().reset_index(name="games_played")
+    games = logs.groupby(group_cols, dropna=False)["week"].nunique().reset_index(name="games_played") if "week" in logs.columns else summary[group_cols].assign(games_played=17)
     summary = summary.merge(games, on=group_cols, how="left")
     gp = summary["games_played"].replace(0, np.nan)
     per_game_map = {
@@ -763,26 +1210,35 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
     }
     for src, dst in per_game_map.items():
         if src in summary.columns:
-            summary[dst] = (summary[src] / gp).round(3)
+            summary[dst] = (summary[src] / gp).round(3).fillna(0)
 
-    # Create app-ready usage features from last-season volume.
     if "targets" in summary.columns:
         team_targets = summary.groupby("team")["targets"].transform("sum").replace(0, np.nan)
-        summary["target_share"] = ((summary["targets"] / team_targets) * 100).round(2)
+        summary["target_share"] = ((summary["targets"] / team_targets) * 100).round(2).fillna(0)
     if "air_yards" in summary.columns:
         team_air = summary.groupby("team")["air_yards"].transform("sum").replace(0, np.nan)
-        summary["air_yards_share"] = ((summary["air_yards"] / team_air) * 100).round(2)
+        summary["air_yards_share"] = ((summary["air_yards"] / team_air) * 100).round(2).fillna(0)
     if "carries" in summary.columns:
         team_carries = summary.groupby("team")["carries"].transform("sum").replace(0, np.nan)
-        summary["carries_share"] = ((summary["carries"] / team_carries) * 100).round(2)
+        summary["carries_share"] = ((summary["carries"] / team_carries) * 100).round(2).fillna(0)
     if "offense_snaps" in summary.columns:
         team_max_snap = summary.groupby("team")["offense_snaps"].transform("max").replace(0, np.nan)
-        summary["snap_share"] = ((summary["offense_snaps"] / team_max_snap) * 100).round(2)
-    # Route participation needs charting route data later; use a conservative proxy now.
-    summary["route_participation"] = np.where(summary.get("position","").astype(str).isin(["WR","TE"]), np.minimum(98, summary.get("snap_share", 70).fillna(70) + 6), summary.get("snap_share", 60).fillna(60))
-    summary["red_zone_touch_share"] = np.nan
+        summary["snap_share"] = ((summary["offense_snaps"] / team_max_snap) * 100).round(2).fillna(0)
+    else:
+        summary["snap_share"] = 0
+    pos = summary.get("position", pd.Series([""]*len(summary))).astype(str).str.upper()
+    summary["route_participation"] = np.where(pos.isin(["WR","TE"]), np.minimum(98, summary["snap_share"].fillna(0) + 6), summary["snap_share"].fillna(0))
 
-    # Team offense context from player weekly stats.
+    # PBP advanced context, red-zone, OT, trench.
+    pbp_team_context, team_adv, defense_adv, red_zone, ot, trench = _build_pbp_context(pbp)
+    if not red_zone.empty:
+        rz_small = red_zone[[c for c in ["team","player","red_zone_touch_share","red_zone_carries","red_zone_targets","red_zone_pass_attempts","goal_line_touches"] if c in red_zone.columns]].copy()
+        summary = summary.merge(rz_small, on=["team","player"], how="left")
+    if "red_zone_touch_share" not in summary.columns:
+        summary["red_zone_touch_share"] = 0
+    summary["red_zone_touch_share"] = pd.to_numeric(summary["red_zone_touch_share"], errors="coerce").fillna(0)
+
+    # Team offense context from weekly if PBP is unavailable; prefer PBP fields when present.
     team_rows = []
     for team, g in logs.groupby("team"):
         if not str(team).strip():
@@ -792,7 +1248,7 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
         rush_att = safe_float(g["carries"].sum()) if "carries" in g.columns else 0
         plays = (pass_att or 0) + (rush_att or 0)
         team_rows.append({
-            "team": team,
+            "team": str(team),
             "plays_pg": round(plays/games_team,2),
             "pass_rate": round(100*(pass_att or 0)/max(1,plays),2),
             "rush_rate": round(100*(rush_att or 0)/max(1,plays),2),
@@ -800,14 +1256,20 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
             "rush_attempts_pg": round((rush_att or 0)/games_team,2),
         })
     team_df = pd.DataFrame(team_rows)
+    if not team_adv.empty:
+        team_df = team_df.merge(team_adv, on="team", how="outer") if not team_df.empty else team_adv.copy()
+        # fill main projection fields with richer PBP names when available
+        for src, dst in [("pbp_plays_pg","plays_pg"),("pbp_pass_rate","pass_rate"),("pbp_rush_rate","rush_rate")]:
+            if src in team_df.columns:
+                team_df[dst] = pd.to_numeric(team_df.get(dst), errors="coerce").fillna(pd.to_numeric(team_df[src], errors="coerce"))
 
-    # Defense ranks allowed by opponent, useful for prop matchup gates.
+    # Defense ranks allowed by opponent from weekly.
     def_rows = []
     if "opp" in logs.columns and str(logs["opp"].fillna("").sum()).strip():
         for opp, g in logs.groupby("opp"):
             games_opp = max(1, g["week"].nunique() if "week" in g.columns else 17)
             def_rows.append({
-                "team": opp,
+                "team": str(opp),
                 "pass_yards_allowed_pg": round((g["passing_yards"].sum() if "passing_yards" in g.columns else 0)/games_opp,2),
                 "rush_yards_allowed_pg": round((g["rushing_yards"].sum() if "rushing_yards" in g.columns else 0)/games_opp,2),
                 "rec_yards_allowed_pg": round((g["receiving_yards"].sum() if "receiving_yards" in g.columns else 0)/games_opp,2),
@@ -815,19 +1277,23 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
             })
     defense = pd.DataFrame(def_rows)
     if not defense.empty:
-        # Low rank number = tougher defense.
         defense["def_pass_rank"] = defense["pass_yards_allowed_pg"].rank(method="min", ascending=True).astype(int)
         defense["def_run_rank"] = defense["rush_yards_allowed_pg"].rank(method="min", ascending=True).astype(int)
         defense["def_role_rank"] = defense["rec_yards_allowed_pg"].rank(method="min", ascending=True).astype(int)
+    if not defense_adv.empty:
+        defense = defense.merge(defense_adv, on="team", how="outer") if not defense.empty else defense_adv.copy()
 
     team_context = {}
-    for _, r in team_df.iterrows():
-        team = str(r["team"])
+    for _, r in team_df.iterrows() if not team_df.empty else []:
+        team = str(r.get("team"))
         d = {k: (None if pd.isna(v) else float(v) if isinstance(v, (np.floating, float)) else int(v) if isinstance(v, (np.integer, int)) else v) for k,v in r.items() if k != "team"}
         if not defense.empty and team in set(defense["team"].astype(str)):
             dr = defense[defense["team"].astype(str) == team].iloc[0].to_dict()
-            for k in ["def_pass_rank","def_run_rank","def_role_rank"]:
-                d[k] = int(dr.get(k)) if pd.notna(dr.get(k)) else None
+            for k,v in dr.items():
+                if k != "team" and pd.notna(v):
+                    d[k] = int(v) if isinstance(v,(np.integer,int)) else float(v) if isinstance(v,(np.floating,float)) else v
+        if team in pbp_team_context:
+            d.update(pbp_team_context[team])
         team_context[team] = d
 
     # Travel/stadium context from schedules.
@@ -840,7 +1306,7 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
                 continue
             env = STADIUM_ENV.get(str(home), {})
             travel_rows.append({
-                "season": int(season),
+                "season": season,
                 "week": r.get("week"),
                 "matchup": f"{away} @ {home}",
                 "away_team": away,
@@ -863,29 +1329,280 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON):
         defense.to_csv(PHASE6_DEFENSE_RANK_FILE, index=False)
     if not travel.empty:
         travel.to_csv(PHASE6_TRAVEL_FILE, index=False)
+    if not team_adv.empty:
+        team_adv.to_csv(PHASE6_TEAM_ADVANCED_FILE, index=False)
+    if not trench.empty:
+        trench.to_csv(PHASE6_TRENCH_FILE, index=False)
+    if not red_zone.empty:
+        red_zone.to_csv(PHASE6_RED_ZONE_FILE, index=False)
+    if not ot.empty:
+        ot.to_csv(PHASE6_OT_FILE, index=False)
 
     app_usage_cols = [c for c in [
         "player","team","position","snap_share","route_participation","target_share","air_yards_share",
-        "red_zone_touch_share","targets_pg","receptions_pg","rush_attempts_pg","carries_share",
+        "red_zone_touch_share","red_zone_carries","red_zone_targets","goal_line_touches",
+        "targets_pg","receptions_pg","rush_attempts_pg","carries_share",
         "pass_attempts_pg","passing_yards_pg","rushing_yards_pg","receiving_yards_pg","fantasy_points_pg"
     ] if c in summary.columns]
     if app_usage_cols:
-        summary[app_usage_cols].to_csv(USAGE_FILE, index=False)
+        # App-ready usage file should not be dominated by rows with all zeros.
+        usage = summary[app_usage_cols].copy()
+        usage_numeric = usage.select_dtypes(include=[np.number]).columns.tolist()
+        if usage_numeric:
+            usage = usage[usage[usage_numeric].abs().sum(axis=1) > 0].copy()
+        usage.to_csv(USAGE_FILE, index=False)
     save_json(TEAM_CONTEXT_FILE, team_context)
     save_json(PHASE6_TEAM_CONTEXT_FILE, team_context)
+    _save_position_specific_phase6_tables(summary)
 
-    diag.update({
-        "status": "BUILT",
+    manifest = {
+        "built_at": now_iso(),
+        "season": season,
         "player_log_file": str(PHASE6_PLAYER_LOG_FILE),
         "player_summary_file": str(PHASE6_PLAYER_SUMMARY_FILE),
         "usage_file": str(USAGE_FILE),
         "team_context_file": str(TEAM_CONTEXT_FILE),
         "defense_rank_file": str(PHASE6_DEFENSE_RANK_FILE),
         "travel_file": str(PHASE6_TRAVEL_FILE),
+        "team_advanced_file": str(PHASE6_TEAM_ADVANCED_FILE),
+        "trench_file": str(PHASE6_TRENCH_FILE),
+        "red_zone_file": str(PHASE6_RED_ZONE_FILE),
+        "overtime_file": str(PHASE6_OT_FILE),
         "players": int(summary["player"].nunique()) if "player" in summary.columns else int(len(summary)),
         "teams": int(len(team_context)),
-    })
+        "player_week_rows": int(len(logs)),
+        "schedule_rows": int(len(schedules)),
+        "snap_rows": int(len(snaps)),
+        "pbp_rows": int(len(pbp)),
+        "player_week_source": weekly_source,
+        "schedule_source": schedule_source,
+    }
+    save_json(PHASE6_MANIFEST_FILE, manifest)
+    diag.update({"status": "BUILT_AND_SAVED", **manifest})
     return diag
+
+
+
+# ---------- Phase 6 Builder 3.0: persistent GitHub-style database layer ----------
+# This layer intentionally mirrors the MLB workflow: pull/build once, save the resulting
+# files, then reuse local/GitHub-committed files on every app start. It also lets you
+# hard-input a completed phase6_nfl_database folder into GitHub later without changing code.
+PHASE6_REQUIRED_FILES = [
+    "nfl_player_summary_last_season.csv",
+    "nfl_team_context_last_season.json",
+]
+PHASE6_OFFENSIVE_POSITIONS = {"QB", "RB", "WR", "TE", "FB", "K"}
+
+# Keep the v2.2 builder as a fallback, then override build_phase6_nfl_database below.
+_phase6_v22_build = build_phase6_nfl_database
+
+
+def _phase6_candidate_database_dirs():
+    """Places the app will look for a saved Phase 6 database.
+
+    This supports both workflows:
+    1) App-built database in STORAGE_DIR/nfl_engine/phase6_nfl_database.
+    2) GitHub hard-input database committed into ./phase6_nfl_database or
+       ./nfl_engine/phase6_nfl_database.
+    """
+    cwd = Path.cwd()
+    candidates = [
+        PHASE6_DIR,
+        cwd / "phase6_nfl_database",
+        cwd / "nfl_engine" / "phase6_nfl_database",
+        Path("phase6_nfl_database"),
+        Path("nfl_engine") / "phase6_nfl_database",
+    ]
+    out = []
+    seen = set()
+    for d in candidates:
+        try:
+            r = d.resolve()
+        except Exception:
+            r = d
+        if str(r) not in seen:
+            seen.add(str(r)); out.append(d)
+    return out
+
+
+def _phase6_file_has_rows(path, min_rows=1):
+    try:
+        if not Path(path).exists() or Path(path).stat().st_size <= 50:
+            return False
+        if str(path).lower().endswith(".json"):
+            data = load_json(path, {})
+            return bool(data) and len(data) >= min_rows
+        df = pd.read_csv(path, nrows=min_rows + 2)
+        return len(df) >= min_rows
+    except Exception:
+        return False
+
+
+def _phase6_database_quality(db_dir):
+    """Score whether a database is actually useful, not just present.
+
+    A useful DB should have a non-empty summary, app usage hooks, and team context.
+    Player logs are preferred, but not required if summary+usage exist from a committed
+    GitHub database. The manifest reports all counts for transparency.
+    """
+    db_dir = Path(db_dir)
+    summary_path = db_dir / "nfl_player_summary_last_season.csv"
+    logs_path = db_dir / "nfl_player_logs_last_season.csv"
+    team_context_path = db_dir / "nfl_team_context_last_season.json"
+    if not _phase6_file_has_rows(summary_path, 5):
+        return False, {"reason": "missing_or_empty_player_summary"}
+    try:
+        summary = pd.read_csv(summary_path)
+    except Exception as e:
+        return False, {"reason": f"summary_read_error: {e}"}
+    if summary.empty or "player" not in summary.columns:
+        return False, {"reason": "bad_player_summary_schema"}
+    offensive_rows = summary.copy()
+    if "position" in offensive_rows.columns:
+        offensive_rows = offensive_rows[offensive_rows["position"].astype(str).str.upper().isin(PHASE6_OFFENSIVE_POSITIONS)]
+    numeric_cols = [c for c in offensive_rows.select_dtypes(include=[np.number]).columns if c not in ["season"]]
+    non_zero_rows = 0
+    if numeric_cols:
+        non_zero_rows = int((offensive_rows[numeric_cols].abs().sum(axis=1) > 0).sum())
+    team_context = load_json(team_context_path, {}) if team_context_path.exists() else {}
+    quality = {
+        "summary_rows": int(len(summary)),
+        "offensive_rows": int(len(offensive_rows)),
+        "non_zero_offensive_rows": non_zero_rows,
+        "player_log_rows": int(len(pd.read_csv(logs_path, usecols=[0])) if logs_path.exists() and logs_path.stat().st_size > 50 else 0),
+        "team_context_teams": int(len(team_context)) if isinstance(team_context, dict) else 0,
+    }
+    # Be practical: early/preseason database can still be useful if summary has real rows.
+    ok = quality["non_zero_offensive_rows"] >= 25 and quality["team_context_teams"] >= 16
+    if not ok:
+        quality["reason"] = "database_present_but_low_quality_or_mostly_zero"
+    return ok, quality
+
+
+def _phase6_install_database_from_dir(src_dir):
+    """Copy a committed/local database into the active STORAGE_DIR database folder."""
+    src_dir = Path(src_dir)
+    if not src_dir.exists():
+        return False, {"reason": "source_dir_missing", "source": str(src_dir)}
+    try:
+        PHASE6_DIR.mkdir(parents=True, exist_ok=True)
+        copied = []
+        for file in src_dir.glob("*"):
+            if file.is_file() and file.suffix.lower() in [".csv", ".json", ".parquet"]:
+                target = PHASE6_DIR / file.name
+                if file.resolve() != target.resolve():
+                    target.write_bytes(file.read_bytes())
+                    copied.append(file.name)
+        # Copy app hooks if they are bundled there.
+        usage_src = src_dir / "nfl_player_usage.csv"
+        team_src = src_dir / "nfl_team_context.json"
+        if usage_src.exists():
+            USAGE_FILE.write_bytes(usage_src.read_bytes()); copied.append("nfl_player_usage.csv -> app hook")
+        if team_src.exists():
+            TEAM_CONTEXT_FILE.write_bytes(team_src.read_bytes()); copied.append("nfl_team_context.json -> app hook")
+        # If only last-season names exist, install hooks from them.
+        summary = PHASE6_DIR / "nfl_player_summary_last_season.csv"
+        team_last = PHASE6_DIR / "nfl_team_context_last_season.json"
+        if summary.exists() and not USAGE_FILE.exists():
+            try:
+                df = pd.read_csv(summary)
+                app_usage_cols = [c for c in [
+                    "player","team","position","snap_share","route_participation","target_share","air_yards_share",
+                    "red_zone_touch_share","red_zone_carries","red_zone_targets","goal_line_touches",
+                    "targets_pg","receptions_pg","rush_attempts_pg","carries_share",
+                    "pass_attempts_pg","passing_yards_pg","rushing_yards_pg","receiving_yards_pg","fantasy_points_pg"
+                ] if c in df.columns]
+                if app_usage_cols:
+                    df[app_usage_cols].to_csv(USAGE_FILE, index=False)
+            except Exception as e:
+                request_log("PHASE6_INSTALL_USAGE", "ERROR", e)
+        if team_last.exists() and not TEAM_CONTEXT_FILE.exists():
+            TEAM_CONTEXT_FILE.write_bytes(team_last.read_bytes())
+        _save_position_specific_phase6_tables(pd.read_csv(summary) if summary.exists() else pd.DataFrame())
+        ok, quality = _phase6_database_quality(PHASE6_DIR)
+        return ok, {"source": str(src_dir), "copied": copied, **quality}
+    except Exception as e:
+        return False, {"reason": f"install_error: {e}", "source": str(src_dir)}
+
+
+def _phase6_try_use_bundled_database():
+    """Use a GitHub-hard-input database folder if present."""
+    for d in _phase6_candidate_database_dirs():
+        # Skip active dir here; active dir is checked separately.
+        try:
+            if d.resolve() == PHASE6_DIR.resolve():
+                continue
+        except Exception:
+            pass
+        ok, quality = _phase6_database_quality(d)
+        if ok:
+            installed, install_info = _phase6_install_database_from_dir(d)
+            if installed:
+                manifest = {
+                    "built_at": now_iso(),
+                    "status": "USING_GITHUB_HARD_INPUT_DATABASE",
+                    "source_database_dir": str(d),
+                    **install_info,
+                }
+                save_json(PHASE6_MANIFEST_FILE, manifest)
+                return manifest
+    return None
+
+
+def _phase6_export_database_zip():
+    """Create a zip the user can commit to GitHub or store as backup."""
+    import zipfile
+    PHASE6_DIR.mkdir(parents=True, exist_ok=True)
+    zip_path = PHASE6_DIR / "phase6_nfl_database_export.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for file in PHASE6_DIR.glob("*"):
+            if file.is_file() and file.name != zip_path.name:
+                z.write(file, arcname=file.name)
+        if USAGE_FILE.exists():
+            z.write(USAGE_FILE, arcname="nfl_player_usage.csv")
+        if TEAM_CONTEXT_FILE.exists():
+            z.write(TEAM_CONTEXT_FILE, arcname="nfl_team_context.json")
+    return zip_path
+
+
+def build_phase6_nfl_database(season=NFL_LAST_SEASON, force_refresh=False):
+    """Phase 6 Builder 3.0.
+
+    Behavior:
+    - If saved local DB is good, use it and do not download.
+    - If a DB folder is hard-input/committed to GitHub, install/use it.
+    - Otherwise download/build once, save, and reuse forever until Force Refresh.
+    """
+    season = int(season)
+    if not force_refresh:
+        ok, quality = _phase6_database_quality(PHASE6_DIR)
+        if ok:
+            manifest = load_json(PHASE6_MANIFEST_FILE, {})
+            return {"season": season, "status": "USING_SAVED_LOCAL_DATABASE", "message": "Saved Phase 6 files found. No download was needed.", **quality, **manifest}
+        bundled = _phase6_try_use_bundled_database()
+        if bundled:
+            return {"season": season, "status": "USING_GITHUB_HARD_INPUT_DATABASE", "message": "Found a committed Phase 6 database folder and installed it into the active app database.", **bundled}
+
+    # Build from web using v2.2 pipeline. If selected season fails, try previous season as a fallback
+    # so the model never goes in blind while a new/current season file is unavailable.
+    diag = _phase6_v22_build(season, force_refresh=force_refresh)
+    ok, quality = _phase6_database_quality(PHASE6_DIR)
+    if ok:
+        diag.update({"status": "BUILT_AND_SAVED_PHASE6_V3", **quality})
+        save_json(PHASE6_MANIFEST_FILE, diag)
+        return diag
+    if force_refresh and season > 1999:
+        prev = season - 1
+        request_log("PHASE6_V3", "TRY_PREVIOUS_SEASON", f"{season} quality failed; trying {prev}")
+        diag2 = _phase6_v22_build(prev, force_refresh=True)
+        ok2, quality2 = _phase6_database_quality(PHASE6_DIR)
+        if ok2:
+            diag2.update({"status": "BUILT_PREVIOUS_SEASON_AND_SAVED_PHASE6_V3", "requested_season": season, "built_season": prev, **quality2})
+            save_json(PHASE6_MANIFEST_FILE, diag2)
+            return diag2
+    diag.update({"status": "PHASE6_BUILD_FAILED_OR_LOW_QUALITY", **quality})
+    return diag
+
 
 # ---------- optional real NFL data loaders ----------
 def _read_optional_csv(path):
@@ -1470,33 +2187,66 @@ with tabs[7]:
 
 with tabs[8]:
     st.markdown("<div class='section-title-pro'>Phase 6 NFL Database</div>", unsafe_allow_html=True)
-    st.write("Builds last-season player logs, player summaries, team offense context, defensive ranks, stadium noise, and travel context.")
+    st.write("Builds and SAVES last-season regular-season data once: player game logs, summaries, team identity, defense, red zone, penalties, fumbles, trenches, OT, stadium noise, and travel context.")
     c1, c2 = st.columns([1,2])
     with c1:
         season_to_build = st.number_input("Last season to build", min_value=1999, max_value=2030, value=NFL_LAST_SEASON, step=1)
-        if st.button("Build / Refresh Phase 6 Database", use_container_width=True):
-            diag = build_phase6_nfl_database(int(season_to_build))
-            if diag.get("status") == "BUILT":
-                st.success(f"Phase 6 database built for {season_to_build}. Players: {diag.get('players')} · Teams: {diag.get('teams')}")
+        existing_ready = _phase6_existing_database_ready()
+        st.metric("Saved database", "READY" if existing_ready else "NOT BUILT")
+        if PHASE6_MANIFEST_FILE.exists():
+            st.caption("Last saved build")
+            st.json(load_json(PHASE6_MANIFEST_FILE, {}))
+        if st.button("Use Saved / Build If Missing", use_container_width=True):
+            diag = build_phase6_nfl_database(int(season_to_build), force_refresh=False)
+            if diag.get("status") in ["BUILT_AND_SAVED", "USING_SAVED_DATABASE", "PULL_FAILED_USING_SAVED_DATABASE"]:
+                st.success(f"Phase 6 ready: {diag.get('status')}. Players: {diag.get('players')} · Teams: {diag.get('teams')}")
             else:
                 st.warning(f"Phase 6 database not built: {diag.get('status')}")
             st.json(diag)
+        if st.button("Force Rebuild / Refresh From Web", use_container_width=True):
+            diag = build_phase6_nfl_database(int(season_to_build), force_refresh=True)
+            if diag.get("status") in ["BUILT_AND_SAVED", "PULL_FAILED_USING_SAVED_DATABASE"]:
+                st.success(f"Phase 6 refreshed/saved: {diag.get('status')}. Players: {diag.get('players')} · Teams: {diag.get('teams')}")
+            else:
+                st.warning(f"Phase 6 database not built: {diag.get('status')}")
+            st.json(diag)
+        if st.button("Export Saved Database ZIP", use_container_width=True):
+            try:
+                zip_path = _phase6_export_database_zip()
+                st.success(f"Export created: {zip_path}")
+                st.caption("Commit the unzipped phase6_nfl_database folder to GitHub if you want it hard-input like MLB learning data.")
+            except Exception as e:
+                st.error(f"Export failed: {e}")
     with c2:
-        st.info("These files plug directly into the current projection engine: nfl_player_usage.csv and nfl_team_context.json. The richer logs stay in phase6_nfl_database for backtesting and learning.")
+        st.info("Once these files are saved, the app uses the local database automatically and DOES NOT pull the same last-season data every day. You can also commit the phase6_nfl_database folder to GitHub and the app will auto-load it like MLB learning data.")
         st.write("Generated files:")
-        st.code("\\n".join([
+        st.code("\n".join([
             str(PHASE6_PLAYER_LOG_FILE),
             str(PHASE6_PLAYER_SUMMARY_FILE),
             str(PHASE6_TEAM_CONTEXT_FILE),
             str(PHASE6_DEFENSE_RANK_FILE),
+            str(PHASE6_TEAM_ADVANCED_FILE),
+            str(PHASE6_TRENCH_FILE),
+            str(PHASE6_RED_ZONE_FILE),
+            str(PHASE6_OT_FILE),
             str(PHASE6_TRAVEL_FILE),
             str(USAGE_FILE),
             str(TEAM_CONTEXT_FILE),
         ]))
     if PHASE6_PLAYER_SUMMARY_FILE.exists():
-        st.subheader("Player Summary Preview")
+        st.subheader("Player Summary Preview — offensive rows first")
         try:
-            st.dataframe(pd.read_csv(PHASE6_PLAYER_SUMMARY_FILE).head(75), use_container_width=True, hide_index=True)
+            prev = pd.read_csv(PHASE6_PLAYER_SUMMARY_FILE)
+            numeric_cols = prev.select_dtypes(include=[np.number]).columns.tolist()
+            if numeric_cols:
+                prev["_usage_total"] = prev[numeric_cols].abs().sum(axis=1)
+                prev = prev[prev["_usage_total"] > 0].copy()
+            if "position" in prev.columns:
+                off = prev[prev["position"].astype(str).str.upper().isin(["QB","RB","WR","TE","FB","K"])]
+                if not off.empty:
+                    prev = off
+            show_cols = [c for c in ["player","team","position","games_played","pass_attempts_pg","passing_yards_pg","rush_attempts_pg","rushing_yards_pg","targets_pg","receptions_pg","receiving_yards_pg","target_share","snap_share","route_participation","red_zone_touch_share"] if c in prev.columns]
+            st.dataframe(prev.sort_values("_usage_total", ascending=False)[show_cols].head(100), use_container_width=True, hide_index=True)
         except Exception as e:
             st.warning(f"Could not preview player summary: {e}")
     if PHASE6_DEFENSE_RANK_FILE.exists():
@@ -1505,6 +2255,24 @@ with tabs[8]:
             st.dataframe(pd.read_csv(PHASE6_DEFENSE_RANK_FILE).head(40), use_container_width=True, hide_index=True)
         except Exception as e:
             st.warning(f"Could not preview defense ranks: {e}")
+    if PHASE6_TEAM_ADVANCED_FILE.exists():
+        st.subheader("Team Identity / Penalties / Fumbles / OT Preview")
+        try:
+            st.dataframe(pd.read_csv(PHASE6_TEAM_ADVANCED_FILE).head(40), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not preview team advanced: {e}")
+    if PHASE6_TRENCH_FILE.exists():
+        st.subheader("Trench Context Preview")
+        try:
+            st.dataframe(pd.read_csv(PHASE6_TRENCH_FILE).head(40), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not preview trench context: {e}")
+    if PHASE6_RED_ZONE_FILE.exists():
+        st.subheader("Red Zone / Goal Line Usage Preview")
+        try:
+            st.dataframe(pd.read_csv(PHASE6_RED_ZONE_FILE).head(75), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Could not preview red zone usage: {e}")
     if PHASE6_TRAVEL_FILE.exists():
         st.subheader("Travel / Stadium Context Preview")
         try:
@@ -1531,7 +2299,7 @@ with tabs[9]:
     st.write("- Asymmetric NFL simulation with collapse/ceiling branches instead of clean normal-only outcomes")
     st.warning("Preseason note: demo rows are for testing UI/workflow only. Real Underdog NFL rows automatically override demo rows when live. Use Live Underdog only to verify the feed without fallback noise.")
 
-with tabs[9]:
+with tabs[10]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
     st.write("This tab scans Underdog for NFL moneyline/winner markets when they are posted. It will not create fake moneylines if Underdog does not expose them yet.")
     if moneylines:
