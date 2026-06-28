@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v2.6 — POSITION TABS + HIDDEN PHASE 6 ADMIN"
+APP_VERSION = "NFL v2.6 — POSITION TABS + RECEIVERS + SAVED DATABASE"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1981,165 +1981,198 @@ def update_learning_from_result(player, prop, projected, actual):
     return data.get(key,cur)
 
 # ---------- UI ----------
-st.markdown(f"""
-<div class='hero-panel'>
-  <div class='big-title'>NFL Prop Engine</div>
-  <div class='sub-title'>Live Underdog lines · QB/RB/WR/TE prop tabs · Phase 6 database · CLV · save before/after · grading</div>
-  <span class='badge'>{APP_VERSION}</span><span class='badge good-badge'>Production board layout</span>
-</div>
-""", unsafe_allow_html=True)
-
-POSITION_TAB_MAP = {
-    "QBs": ["QB"],
-    "RBs": ["RB", "FB"],
-    "WRs": ["WR"],
-    "TEs": ["TE"],
+POSITION_TAB_PROPS = {
+    "QBs": ["All", "Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions", "Rushing Yards"],
+    "RBs": ["All", "Rushing Yards", "Rush Attempts", "Receiving Yards", "Receptions", "Fantasy Points", "Anytime TD", "Longest Rush"],
+    "Receivers": ["All", "Receiving Yards", "Receptions", "Longest Reception", "Fantasy Points", "Anytime TD"],
 }
 
-QB_PROPS = {"Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions"}
-RB_PROPS = {"Rushing Yards", "Rush Attempts", "Longest Rush"}
-REC_PROPS = {"Receiving Yards", "Receptions", "Longest Reception"}
+QB_POSITIONS = {"QB"}
+RB_POSITIONS = {"RB", "FB"}
+RECEIVER_POSITIONS = {"WR", "TE"}
 
-def _position_key(p):
-    return str(p.get("position") or "").upper().strip()
 
-def _position_props(label, rows):
-    allowed = POSITION_TAB_MAP.get(label, [])
-    out = []
-    for p in rows:
-        pos = _position_key(p)
-        prop = str(p.get("prop") or "")
-        if pos in allowed:
-            out.append(p)
-            continue
-        # Safety fallback for feeds that do not include position.
-        if label == "QBs" and prop in QB_PROPS:
-            out.append(p)
-        elif label == "RBs" and prop in RB_PROPS and pos in ["", "NFL", "RB", "FB"]:
-            out.append(p)
-        elif label == "WRs" and prop in REC_PROPS and pos == "WR":
-            out.append(p)
-        elif label == "TEs" and prop in REC_PROPS and pos == "TE":
-            out.append(p)
+def _pos(p):
+    return str((p or {}).get("position") or "").upper().strip()
+
+
+def _is_qb(p):
+    return _pos(p) in QB_POSITIONS
+
+
+def _is_rb(p):
+    return _pos(p) in RB_POSITIONS
+
+
+def _is_receiver(p):
+    return _pos(p) in RECEIVER_POSITIONS
+
+
+def _filter_position_market(rows, position_name, market="All", receiver_pos="All"):
+    if position_name == "QBs":
+        out = [p for p in rows if _is_qb(p)]
+    elif position_name == "RBs":
+        out = [p for p in rows if _is_rb(p)]
+    elif position_name == "Receivers":
+        out = [p for p in rows if _is_receiver(p)]
+        if receiver_pos in ["WR", "TE"]:
+            out = [p for p in out if _pos(p) == receiver_pos]
+    else:
+        out = list(rows)
+    if market and market != "All":
+        out = [p for p in out if p.get("prop") == market]
     return out
 
-def _board_df(rows):
-    if not rows:
-        return pd.DataFrame()
-    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","pure_upside","volatility","stability_score","data_score","line_delta","source"]
-    tmp=pd.DataFrame(rows)
-    return tmp[[c for c in show_cols if c in tmp.columns]]
 
-def _render_prop_table(rows, empty_msg="No props available with current filters."):
+def _render_prop_table(rows, title="Board"):
     if not rows:
-        st.warning(empty_msg)
+        st.warning("No props available for this view.")
         return
-    st.dataframe(_board_df(rows), use_container_width=True, hide_index=True)
+    view = pd.DataFrame(rows)
+    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","pure_upside","volatility","stability_score","data_score","line_delta","source"]
+    st.dataframe(view[[c for c in show_cols if c in view.columns]], use_container_width=True, hide_index=True)
 
-def _render_player_card(p, show_ladder=True):
-    badge_class="good-badge" if p.get("pick")=="OVER" else "red-badge" if p.get("pick")=="UNDER" else "yellow-badge"
-    st.markdown(f"""
-    <div class='pick-card'>
-      <div class='player-name'>{p.get('player','')} <span class='small-muted'>({p.get('position','')} · {p.get('team','')})</span></div>
-      <span class='badge'>{p.get('prop')}</span><span class='badge'>{p.get('matchup','')}</span><span class='badge {badge_class}'>{p.get('signal')}</span><span class='badge yellow-badge'>Upside {p.get('pure_upside')}</span><span class='badge'>Vol {p.get('volatility')}</span>
-      <div class='kpi-strip'>
-        <div class='metric-card'><div class='kpi-label'>Line</div><div class='kpi-value'>{p.get('line')}</div></div>
-        <div class='metric-card'><div class='kpi-label'>Projection</div><div class='kpi-value'>{p.get('projection')}</div></div>
-        <div class='metric-card'><div class='kpi-label'>Edge</div><div class='kpi-value'>{p.get('edge')}</div></div>
-        <div class='metric-card'><div class='kpi-label'>Fair Prob</div><div class='kpi-value'>{'' if p.get('fair_prob') is None else str(round(p.get('fair_prob')*100,1))+'%'}</div></div>
-        <div class='metric-card'><div class='kpi-label'>P75</div><div class='kpi-value'>{p.get('p75')}</div></div>
-        <div class='metric-card'><div class='kpi-label'>P90 Ceiling</div><div class='kpi-value'>{p.get('p90')}</div></div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-    with st.expander(f"View More — {p.get('player','')} {p.get('prop','')}"):
-        c1,c2,c3=st.columns(3)
-        with c1:
-            st.subheader("Usage")
-            role=p.get("role",{}) or {}
-            st.write(f"Snap Share: **{role.get('snap','')}%**")
-            st.write(f"Route Participation: **{role.get('route','')}%**")
-            st.write(f"Target Share: **{role.get('target','')}%**")
-            st.write(f"Carry Share: **{role.get('carry','')}%**")
-            st.write(f"Red-Zone Usage: **{role.get('rz','')}%**")
-        with c2:
-            st.subheader("Environment")
-            env=p.get("env",{}) or {}
-            st.write(f"Stadium: **{env.get('stadium','')}**")
-            st.write(f"Crowd Noise: **{env.get('crowd','')}**")
-            st.write(f"Roof: **{env.get('roof','')}**")
-            st.write(f"Surface: **{env.get('surface','')}**")
-            st.write(f"Altitude: **{env.get('altitude','')} ft**")
-        with c3:
-            st.subheader("Risk / Official Filter")
-            for n in p.get("notes",[]): st.write("- "+str(n))
-            st.write(f"Data Score: **{p.get('data_score')}/99**")
-            st.write(f"Stability Score: **{p.get('stability_score')} /100**")
-            st.write(f"Action Tier: **{p.get('action_tier')}**")
-            rejects=p.get('official_rejections') or []
-            if rejects:
-                st.write("Official Filter Rejections:")
-                for rr in rejects: st.write("- "+str(rr))
-            st.write(f"CLV Line Delta: **{p.get('line_delta')}**")
-            st.write(f"Source: **{p.get('source')}**")
-        if show_ladder:
+
+def _render_player_cards(rows, limit=None, header=None):
+    if header:
+        st.markdown(f"<div class='section-title-pro'>{header}</div>", unsafe_allow_html=True)
+    shown = rows if limit is None else rows[:limit]
+    if not shown:
+        st.warning("No player cards available in this view.")
+        return
+    for i,p in enumerate(shown):
+        badge_class="good-badge" if p.get("pick")=="OVER" else "red-badge" if p.get("pick")=="UNDER" else "yellow-badge"
+        fair = '' if p.get('fair_prob') is None else str(round(p.get('fair_prob')*100,1))+'%'
+        st.markdown(f"""
+        <div class='pick-card'>
+          <div class='player-name'>{p['player']} <span class='small-muted'>({p.get('position','')} · {p.get('team','')})</span></div>
+          <span class='badge'>{p.get('prop')}</span><span class='badge'>{p.get('matchup','')}</span><span class='badge {badge_class}'>{p.get('signal')}</span><span class='badge yellow-badge'>Upside {p.get('pure_upside')}</span><span class='badge'>Vol {p.get('volatility')}</span>
+          <div class='kpi-strip'>
+            <div class='metric-card'><div class='kpi-label'>Line</div><div class='kpi-value'>{p.get('line')}</div></div>
+            <div class='metric-card'><div class='kpi-label'>Projection</div><div class='kpi-value'>{p.get('projection')}</div></div>
+            <div class='metric-card'><div class='kpi-label'>Edge</div><div class='kpi-value'>{p.get('edge')}</div></div>
+            <div class='metric-card'><div class='kpi-label'>Fair Prob</div><div class='kpi-value'>{fair}</div></div>
+            <div class='metric-card'><div class='kpi-label'>P75</div><div class='kpi-value'>{p.get('p75')}</div></div>
+            <div class='metric-card'><div class='kpi-label'>P90 Ceiling</div><div class='kpi-value'>{p.get('p90')}</div></div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+        with st.expander(f"View More — {p['player']} {p['prop']}"):
+            c1,c2,c3=st.columns(3)
+            with c1:
+                st.subheader("Usage")
+                role=p.get("role", {})
+                st.write(f"Snap Share: **{role.get('snap','')}%**")
+                st.write(f"Route Participation: **{role.get('route','')}%**")
+                st.write(f"Target Share: **{role.get('target','')}%**")
+                st.write(f"Carry Share: **{role.get('carry','')}%**")
+                st.write(f"Red-Zone Usage: **{role.get('rz','')}%**")
+            with c2:
+                st.subheader("Environment")
+                env=p.get("env", {})
+                st.write(f"Stadium: **{env.get('stadium','')}**")
+                st.write(f"Crowd Noise: **{env.get('crowd','')}**")
+                st.write(f"Roof: **{env.get('roof','')}**")
+                st.write(f"Surface: **{env.get('surface','')}**")
+                st.write(f"Altitude: **{env.get('altitude','')} ft**")
+            with c3:
+                st.subheader("Risk Notes")
+                for n in p.get("notes",[]): st.write("- "+str(n))
+                st.write(f"Data Score: **{p.get('data_score')}/99**")
+                st.write(f"Stability Score: **{p.get('stability_score')} /100**")
+                st.write(f"Action Tier: **{p.get('action_tier')}**")
+                rejects=p.get('official_rejections') or []
+                if rejects:
+                    st.write("Official Filter Rejections:")
+                    for rr in rejects: st.write("- "+str(rr))
+                st.write(f"CLV Line Delta: **{p.get('line_delta')}**")
+                st.write(f"Source: **{p.get('source')}**")
             st.subheader("Alt Ladder")
             st.dataframe(alt_ladder(p), use_container_width=True, hide_index=True)
 
-def _render_position_page(label, rows):
-    st.markdown(f"<div class='section-title-pro'>{label} Prop Board</div>", unsafe_allow_html=True)
-    pos_rows=_position_props(label, rows)
-    if not pos_rows:
-        st.warning(f"No {label} props loaded. If NFL props are not live yet, this is normal in Live Underdog only mode.")
-        return
-    market_options=["All"]+sorted(set(str(p.get("prop") or "") for p in pos_rows if p.get("prop")))
-    market=st.selectbox(f"{label} market", market_options, key=f"market_{label}")
-    if market != "All":
-        pos_rows=[p for p in pos_rows if p.get("prop")==market]
-    _render_prop_table(pos_rows)
-    st.divider()
-    for p in pos_rows[:60]:
-        _render_player_card(p, show_ladder=False)
+
+def _render_position_board(rows, position_name):
+    st.markdown(f"<div class='section-title-pro'>{position_name} Prop Board</div>", unsafe_allow_html=True)
+    if position_name == "Receivers":
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            receiver_pos = st.selectbox("Receiver type", ["All", "WR", "TE"], index=0, key="receiver_position_filter")
+        with c2:
+            market = st.selectbox("Receiver market", POSITION_TAB_PROPS[position_name], index=0, key="receiver_market_filter")
+        filtered = _filter_position_market(rows, position_name, market, receiver_pos)
+    else:
+        market = st.selectbox(f"{position_name} market", POSITION_TAB_PROPS[position_name], index=0, key=f"{position_name}_market_filter")
+        filtered = _filter_position_market(rows, position_name, market)
+    _render_prop_table(filtered, f"{position_name} board")
+    _render_player_cards(filtered, header=None)
+
+
+def _render_phase6_admin():
+    st.markdown("### Admin: Phase 6 Database")
+    st.caption("Hidden admin/setup area. The main app loads saved Phase 6 files automatically.")
+    season_to_build = st.number_input("Last season to build", min_value=1999, max_value=2030, value=NFL_LAST_SEASON, step=1, key="phase6_admin_season")
+    existing_ready = _phase6_existing_database_ready()
+    st.metric("Saved database", "READY" if existing_ready else "NOT BUILT")
+    if PHASE6_MANIFEST_FILE.exists():
+        with st.expander("Last saved build", expanded=False):
+            st.json(load_json(PHASE6_MANIFEST_FILE, {}))
+    if st.button("Use Saved / Build If Missing", use_container_width=True, key="phase6_use_saved_sidebar"):
+        diag = build_phase6_nfl_database(int(season_to_build), force_refresh=False)
+        if diag.get("status") in ["BUILT_AND_SAVED", "USING_SAVED_DATABASE", "PULL_FAILED_USING_SAVED_DATABASE", "USING_SAVED_LOCAL_DATABASE", "USING_GITHUB_HARD_INPUT_DATABASE", "BUILT_AND_SAVED_PHASE6_V3"]:
+            st.success(f"Phase 6 ready: {diag.get('status')}.")
+        else:
+            st.warning(f"Phase 6 database not built: {diag.get('status')}")
+        st.json(diag)
+    if st.button("Force Rebuild / Refresh From Web", use_container_width=True, key="phase6_force_sidebar"):
+        diag = build_phase6_nfl_database(int(season_to_build), force_refresh=True)
+        if diag.get("status") in ["BUILT_AND_SAVED", "PULL_FAILED_USING_SAVED_DATABASE", "BUILT_AND_SAVED_PHASE6_V3", "BUILT_PREVIOUS_SEASON_AND_SAVED_PHASE6_V3"]:
+            st.success(f"Phase 6 refreshed/saved: {diag.get('status')}.")
+        else:
+            st.warning(f"Phase 6 database not built: {diag.get('status')}")
+        st.json(diag)
+    zip_path = PHASE6_DIR / "phase6_nfl_database_export.zip"
+    if st.button("Export Saved Database ZIP", use_container_width=True, key="phase6_export_sidebar"):
+        try:
+            zip_path = _phase6_export_database_zip()
+            st.success(f"Export created: {zip_path.name}")
+        except Exception as e:
+            st.error(f"Export failed: {e}")
+    if zip_path.exists():
+        try:
+            st.download_button("⬇️ Download Complete Phase 6 Database ZIP", data=zip_path.read_bytes(), file_name="phase6_nfl_database_export.zip", mime="application/zip", use_container_width=True, key="phase6_download_zip_sidebar")
+        except Exception as e:
+            st.warning(f"ZIP exists but could not be prepared for download: {e}")
+    if USAGE_FILE.exists():
+        try:
+            st.download_button("⬇️ Download Player Usage CSV", data=USAGE_FILE.read_bytes(), file_name="nfl_player_usage.csv", mime="text/csv", use_container_width=True, key="phase6_download_usage_sidebar")
+        except Exception:
+            pass
+    if TEAM_CONTEXT_FILE.exists():
+        try:
+            st.download_button("⬇️ Download Team Context JSON", data=TEAM_CONTEXT_FILE.read_bytes(), file_name="nfl_team_context.json", mime="application/json", use_container_width=True, key="phase6_download_team_sidebar")
+        except Exception:
+            pass
+
+
+st.markdown(f"""
+<div class='hero-panel'>
+  <div class='big-title'>NFL Prop Engine</div>
+  <div class='sub-title'>Clean player cards · projections · pure upside · stadium/noise · weather-ready · CLV · save before/after · grading</div>
+  <span class='badge'>{APP_VERSION}</span><span class='badge good-badge'>MLB framework converted to NFL structure</span>
+</div>
+""", unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("Controls")
     source_mode=st.radio("Prop Source", ["Live Underdog only", "Live Underdog first, demo fallback", "Demo board only"], index=0)
-    if source_mode != "Live Underdog only":
-        st.warning("TEST MODE — Demo rows are not real plays.")
     prop_filter=st.multiselect("Prop Types", list(PROP_CONFIG.keys()), default=list(PROP_CONFIG.keys()))
     min_score=st.slider("Minimum Data Score",0,99,0)
     show_all=st.checkbox("Show all player cards", True)
     st.divider()
+    st.caption("API keys can be added in Streamlit secrets or Railway variables later.")
     show_feed_debug=st.checkbox("Show Underdog feed debug", False)
-
     with st.expander("Admin: Phase 6 Database", expanded=False):
-        season_to_build = st.number_input("Last season to build", min_value=1999, max_value=2030, value=NFL_LAST_SEASON, step=1, key="sidebar_phase6_season")
-        existing_ready = _phase6_existing_database_ready() if '_phase6_existing_database_ready' in globals() else False
-        st.metric("Saved database", "READY" if existing_ready else "NOT BUILT")
-        if PHASE6_MANIFEST_FILE.exists():
-            manifest=load_json(PHASE6_MANIFEST_FILE,{})
-            st.caption(f"Last status: {manifest.get('status','saved')}")
-        if st.button("Use Saved / Build If Missing", use_container_width=True, key="sidebar_phase6_use_saved"):
-            diag = build_phase6_nfl_database(int(season_to_build), force_refresh=False)
-            st.json(diag)
-        if st.button("Force Rebuild / Refresh From Web", use_container_width=True, key="sidebar_phase6_force"):
-            diag = build_phase6_nfl_database(int(season_to_build), force_refresh=True)
-            st.json(diag)
-        zip_path = PHASE6_DIR / "phase6_nfl_database_export.zip"
-        if st.button("Export Saved Database ZIP", use_container_width=True, key="sidebar_phase6_export"):
-            try:
-                zip_path = _phase6_export_database_zip()
-                st.success(f"Export created: {zip_path}")
-            except Exception as e:
-                st.error(f"Export failed: {e}")
-        if zip_path.exists():
-            st.download_button("⬇️ Download Complete Phase 6 Database ZIP", zip_path.read_bytes(), file_name="phase6_nfl_database_export.zip", mime="application/zip", use_container_width=True, key="download_phase6_zip")
-        if USAGE_FILE.exists():
-            st.download_button("⬇️ Download Player Usage CSV", USAGE_FILE.read_bytes(), file_name="nfl_player_usage.csv", mime="text/csv", use_container_width=True, key="download_usage_csv")
-        if TEAM_CONTEXT_FILE.exists():
-            st.download_button("⬇️ Download Team Context JSON", TEAM_CONTEXT_FILE.read_bytes(), file_name="nfl_team_context.json", mime="application/json", use_container_width=True, key="download_team_json")
-    st.divider()
-    st.caption("Demo is hidden behind source mode. Use Live Underdog only for real boards.")
+        _render_phase6_admin()
     st.code("STORAGE_DIR=nfl_engine", language="bash")
 
 live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props()
@@ -2154,7 +2187,7 @@ best_edges=[p for p in projected if p.get("action_tier")=="BET"]
 
 st.markdown("<div class='kpi-strip'>"+
     f"<div class='kpi-box'><div class='kpi-label'>Player Cards</div><div class='kpi-value'>{len(projected)}</div><div class='kpi-sub'>shown on board</div></div>"+
-    f"<div class='kpi-box'><div class='kpi-label'>Live Lines</div><div class='kpi-value'>{real_count}</div><div class='kpi-sub'>{'Underdog detected' if real_count else 'waiting for live NFL props'}</div></div>"+
+    f"<div class='kpi-box'><div class='kpi-label'>Live Lines</div><div class='kpi-value'>{real_count}</div><div class='kpi-sub'>{'Underdog detected' if real_count else 'live only / no rows' if source_mode=='Live Underdog only' else 'demo fallback active'}</div></div>"+
     f"<div class='kpi-box'><div class='kpi-label'>Best Edges</div><div class='kpi-value'>{len(best_edges)}</div><div class='kpi-sub'>prob/edge filtered</div></div>"+
     f"<div class='kpi-box'><div class='kpi-label'>Before Saves</div><div class='kpi-value'>{len(load_json(PICK_LOG,[]))}</div><div class='kpi-sub'>official snapshots</div></div>"+
     f"<div class='kpi-box'><div class='kpi-label'>After Saves</div><div class='kpi-value'>{len(load_json(AFTER_LOG,[]))}</div><div class='kpi-sub'>closing snapshots</div></div>"+
@@ -2162,7 +2195,7 @@ st.markdown("<div class='kpi-strip'>"+
     "</div>", unsafe_allow_html=True)
 
 if live:
-    st.success(f"Live Underdog NFL props detected: {len(live)} rows. Demo mode is OFF for this refresh.")
+    st.success(f"🟢 Live Underdog NFL props detected: {len(live)} rows. Demo mode is OFF for this refresh.")
 elif source_mode == "Live Underdog only":
     st.warning("No live Underdog NFL rows were detected. Live-only mode is showing an empty board instead of demo lines.")
 else:
@@ -2173,32 +2206,27 @@ if 'show_feed_debug' in globals() and show_feed_debug:
     st.caption("Latest Underdog/API request log")
     st.dataframe(pd.DataFrame(req_log[-25:]), use_container_width=True, hide_index=True)
 
-tabs=st.tabs(["Today / Weekly Board", "QBs", "RBs", "WRs", "TEs", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
+tabs=st.tabs(["Today / Weekly Board", "QBs", "RBs", "Receivers", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
 
 with tabs[0]:
     st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
-    _render_prop_table(projected)
-    if projected:
-        st.caption("Use QBs/RBs/WRs/TEs tabs for cleaner position-specific prop boards.")
+    _render_prop_table(projected, "NFL Board")
 
 with tabs[1]:
-    _render_position_page("QBs", projected)
+    _render_position_board(projected, "QBs")
 
 with tabs[2]:
-    _render_position_page("RBs", projected)
+    _render_position_board(projected, "RBs")
 
 with tabs[3]:
-    _render_position_page("WRs", projected)
+    _render_position_board(projected, "Receivers")
 
 with tabs[4]:
-    _render_position_page("TEs", projected)
-
-with tabs[5]:
     st.markdown("<div class='section-title-pro'>Best Edges + Official Filter</div>", unsafe_allow_html=True)
     filt_rows=[]
     for p in projected:
         filt_rows.append({
-            "Player": p.get("player"), "Position": p.get("position"), "Prop": p.get("prop"), "Pick": p.get("pick"),
+            "Player": p.get("player"), "Pos": p.get("position"), "Prop": p.get("prop"), "Pick": p.get("pick"),
             "Signal": p.get("signal"), "Tier": p.get("action_tier"), "Line": p.get("line"),
             "Proj": p.get("projection"), "Edge": p.get("edge"), "Fair Prob %": None if p.get("fair_prob") is None else round(p.get("fair_prob")*100,1),
             "EV %": None if p.get("ev") is None else round(p.get("ev")*100,1), "Kelly %": round((p.get("kelly") or 0)*100,2),
@@ -2207,34 +2235,41 @@ with tabs[5]:
         })
     if filt_rows:
         st.dataframe(pd.DataFrame(filt_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No props loaded.")
     edges=sorted(best_edges, key=lambda x: (x.get("fair_prob") or 0, x.get("data_score") or 0, abs(x.get("edge") or 0)), reverse=True)
-    if not edges:
-        st.warning("No strong edge cards yet. In Live Underdog only mode this is normal until NFL props are posted.")
+    st.markdown("<div class='section-title-pro'>Best Edge Cards</div>", unsafe_allow_html=True)
+    if not edges: st.warning("No strong edge cards yet. During live-only/no-line mode this is normal.")
     for p in edges[:30]:
-        _render_player_card(p, show_ladder=False)
+        st.markdown(f"""
+        <div class='pick-card'><div class='player-name'>{p['player']} — {p['prop']}</div>
+        <span class='badge'>{p.get('team','')}</span><span class='badge'>{p.get('matchup','')}</span><span class='badge good-badge'>{p.get('signal')}</span><span class='badge yellow-badge'>Pure Upside: {p['pure_upside']}</span>
+        <div class='kpi-strip'>
+        <div class='metric-card'><div class='kpi-label'>Line</div><div class='kpi-value'>{p.get('line')}</div></div>
+        <div class='metric-card'><div class='kpi-label'>Projection</div><div class='kpi-value'>{p.get('projection')}</div></div>
+        <div class='metric-card'><div class='kpi-label'>Edge</div><div class='kpi-value'>{p.get('edge')}</div></div>
+        <div class='metric-card'><div class='kpi-label'>Fair Prob</div><div class='kpi-value'>{round((p.get('fair_prob') or 0)*100,1)}%</div></div>
+        <div class='metric-card'><div class='kpi-label'>Ceiling P90</div><div class='kpi-value'>{p.get('p90')}</div></div>
+        <div class='metric-card'><div class='kpi-label'>Score</div><div class='kpi-value'>{p.get('data_score')}</div></div>
+        <div class='metric-card'><div class='kpi-label'>Stability</div><div class='kpi-value'>{p.get('stability_score')}</div></div>
+        </div></div>""", unsafe_allow_html=True)
+
+with tabs[5]:
+    _render_player_cards(projected, header="Clickable Player Cards")
 
 with tabs[6]:
-    st.markdown("<div class='section-title-pro'>Clickable Player Cards</div>", unsafe_allow_html=True)
-    if not projected:
-        st.warning("No player cards loaded.")
-    for p in projected:
-        _render_player_card(p, show_ladder=True)
-
-with tabs[7]:
     st.markdown("<div class='section-title-pro'>Alt-Line Ladder</div>", unsafe_allow_html=True)
     names=[f"{p['player']} — {p['prop']}" for p in projected]
     if names:
         choice=st.selectbox("Choose Player Prop", names)
         p=projected[names.index(choice)]
         st.dataframe(alt_ladder(p), use_container_width=True, hide_index=True)
-    else:
-        st.warning("No props to ladder.")
+    else: st.warning("No props to ladder.")
 
-with tabs[8]:
+with tabs[7]:
     st.markdown("<div class='section-title-pro'>Correlation Builder</div>", unsafe_allow_html=True)
     st.write("Use this to avoid bad parlays and find positive stacks.")
-    if df.empty:
-        st.warning("No player cards loaded.")
+    if df.empty: st.warning("No player cards loaded.")
     else:
         labels=[f"{p['player']} — {p['prop']}" for p in projected]
         left=st.selectbox("Leg 1", labels, key="corr1")
@@ -2243,15 +2278,12 @@ with tabs[8]:
         p2=projected[labels.index(right)]
         corr="Neutral"
         if p1.get("matchup")==p2.get("matchup"):
-            if "Passing" in str(p1["prop"]) and p2["prop"] in ["Receiving Yards","Receptions","Anytime TD","Longest Reception"]:
-                corr="Positive QB stack"
-            elif p1.get("team")==p2.get("team") and p1.get("prop")==p2.get("prop"):
-                corr="Possible target/usage conflict"
-            elif p1.get("team")!=p2.get("team") and any(x in str(p1.get("prop")) for x in ["Passing","Receiving"]) and any(x in str(p2.get("prop")) for x in ["Passing","Receiving"]):
-                corr="Positive game-script shootout"
+            if "Passing" in p1["prop"] and p2["prop"] in ["Receiving Yards","Receptions","Anytime TD","Longest Reception"]: corr="Positive QB stack"
+            elif p1["team"]==p2["team"] and p1["prop"]==p2["prop"]: corr="Possible target/usage conflict"
+            elif p1["team"]!=p2["team"] and any(x in p1["prop"] for x in ["Passing","Receiving"]) and any(x in p2["prop"] for x in ["Passing","Receiving"]): corr="Positive game-script shootout"
         st.success(f"Correlation Read: {corr}")
 
-with tabs[9]:
+with tabs[8]:
     st.markdown("<div class='section-title-pro'>Save Before / After / Final Grade</div>", unsafe_allow_html=True)
     c1,c2,c3=st.columns(3)
     with c1:
@@ -2262,9 +2294,8 @@ with tabs[9]:
         st.write("Final grading below")
     st.divider()
     if projected:
-        labels=[f"{p['player']} — {p['prop']}" for p in projected]
-        g_choice=st.selectbox("Prop to grade", labels)
-        g=projected[labels.index(g_choice)]
+        g_choice=st.selectbox("Prop to grade", [f"{p['player']} — {p['prop']}" for p in projected])
+        g=projected[[f"{p['player']} — {p['prop']}" for p in projected].index(g_choice)]
         actual=st.number_input("Actual result", min_value=0.0, step=0.5)
         if st.button("Submit Final Grade + Learn"):
             line=safe_float(g.get("line")); pick=g.get("pick"); win=None
@@ -2274,21 +2305,18 @@ with tabs[9]:
             rows=load_json(RESULT_LOG,[]); rows.append({**g,"actual":actual,"win":win,"graded_at":now_iso(),"new_learning_scale":scale}); save_json(RESULT_LOG,rows[-5000:])
             st.success(f"Graded. Result: {'WIN' if win else 'LOSS' if win is False else 'NO LINE'} · New learning scale: {scale}")
 
-with tabs[10]:
+with tabs[9]:
     st.markdown("<div class='section-title-pro'>Learning Dashboard</div>", unsafe_allow_html=True)
     results=load_json(RESULT_LOG,[]); learn=load_json(LEARN_FILE,{})
     if results:
         rdf=pd.DataFrame(results)
         st.metric("Graded Props",len(rdf))
-        if "win" in rdf.columns:
-            st.metric("Hit Rate", f"{round(rdf['win'].dropna().mean()*100,1)}%" if len(rdf['win'].dropna()) else "N/A")
+        if "win" in rdf.columns: st.metric("Hit Rate", f"{round(rdf['win'].dropna().mean()*100,1)}%" if len(rdf['win'].dropna()) else "N/A")
         st.dataframe(rdf.tail(100), use_container_width=True)
-    else:
-        st.info("No graded NFL props yet. Once you grade results, this dashboard will populate.")
-    if learn:
-        st.json(learn)
+    else: st.info("No graded NFL props yet. Once you grade results, this dashboard will populate.")
+    if learn: st.json(learn)
 
-with tabs[11]:
+with tabs[10]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
     st.write("This tab scans Underdog for NFL moneyline/winner markets when they are posted. It will not create fake moneylines if Underdog does not expose them yet.")
     if moneylines:
