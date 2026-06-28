@@ -30,6 +30,8 @@ LEARN_FILE = LOCAL_DIR / "nfl_learning.json"
 CLV_FILE = LOCAL_DIR / "nfl_clv_tracker.json"
 LINE_HISTORY_FILE = LOCAL_DIR / "nfl_line_history.json"
 REQUEST_LOG = LOCAL_DIR / "request_log.json"
+BOARD_CACHE_FILE = LOCAL_DIR / "nfl_last_pulled_board.json"
+MONEYLINE_CACHE_FILE = LOCAL_DIR / "nfl_last_pulled_moneylines.json"
 USAGE_FILE = LOCAL_DIR / "nfl_player_usage.csv"
 TEAM_CONTEXT_FILE = LOCAL_DIR / "nfl_team_context.json"
 INJURY_FILE = LOCAL_DIR / "nfl_injuries.json"
@@ -581,7 +583,7 @@ def flatten(obj):
     return out
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_nfl_props():
+def fetch_underdog_nfl_props(cache_bust=0):
     """Pull live Underdog NFL props when available.
 
     Safety behavior:
@@ -645,7 +647,7 @@ def fetch_underdog_nfl_props():
     return clean[:500]
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_nfl_moneylines():
+def fetch_underdog_nfl_moneylines(cache_bust=0):
     """Scan Underdog feeds for NFL moneyline/winner markets when Underdog posts them.
 
     Some Underdog endpoints only expose player over/under props. This function is intentionally
@@ -691,6 +693,42 @@ def fetch_underdog_nfl_moneylines():
             seen.add(key); clean.append(r)
     request_log("UNDERDOG_NFL_MONEYLINE_PULL", "FOUND" if clean else "NO_MONEYLINE_ROWS", endpoint_debug)
     return clean[:200]
+
+
+def save_last_pulled_board(live_rows, moneyline_rows=None):
+    """Persist the latest real Underdog pull so the board can be inspected and reused.
+
+    This mirrors the MLB workflow: pull the board, keep the exact slate snapshot, then
+    allow Save BEFORE / AFTER to operate on the full current board.
+    """
+    live_rows = live_rows or []
+    moneyline_rows = moneyline_rows or []
+    payload = {
+        "pulled_at": now_iso(),
+        "source": "Underdog",
+        "row_count": len(live_rows),
+        "rows": live_rows,
+    }
+    save_json(BOARD_CACHE_FILE, payload)
+    save_json(MONEYLINE_CACHE_FILE, {
+        "pulled_at": now_iso(),
+        "source": "Underdog",
+        "row_count": len(moneyline_rows),
+        "rows": moneyline_rows,
+    })
+    return payload
+
+def load_last_pulled_board():
+    data = load_json(BOARD_CACHE_FILE, {})
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        return data
+    return {"pulled_at": None, "row_count": 0, "rows": []}
+
+def load_last_pulled_moneylines():
+    data = load_json(MONEYLINE_CACHE_FILE, {})
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        return data
+    return {"pulled_at": None, "row_count": 0, "rows": []}
 
 
 # ---------- MLB-style stable seeds + Phase 6 NFL database ----------
@@ -3016,6 +3054,23 @@ st.markdown(f"""
 with st.sidebar:
     st.header("Controls")
     source_mode=st.radio("Prop Source", ["Live Underdog only", "Live Underdog first, demo fallback", "Demo board only"], index=0)
+
+    if "board_pull_id" not in st.session_state:
+        st.session_state["board_pull_id"] = 0
+    last_board_meta = load_last_pulled_board()
+    if st.button("🔄 Refresh / Pull Underdog Board Lines", use_container_width=True):
+        st.session_state["board_pull_id"] = int(st.session_state.get("board_pull_id", 0)) + 1
+        try:
+            fetch_underdog_nfl_props.clear()
+            fetch_underdog_nfl_moneylines.clear()
+            safe_get_json.clear()
+        except Exception:
+            pass
+        request_log("MANUAL_PULL_BOARD", "REQUESTED", f"pull_id={st.session_state['board_pull_id']}")
+        st.rerun()
+    st.caption(f"Last saved board pull: {last_board_meta.get('pulled_at') or 'None'} · Rows: {last_board_meta.get('row_count', 0)}")
+    use_saved_board_if_blank = st.checkbox("Use last pulled board if live pull is blank", value=False, help="Useful if Underdog temporarily fails after you already pulled a board. Demo mode is still separate.")
+
     # Prop filtering is now handled by the main QBs / RBs / Receivers tabs.
     # Keep every supported market active in the engine and hide the old sidebar multiselect.
     prop_filter=list(PROP_CONFIG.keys())
@@ -3039,8 +3094,18 @@ with st.sidebar:
         _render_phase6_admin()
     st.code("STORAGE_DIR=nfl_engine", language="bash")
 
-live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props()
-moneylines=[] if source_mode=="Demo board only" else fetch_underdog_nfl_moneylines()
+pull_id = int(st.session_state.get("board_pull_id", 0))
+live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props(pull_id)
+moneylines=[] if source_mode=="Demo board only" else fetch_underdog_nfl_moneylines(pull_id)
+if live:
+    save_last_pulled_board(live, moneylines)
+elif source_mode != "Demo board only" and use_saved_board_if_blank:
+    cached_board = load_last_pulled_board()
+    cached_money = load_last_pulled_moneylines()
+    live = cached_board.get("rows", []) or []
+    moneylines = cached_money.get("rows", []) or []
+    if live:
+        request_log("UNDERDOG_BOARD_CACHE", "USING_LAST_PULLED", f"rows={len(live)} pulled_at={cached_board.get('pulled_at')}")
 raw = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
 projected=[project_row(r) for r in raw if r.get("prop") in prop_filter]
 for _p in projected:
@@ -3062,9 +3127,10 @@ st.markdown("<div class='kpi-strip'>"+
     "</div>", unsafe_allow_html=True)
 
 if live:
-    st.success(f"🟢 Live Underdog NFL props detected: {len(live)} rows. Demo mode is OFF for this refresh.")
+    cached_meta = load_last_pulled_board()
+    st.success(f"🟢 Live/loaded Underdog NFL props detected: {len(live)} rows. Last board pull: {cached_meta.get('pulled_at') or 'current refresh'}.")
 elif source_mode == "Live Underdog only":
-    st.warning("No live Underdog NFL rows were detected. Live-only mode is showing an empty board instead of demo lines.")
+    st.warning("No live Underdog NFL rows were detected. Click 🔄 Refresh / Pull Underdog Board Lines in the sidebar when props are posted.")
 else:
     st.info("Demo/testing mode is active. These rows are for UI testing only and should not be treated as real plays.")
 
