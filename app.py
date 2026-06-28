@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v2.6 — POSITION TABS + RECEIVERS + SAVED DATABASE"
+APP_VERSION = "NFL v2.7 — FINAL MASTER + CLEAR LOGS + MLB-STYLE LEARNING"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -248,6 +248,37 @@ def load_json(path, default):
 def save_json(path, data):
     try: Path(path).write_text(json.dumps(data, indent=2))
     except Exception: pass
+
+def clear_json_file(path, empty_value=None):
+    """Clear one saved app log safely without deleting the file path itself."""
+    if empty_value is None:
+        empty_value = []
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(empty_value, indent=2))
+        return True
+    except Exception:
+        return False
+
+def clear_board_logs(clear_learning=False, clear_line_history=False):
+    """Clear board snapshot/grade logs. Phase 6 historical database files are not touched."""
+    cleared = []
+    for label, path, empty in [
+        ("Before snapshots", PICK_LOG, []),
+        ("After snapshots", AFTER_LOG, []),
+        ("Final graded results", RESULT_LOG, []),
+    ]:
+        if clear_json_file(path, empty):
+            cleared.append(label)
+    if clear_learning:
+        if clear_json_file(LEARN_FILE, {}):
+            cleared.append("Learning calibration")
+    if clear_line_history:
+        if clear_json_file(CLV_FILE, {}):
+            cleared.append("CLV tracker")
+        if clear_json_file(LINE_HISTORY_FILE, {}):
+            cleared.append("Line history")
+    return cleared
 def strip_accents(text):
     try: return "".join(ch for ch in unicodedata.normalize("NFKD", str(text or "")) if not unicodedata.combining(ch))
     except Exception: return str(text or "")
@@ -2676,6 +2707,24 @@ with tabs[8]:
         st.metric("Current Board Rows", len(projected))
         st.metric("Bettable Rows", sum(1 for p in projected if p.get("bettable")))
         st.metric("Live Rows", sum(1 for p in projected if p.get("source") != "DEMO"))
+
+    st.divider()
+    st.subheader("Clear Board Logs")
+    st.caption("Use this when you saved demo/test slates and want a clean board. This does NOT delete the Phase 6 historical database.")
+    clear_col1, clear_col2, clear_col3 = st.columns([1.2, 1.2, 2])
+    with clear_col1:
+        clear_learning_flag = st.checkbox("Also clear learning/calibration", value=False, help="Leave off unless you want to reset learned prop calibration too.")
+    with clear_col2:
+        clear_line_flag = st.checkbox("Also clear CLV/line history", value=False, help="Leave off unless you want to reset saved line movement history.")
+    with clear_col3:
+        confirm_clear = st.text_input("Type CLEAR to confirm", value="", placeholder="CLEAR")
+        if st.button("🧹 Clear Board Logs", use_container_width=True):
+            if confirm_clear.strip().upper() != "CLEAR":
+                st.warning("Type CLEAR first so logs are not wiped by accident.")
+            else:
+                cleared = clear_board_logs(clear_learning=clear_learning_flag, clear_line_history=clear_line_flag)
+                st.success("Cleared: " + ", ".join(cleared) if cleared else "Nothing cleared")
+                st.info("Phase 6 database was preserved.")
 
     st.divider()
     st.subheader("Bulk Grade Saved BEFORE Slate")
