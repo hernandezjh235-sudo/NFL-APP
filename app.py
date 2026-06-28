@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v2.4 — PHASE 6 BUILDER 3.0 VERIFIED + SAVED DATABASE"
+APP_VERSION = "NFL v2.5 — PHASE 6 DOWNLOAD ZIP + SAVED DATABASE"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2210,6 +2210,7 @@ with tabs[8]:
             else:
                 st.warning(f"Phase 6 database not built: {diag.get('status')}")
             st.json(diag)
+        zip_path = PHASE6_DIR / "phase6_nfl_database_export.zip"
         if st.button("Export Saved Database ZIP", use_container_width=True):
             try:
                 zip_path = _phase6_export_database_zip()
@@ -2217,6 +2218,45 @@ with tabs[8]:
                 st.caption("Commit the unzipped phase6_nfl_database folder to GitHub if you want it hard-input like MLB learning data.")
             except Exception as e:
                 st.error(f"Export failed: {e}")
+
+        # Streamlit Cloud stores generated files on the server. This exposes the ZIP
+        # directly to your browser so you can download it and add it to GitHub.
+        if zip_path.exists():
+            try:
+                st.download_button(
+                    label="⬇️ Download Complete Phase 6 Database ZIP",
+                    data=zip_path.read_bytes(),
+                    file_name="phase6_nfl_database_export.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+            except Exception as e:
+                st.warning(f"ZIP exists but could not be prepared for download: {e}")
+        else:
+            st.caption("Export the saved database first, then the download button will appear here.")
+
+        if USAGE_FILE.exists():
+            try:
+                st.download_button(
+                    label="⬇️ Download Player Usage CSV",
+                    data=USAGE_FILE.read_bytes(),
+                    file_name="nfl_player_usage.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
+        if TEAM_CONTEXT_FILE.exists():
+            try:
+                st.download_button(
+                    label="⬇️ Download Team Context JSON",
+                    data=TEAM_CONTEXT_FILE.read_bytes(),
+                    file_name="nfl_team_context.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            except Exception:
+                pass
     with c2:
         st.info("Once these files are saved, the app uses the local database automatically and DOES NOT pull the same last-season data every day. You can also commit the phase6_nfl_database folder to GitHub and the app will auto-load it like MLB learning data.")
         st.write("Generated files:")
