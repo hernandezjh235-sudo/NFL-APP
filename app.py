@@ -349,15 +349,37 @@ def official_rejection_reasons(p):
     return reasons
 
 def build_signal(p):
+    """Readable NFL signal layer.
+
+    Important: official rejection reasons still exist for the Official/Best Edge filter,
+    but the player card should not say "PASS — UNDER" all day. The card should
+    show the model direction first: OVER / UNDER / LEAN OVER / LEAN UNDER.
+    """
     reasons=official_rejection_reasons(p)
-    side=p.get("pick","PASS")
+    side=str(p.get("pick") or "PASS").upper()
     prob=safe_float(p.get("fair_prob"),0) or 0
     score=safe_float(p.get("data_score"),0) or 0
     edge_abs=abs(safe_float(p.get("edge"),0) or 0)
-    elite=(not reasons and prob>=MIN_NFL_ELITE_PROB and score>=MIN_NFL_ELITE_SCORE and edge_abs>=edge_requirement(p.get("prop"))*1.35)
-    if elite: return f"🔥 ELITE WATCH {side}", "BET", reasons
-    if not reasons: return f"✅ STRONG WATCH {side}", "BET", reasons
-    return f"🚫 PASS — {side}", "PASS", reasons
+    req=edge_requirement(p.get("prop"))
+
+    if side in ["NO LINE", "PASS"] or safe_float(p.get("line")) is None:
+        return "🚫 NO LINE", "PASS", reasons
+
+    elite=(not reasons and prob>=MIN_NFL_ELITE_PROB and score>=MIN_NFL_ELITE_SCORE and edge_abs>=req*1.35)
+    strong=(not reasons and prob>=MIN_NFL_BETTABLE_PROB and score>=MIN_NFL_DATA_SCORE and edge_abs>=req)
+
+    if elite:
+        return f"🔥 {side}", "BET", reasons
+    if strong:
+        return f"✅ {side}", "BET", reasons
+
+    # Non-official plays still deserve a clean model direction.
+    # LEAN means there is some edge/probability, but one or more gates blocked it from official.
+    if prob >= 0.57 or edge_abs >= req*0.55:
+        return f"⚠️ LEAN {side}", "LEAN", reasons
+
+    # Thin direction: model barely prefers a side. Still do not label it PASS on the card.
+    return f"{side}", "WATCH", reasons
 
 def get_secret(key, default=""):
     try: return st.secrets[key]
@@ -2165,7 +2187,9 @@ st.markdown(f"""
 with st.sidebar:
     st.header("Controls")
     source_mode=st.radio("Prop Source", ["Live Underdog only", "Live Underdog first, demo fallback", "Demo board only"], index=0)
-    prop_filter=st.multiselect("Prop Types", list(PROP_CONFIG.keys()), default=list(PROP_CONFIG.keys()))
+    # Prop filtering is now handled by the main QBs / RBs / Receivers tabs.
+    # Keep every supported market active in the engine and hide the old sidebar multiselect.
+    prop_filter=list(PROP_CONFIG.keys())
     min_score=st.slider("Minimum Data Score",0,99,0)
     show_all=st.checkbox("Show all player cards", True)
     st.divider()
