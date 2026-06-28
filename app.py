@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v2.7 — FINAL MASTER + CLEAR LOGS + MLB-STYLE LEARNING"
+APP_VERSION = "NFL v2.8 — BAYESIAN MARKOV + ADVANCED SIM ASSIST + XGB"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2121,6 +2121,430 @@ def simulate_prop_distribution(base, sigma, prop, sims, seed, collapse_prob=0.11
         sim=np.clip(core,0,None)
     return sim
 
+
+
+def _prop_target_columns(prop):
+    """Map NFL prop markets to possible actual stat columns in Phase 6 / graded logs."""
+    mapping = {
+        "Passing Yards": ["passing_yards", "pass_yds", "passing_yards_pg"],
+        "Passing TDs": ["passing_tds", "pass_tds", "passing_tds_pg"],
+        "Interceptions": ["interceptions", "ints", "interceptions_pg"],
+        "Pass Attempts": ["attempts", "pass_attempts", "pass_attempts_pg"],
+        "Completions": ["completions", "completions_pg"],
+        "Rushing Yards": ["rushing_yards", "rush_yds", "rushing_yards_pg"],
+        "Rush Attempts": ["carries", "rush_attempts", "rush_attempts_pg"],
+        "Receiving Yards": ["receiving_yards", "rec_yds", "receiving_yards_pg"],
+        "Receptions": ["receptions", "receptions_pg"],
+        "Fantasy Points": ["fantasy_points_ppr", "fantasy_points", "fantasy_points_pg"],
+        "Anytime TD": ["touchdowns", "receiving_tds", "rushing_tds", "passing_tds"],
+        "Longest Reception": ["longest_reception", "longest_rec"],
+        "Longest Rush": ["longest_rush"],
+        "Kicking Points": ["kicking_points"],
+        "Field Goals Made": ["fg_made", "field_goals_made"],
+    }
+    return mapping.get(str(prop), [])
+
+XGB_FEATURE_KEYS = [
+    "projection", "line", "edge", "fair_prob", "data_score", "stability_score", "usage_quality",
+    "opportunity_score", "pace_factor", "vegas_factor", "game_script_factor", "matchup_factor",
+    "blowout_prob", "collapse_prob", "ceiling_prob", "snap_share", "route_participation",
+    "target_share", "air_yards_share", "red_zone_touch_share", "targets_pg", "receptions_pg",
+    "rush_attempts_pg", "carries_share", "pass_attempts_pg", "spread", "game_total", "team_total",
+    "plays_pg", "pbp_plays_pg", "pass_rate", "rush_rate", "def_pass_rank", "def_run_rank",
+    "def_role_rank", "pressure_rate", "coverage_grade", "travel_miles", "rest_days",
+]
+
+
+def _numeric_feature(row, key, default=0.0):
+    v = safe_float((row or {}).get(key))
+    return default if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) else float(v)
+
+
+def _xgb_feature_vector(row):
+    return [_numeric_feature(row, k, 0.0) for k in XGB_FEATURE_KEYS]
+
+
+def _graded_training_rows(prop=None):
+    rows = load_json(RESULT_LOG, [])
+    out = []
+    for r in rows:
+        if safe_float(r.get("actual")) is None or safe_float(r.get("projection")) is None:
+            continue
+        if prop and r.get("prop") != prop:
+            continue
+        out.append(r)
+    return out
+
+
+def xgboost_assist_projection(row, rule_projection):
+    """Optional post-grade XGBoost assist.
+
+    This intentionally does NOT replace Monte Carlo.  The rules/opportunity engine produces
+    the first projection, XGBoost learns from your graded results after enough samples, then
+    Monte Carlo converts the final blended projection into probabilities.
+    """
+    enabled = bool(st.session_state.get("xgb_assist_enabled", False))
+    if not enabled:
+        return float(rule_projection), {"enabled": False, "status": "OFF", "blend": 0.0}
+
+    prop = row.get("prop")
+    same_prop = _graded_training_rows(prop)
+    all_rows = _graded_training_rows(None)
+    train_rows = same_prop if len(same_prop) >= 35 else all_rows
+    min_rows = int(st.session_state.get("xgb_min_rows", 50) or 50)
+    if len(train_rows) < min_rows:
+        return float(rule_projection), {
+            "enabled": True,
+            "status": f"WARMUP {len(train_rows)}/{min_rows} graded rows",
+            "blend": 0.0,
+            "sample_count": len(train_rows),
+        }
+
+    try:
+        X = np.array([_xgb_feature_vector(r) for r in train_rows], dtype=float)
+        y = np.array([safe_float(r.get("actual"), safe_float(r.get("projection"), 0)) or 0 for r in train_rows], dtype=float)
+        if len(y) < min_rows or np.nanstd(y) <= 0:
+            return float(rule_projection), {"enabled": True, "status": "NO_VARIANCE", "blend": 0.0, "sample_count": len(train_rows)}
+        try:
+            from xgboost import XGBRegressor
+            model = XGBRegressor(
+                n_estimators=120,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                objective="reg:squarederror",
+                random_state=42,
+                n_jobs=1,
+            )
+            model_name = "XGBoost"
+        except Exception:
+            from sklearn.ensemble import GradientBoostingRegressor
+            model = GradientBoostingRegressor(n_estimators=120, max_depth=3, learning_rate=0.05, random_state=42)
+            model_name = "GBR fallback"
+        model.fit(X, y)
+        pred = float(model.predict(np.array([_xgb_feature_vector(row)], dtype=float))[0])
+        if not np.isfinite(pred):
+            raise ValueError("non-finite ML prediction")
+        rule = float(rule_projection)
+        # Keep the assist as an assist.  It cannot yank the projection wildly away from the main engine.
+        pred = clamp(pred, rule * 0.72, rule * 1.28) if rule > 0 else max(0, pred)
+        max_blend = safe_float(st.session_state.get("xgb_blend_weight"), 0.22) or 0.22
+        confidence_blend = clamp((len(train_rows) - min_rows) / 250.0, 0.08, max_blend)
+        blended = (rule * (1 - confidence_blend)) + (pred * confidence_blend)
+        return float(blended), {
+            "enabled": True,
+            "status": "ACTIVE",
+            "model": model_name,
+            "rule_projection": round(rule, 3),
+            "xgb_projection": round(pred, 3),
+            "blend": round(confidence_blend, 3),
+            "sample_count": len(train_rows),
+            "same_prop_samples": len(same_prop),
+        }
+    except Exception as e:
+        return float(rule_projection), {"enabled": True, "status": f"ERROR: {str(e)[:90]}", "blend": 0.0, "sample_count": len(train_rows)}
+
+
+def _phase6_consistency_score(player, prop):
+    """Historical consistency from saved weekly logs when available."""
+    try:
+        if not PHASE6_PLAYER_LOG_FILE.exists():
+            return 70, "Consistency neutral: no weekly log file loaded"
+        cols = ["player", "player_display_name", "position", "week"] + _prop_target_columns(prop)
+        # Read only available columns if possible; fall back to full small-ish CSV.
+        sample = pd.read_csv(PHASE6_PLAYER_LOG_FILE, nrows=1)
+        usecols = [c for c in cols if c in sample.columns]
+        df = pd.read_csv(PHASE6_PLAYER_LOG_FILE, usecols=usecols if usecols else None)
+        name_col = "player" if "player" in df.columns else "player_display_name" if "player_display_name" in df.columns else None
+        if not name_col:
+            return 70, "Consistency neutral: no player name column"
+        target = next((c for c in _prop_target_columns(prop) if c in df.columns), None)
+        if not target:
+            return 70, "Consistency neutral: no stat column for prop"
+        g = df[df[name_col].map(norm) == norm(player)].copy()
+        vals = pd.to_numeric(g[target], errors="coerce").dropna()
+        vals = vals[vals >= 0]
+        if len(vals) < 5:
+            return 70, f"Consistency warming up: {len(vals)} games"
+        mean = float(vals.mean())
+        std = float(vals.std())
+        cv = std / max(1.0, mean)
+        score = int(clamp(100 - cv * 48, 30, 96))
+        return score, f"Historical consistency score {score} from {len(vals)} games"
+    except Exception as e:
+        return 70, f"Consistency neutral: {str(e)[:60]}"
+
+
+def advanced_context_engine(row, prop):
+    """Adds the extra football context layer: EP/drive, rest/travel, refs, importance,
+    player consistency, and feature validation.
+    """
+    factor=1.0; notes=[]; risk="LOW"; ctx={}
+    total=safe_float(row.get("game_total"))
+    team_total=safe_float(row.get("team_total"))
+    if team_total is None and total is not None:
+        spread=safe_float(row.get("spread"), 0) or 0
+        # Approx implied points.  Negative spread means favorite.
+        team_total = (total / 2.0) - (spread / 2.0)
+    if team_total is not None:
+        drives=safe_float(row.get("projected_drives"), 10.4) or 10.4
+        ep_drive=team_total / max(7.5, drives)
+        ctx["expected_points_per_drive"] = round(ep_drive,3)
+        if ep_drive >= 2.45 and prop in ["Passing TDs","Fantasy Points","Anytime TD","Kicking Points","Field Goals Made","Receiving Yards"]:
+            factor*=1.018; notes.append("EP/drive boost: strong scoring environment")
+        elif ep_drive <= 1.75 and prop in ["Passing TDs","Fantasy Points","Anytime TD","Receiving Yards","Rushing Yards"]:
+            factor*=0.975; risk="MED"; notes.append("EP/drive tax: weak scoring environment")
+
+    rest=safe_float(row.get("rest_days"))
+    travel=safe_float(row.get("travel_miles"))
+    if rest is not None:
+        ctx["rest_days"] = rest
+        if rest <= 4:
+            factor*=0.985; risk="MED"; notes.append("Short-week fatigue tax")
+        elif rest >= 10:
+            factor*=1.008; notes.append("Extra-rest preparation nudge")
+    if travel is not None:
+        ctx["travel_miles"] = travel
+        if travel >= 2200:
+            factor*=0.99; notes.append("Long-travel fatigue tax")
+        elif travel <= 350 and travel > 0:
+            factor*=1.003; notes.append("Short-travel stability nudge")
+
+    ref_pen=safe_float(row.get("ref_penalty_rate"), safe_float(row.get("ref_flags_pg"), None))
+    if ref_pen is not None:
+        ctx["ref_penalty_rate"] = ref_pen
+        if ref_pen >= 15:
+            risk="MED"; factor*=0.994; notes.append("Referee crew: high penalty/drive volatility")
+        elif ref_pen <= 10:
+            factor*=1.004; notes.append("Referee crew: low-flag pace stability")
+
+    importance=str(row.get("game_importance") or row.get("motivation") or "").upper()
+    starters_rest=str(row.get("starters_rest_risk") or "").upper()
+    if any(x in importance for x in ["HIGH","PLAYOFF","DIVISION","MUST"]):
+        factor*=1.006; notes.append("Game importance nudge: starters/volume more secure")
+    if any(x in starters_rest for x in ["HIGH","REST","LIMIT"]):
+        factor*=0.935; risk="HIGH"; notes.append("Starter rest / limited role risk")
+
+    consistency, consistency_note = _phase6_consistency_score(row.get("player"), prop)
+    ctx["consistency_score"] = consistency
+    if consistency <= 48:
+        risk="MED"; notes.append(consistency_note + " — volatility tax")
+    elif consistency >= 82:
+        notes.append(consistency_note + " — stable profile")
+
+    # Feature validation: tells you when the projection is leaning on defaults.
+    required_by_prop = {
+        "Passing Yards": ["pass_attempts_pg","pass_rate","game_total","def_pass_rank"],
+        "Passing TDs": ["pass_attempts_pg","red_zone_pass_rate","team_total","def_pass_rank"],
+        "Interceptions": ["pass_attempts_pg","pressure_rate","def_pressure_rate"],
+        "Rushing Yards": ["rush_attempts_pg","carries_share","rush_rate","def_run_rank"],
+        "Rush Attempts": ["rush_attempts_pg","carries_share","spread","rush_rate"],
+        "Receiving Yards": ["route_participation","target_share","air_yards_share","def_role_rank"],
+        "Receptions": ["route_participation","target_share","def_role_rank"],
+        "Longest Reception": ["air_yards_share","route_participation","explosive_pass_rate"],
+        "Fantasy Points": ["snap_share","target_share","red_zone_touch_share","team_total"],
+        "Anytime TD": ["red_zone_touch_share","team_total","goal_line_rush_rate"],
+    }
+    req = required_by_prop.get(prop, [])
+    missing = [k for k in req if safe_float(row.get(k)) is None and row.get(k) in [None, ""]]
+    ctx["missing_features"] = missing
+    if missing:
+        notes.append("Feature validation: missing " + ", ".join(missing[:4]))
+        factor*=clamp(1 - 0.006*len(missing), 0.965, 1.0)
+    return clamp(factor,0.90,1.06), risk, notes, ctx
+
+
+def _prop_target_columns(prop):
+    mapping = {
+        "Passing Yards": ["passing_yards", "pass_yds", "passing_yards_pg"],
+        "Passing TDs": ["passing_tds", "pass_tds", "passing_tds_pg"],
+        "Interceptions": ["interceptions", "ints", "interceptions_pg"],
+        "Rushing Yards": ["rushing_yards", "rush_yds", "rushing_yards_pg"],
+        "Rush Attempts": ["carries", "rush_attempts", "rush_attempts_pg"],
+        "Receiving Yards": ["receiving_yards", "rec_yds", "receiving_yards_pg"],
+        "Receptions": ["receptions", "receptions_pg"],
+        "Longest Reception": ["longest_rec", "receiving_yards", "receiving_yards_pg"],
+        "Longest Rush": ["longest_rush", "rushing_yards", "rushing_yards_pg"],
+        "Fantasy Points": ["fantasy_points_ppr", "fantasy_points", "fantasy_points_pg"],
+        "Anytime TD": ["receiving_tds", "rushing_tds", "passing_tds"],
+        "Kicking Points": ["kicking_points"],
+        "Field Goals Made": ["fg_made"],
+        "Pass Attempts": ["attempts", "pass_attempts_pg"],
+        "Completions": ["completions", "completions_pg"],
+    }
+    return mapping.get(str(prop), [])
+
+def _historical_player_values(player, prop, max_games=18):
+    """Read saved Phase 6 weekly logs and return recent values for the matching prop.
+    This is intentionally defensive so a missing column never breaks the board.
+    """
+    try:
+        if not PHASE6_PLAYER_LOG_FILE.exists():
+            return []
+        sample = pd.read_csv(PHASE6_PLAYER_LOG_FILE, nrows=1)
+        possible_name_cols = [c for c in ["player", "player_display_name", "player_name"] if c in sample.columns]
+        stat_cols = [c for c in _prop_target_columns(prop) if c in sample.columns]
+        base_cols = possible_name_cols + [c for c in ["week", "season"] if c in sample.columns] + stat_cols
+        if not possible_name_cols or not stat_cols:
+            return []
+        df = pd.read_csv(PHASE6_PLAYER_LOG_FILE, usecols=list(dict.fromkeys(base_cols)))
+        name_col = possible_name_cols[0]
+        g = df[df[name_col].map(norm) == norm(player)].copy()
+        if g.empty:
+            return []
+        if "week" in g.columns:
+            g = g.sort_values("week")
+        # Some props are composites, especially TD-style markets.
+        vals = None
+        if prop == "Anytime TD":
+            td_cols = [c for c in ["receiving_tds", "rushing_tds"] if c in g.columns]
+            if td_cols:
+                vals = g[td_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
+        if vals is None:
+            stat_col = stat_cols[0]
+            vals = pd.to_numeric(g[stat_col], errors="coerce")
+        vals = vals.dropna()
+        vals = vals[vals >= 0]
+        return [float(x) for x in vals.tail(max_games).tolist()]
+    except Exception:
+        return []
+
+def bayesian_markov_poisson_engine(row, prop, rule_projection):
+    """Optional advanced simulation assist.
+
+    Layers added here:
+    - Bayesian update: blends the rules projection with the player's own historical game logs.
+    - Markov game-state proxy: close/trailing/leading game scripts adjust volume by prop type.
+    - Poisson scoring-event nudge: touchdown/kicking/interception style props use scoring-event context.
+    - Elo/efficiency matchup proxy: team strength and opponent defense can apply small bounded nudges.
+
+    It is deliberately bounded. It should help calibration, not overpower the core engine.
+    """
+    enabled = bool(st.session_state.get("advanced_sim_assist_enabled", True))
+    if not enabled:
+        return float(rule_projection), {"enabled": False, "status": "OFF", "blend": 0.0, "notes": []}
+
+    projection = float(rule_projection or 0.0)
+    notes=[]; ctx={}; factor=1.0
+
+    # Bayesian update from saved weekly logs.
+    hist = _historical_player_values(row.get("player"), prop, max_games=18)
+    min_games = int(st.session_state.get("bayes_min_games", 5) or 5)
+    if len(hist) >= min_games:
+        hist_mean = float(np.mean(hist))
+        recent_mean = float(np.mean(hist[-5:])) if len(hist) >= 5 else hist_mean
+        hist_std = float(np.std(hist)) if len(hist) > 1 else 0.0
+        # More games + lower variance = higher confidence, capped so it remains an assist.
+        variance_conf = 1.0 / (1.0 + (hist_std / max(1.0, hist_mean)))
+        sample_conf = clamp(len(hist) / 18.0, 0.20, 1.0)
+        bayes_weight = clamp(0.10 + 0.18 * variance_conf * sample_conf, 0.08, 0.30)
+        bayes_mean = (hist_mean * 0.65) + (recent_mean * 0.35)
+        bounded_mean = clamp(bayes_mean, projection * 0.70, projection * 1.30) if projection > 0 else bayes_mean
+        projection = (projection * (1 - bayes_weight)) + (bounded_mean * bayes_weight)
+        ctx.update({"historical_games": len(hist), "historical_mean": round(hist_mean,3), "recent5_mean": round(recent_mean,3), "bayes_weight": round(bayes_weight,3)})
+        notes.append(f"Bayesian log update active: {len(hist)} games, weight {bayes_weight:.2f}")
+    else:
+        ctx["historical_games"] = len(hist)
+        notes.append(f"Bayesian log update warming up: {len(hist)}/{min_games} games")
+
+    # Markov game-state proxy using spread/total/pace: leading, close, trailing state distribution.
+    spread = safe_float(row.get("spread"), 0.0) or 0.0
+    total = safe_float(row.get("game_total"), 44.0) or 44.0
+    pace = safe_float(row.get("pace"), 50.0) or 50.0
+    lead_prob = clamp(0.34 + (-spread)*0.025, 0.12, 0.72)
+    trail_prob = clamp(0.34 + (spread)*0.025, 0.12, 0.72)
+    close_prob = clamp(1.0 - abs(lead_prob - 0.34) - abs(trail_prob - 0.34), 0.18, 0.58)
+    # normalize
+    z = max(0.01, lead_prob + trail_prob + close_prob)
+    lead_prob, trail_prob, close_prob = lead_prob/z, trail_prob/z, close_prob/z
+    ctx["markov_state_probs"] = {"leading": round(lead_prob,3), "close": round(close_prob,3), "trailing": round(trail_prob,3)}
+    markov_factor = 1.0
+    if prop in ["Passing Yards","Pass Attempts","Completions","Receiving Yards","Receptions","Longest Reception"]:
+        markov_factor *= (1 + trail_prob*0.035 - lead_prob*0.026)
+    elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+        markov_factor *= (1 + lead_prob*0.032 - trail_prob*0.025)
+    elif prop in ["Interceptions"]:
+        markov_factor *= (1 + trail_prob*0.030)
+    elif prop in ["Kicking Points", "Field Goals Made"]:
+        markov_factor *= (1 + close_prob*0.020)
+    if pace >= 56:
+        markov_factor *= 1.006
+    elif pace <= 47:
+        markov_factor *= 0.994
+    factor *= clamp(markov_factor, 0.94, 1.06)
+    notes.append("Markov game-state volume model applied")
+
+    # Poisson event-rate nudge for discrete scoring-like markets.
+    if prop in ["Passing TDs", "Anytime TD", "Interceptions", "Field Goals Made", "Kicking Points"]:
+        team_total = safe_float(row.get("team_total"))
+        if team_total is None:
+            team_total = (total/2.0) - (spread/2.0)
+        drives = safe_float(row.get("projected_drives"), 10.4) or 10.4
+        lam_score = clamp((team_total or 21.0) / max(1.0, drives), 0.9, 3.8)
+        ctx["poisson_lambda_score_drive"] = round(lam_score,3)
+        if prop in ["Passing TDs", "Anytime TD"]:
+            factor *= clamp(0.965 + lam_score*0.018, 0.96, 1.055)
+        elif prop in ["Field Goals Made", "Kicking Points"]:
+            # Kicker volume likes scoring environment but also close/stalled drives.
+            factor *= clamp(0.975 + lam_score*0.011 + close_prob*0.012, 0.965, 1.045)
+        elif prop == "Interceptions":
+            factor *= clamp(0.99 + trail_prob*0.025, 0.985, 1.04)
+        notes.append("Poisson event-rate nudge applied")
+
+    # Elo/efficiency proxy. If exact Elo is supplied, use it; otherwise infer from ranks/spread.
+    team_elo = safe_float(row.get("team_elo"))
+    opp_elo = safe_float(row.get("opp_elo"))
+    if team_elo is not None and opp_elo is not None:
+        elo_diff = clamp((team_elo - opp_elo) / 400.0, -0.22, 0.22)
+    else:
+        # Negative spread means stronger/favorite.
+        elo_diff = clamp((-spread) / 24.0, -0.20, 0.20)
+    ctx["elo_efficiency_diff"] = round(elo_diff,3)
+    if prop in ["Passing Yards","Receiving Yards","Receptions","Passing TDs","Fantasy Points","Anytime TD"]:
+        factor *= clamp(1 + elo_diff*0.035, 0.985, 1.018)
+    elif prop in ["Rushing Yards","Rush Attempts"]:
+        factor *= clamp(1 + elo_diff*0.025, 0.988, 1.016)
+    notes.append("Elo/efficiency matchup proxy applied")
+
+    final_projection = projection * clamp(factor, 0.90, 1.10)
+    return float(final_projection), {"enabled": True, "status": "ACTIVE", "blend": round(abs(final_projection - float(rule_projection or 0.0)) / max(1.0, float(rule_projection or 1.0)),3), "factor": round(factor,3), "context": ctx, "notes": notes}
+
+
+def ensemble_ml_assist_projection(row, rule_projection):
+    """Optional Random Forest / Neural-style assist after enough graded rows.
+    This is separate from XGBoost and stays bounded. It only turns on when the user has grades.
+    """
+    enabled = bool(st.session_state.get("ensemble_ml_assist_enabled", False))
+    if not enabled:
+        return float(rule_projection), {"enabled": False, "status": "OFF", "blend": 0.0}
+    prop = row.get("prop")
+    same_prop = _graded_training_rows(prop)
+    all_rows = _graded_training_rows(None)
+    train_rows = same_prop if len(same_prop) >= 45 else all_rows
+    min_rows = int(st.session_state.get("ensemble_min_rows", 75) or 75)
+    if len(train_rows) < min_rows:
+        return float(rule_projection), {"enabled": True, "status": f"WARMUP {len(train_rows)}/{min_rows} graded rows", "blend": 0.0, "sample_count": len(train_rows)}
+    try:
+        from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
+        X = np.array([_xgb_feature_vector(r) for r in train_rows], dtype=float)
+        y = np.array([safe_float(r.get("actual"), safe_float(r.get("projection"), 0)) or 0 for r in train_rows], dtype=float)
+        if len(y) < min_rows or np.nanstd(y) <= 0:
+            return float(rule_projection), {"enabled": True, "status": "NO_VARIANCE", "blend": 0.0, "sample_count": len(train_rows)}
+        rf = RandomForestRegressor(n_estimators=160, max_depth=6, min_samples_leaf=3, random_state=77, n_jobs=1)
+        et = ExtraTreesRegressor(n_estimators=160, max_depth=6, min_samples_leaf=3, random_state=88, n_jobs=1)
+        rf.fit(X, y); et.fit(X, y)
+        xrow = np.array([_xgb_feature_vector(row)], dtype=float)
+        pred = float((rf.predict(xrow)[0] * 0.55) + (et.predict(xrow)[0] * 0.45))
+        rule = float(rule_projection or 0.0)
+        pred = clamp(pred, rule * 0.76, rule * 1.24) if rule > 0 else max(0, pred)
+        max_blend = safe_float(st.session_state.get("ensemble_blend_weight"), 0.16) or 0.16
+        blend = clamp((len(train_rows) - min_rows) / 350.0, 0.04, max_blend)
+        blended = (rule * (1 - blend)) + (pred * blend)
+        return float(blended), {"enabled": True, "status": "ACTIVE", "model": "RF/ExtraTrees", "ensemble_projection": round(pred,3), "rule_projection": round(rule,3), "blend": round(blend,3), "sample_count": len(train_rows), "same_prop_samples": len(same_prop)}
+    except Exception as e:
+        return float(rule_projection), {"enabled": True, "status": f"ERROR: {str(e)[:90]}", "blend": 0.0, "sample_count": len(train_rows)}
+
 def project_row(row, sims=12000):
     row=merge_nfl_context(row)
     prop=row.get("prop","Receiving Yards")
@@ -2138,10 +2562,11 @@ def project_row(row, sims=12000):
     vegas_factor, vegas_risk, vegas_notes = vegas_environment_engine(row, prop)
     script_factor, script_risk, script_notes, script_branches = game_script_simulator(row, prop)
     blowout_factor, blowout_risk, blowout_notes, blowout_prob = blowout_risk_engine(row, prop)
+    advanced_factor, advanced_risk, advanced_notes, advanced_context = advanced_context_engine(row, prop)
     role_factor, injury_risk, game_script_risk, risk_notes = role_risk_adjustments(row, role, prop)
-    if defense_risk == "HIGH" or game_env_risk == "HIGH" or script_risk == "HIGH" or blowout_risk == "HIGH" or vegas_risk == "HIGH":
+    if defense_risk == "HIGH" or game_env_risk == "HIGH" or script_risk == "HIGH" or blowout_risk == "HIGH" or vegas_risk == "HIGH" or advanced_risk == "HIGH":
         game_script_risk="HIGH"
-    base*=role_factor*defense_factor*game_factor*opportunity["factor"]*pace_factor*vegas_factor*script_factor*blowout_factor
+    base*=role_factor*defense_factor*game_factor*opportunity["factor"]*pace_factor*vegas_factor*script_factor*blowout_factor*advanced_factor
     learn=learning_scale(row.get("player"),prop)
     cal_scale, cal_note=calibration_scale(row.get("player"),prop)
     base*=learn*cal_scale
@@ -2151,10 +2576,23 @@ def project_row(row, sims=12000):
     if line is not None and row.get("source")!="DEMO":
         base=base*0.62 + line*0.38
 
+    xgb_info = {"enabled": bool(st.session_state.get("xgb_assist_enabled", False)), "status": "OFF"}
+    if st.session_state.get("xgb_assist_enabled", False):
+        base, xgb_info = xgboost_assist_projection({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "collapse_prob": 0.0, "ceiling_prob": 0.0, "usage_quality": usage_quality, "data_score": 70}, base)
+
+    bayes_markov_info = {"enabled": bool(st.session_state.get("advanced_sim_assist_enabled", True)), "status": "OFF"}
+    if st.session_state.get("advanced_sim_assist_enabled", True):
+        base, bayes_markov_info = bayesian_markov_poisson_engine({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "usage_quality": usage_quality, "data_score": 70}, prop, base)
+
+    ensemble_info = {"enabled": bool(st.session_state.get("ensemble_ml_assist_enabled", False)), "status": "OFF"}
+    if st.session_state.get("ensemble_ml_assist_enabled", False):
+        base, ensemble_info = ensemble_ml_assist_projection({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "collapse_prob": 0.0, "ceiling_prob": 0.0, "usage_quality": usage_quality, "data_score": 70}, base)
+
     sigma=cfg["sigma"]
     if injury_risk in ["HIGH","EXTREME"]: sigma*=1.12
     if game_script_risk=="HIGH": sigma*=1.08
     if usage_quality < 72: sigma*=1.07
+    if (advanced_context or {}).get("consistency_score", 70) <= 48: sigma*=1.06
     collapse_prob, ceiling_prob = simulation_branch_rates(row, prop, injury_risk, game_script_risk)
     collapse_prob = clamp(collapse_prob + (blowout_prob*0.12 if prop in ["Passing Yards","Receiving Yards","Receptions","Rushing Yards","Rush Attempts"] else 0), 0.05, 0.46)
     if script_risk == "HIGH":
@@ -2197,14 +2635,21 @@ def project_row(row, sims=12000):
     line_delta=update_clv_snapshot(row.get("player"), prop, row.get("source"), line) if line is not None else None
     true_line_delta=track_line_delta(row.get("player"), prop, row.get("source"), line) if line is not None else None
 
-    notes=[]+env_notes+opportunity.get("notes",[])+pace_notes+risk_notes+defense_notes+game_notes+vegas_notes+script_notes+blowout_notes
+    notes=[]+env_notes+opportunity.get("notes",[])+pace_notes+risk_notes+defense_notes+game_notes+vegas_notes+script_notes+blowout_notes+advanced_notes
     if usage_flags:
         notes.extend(["Usage data: "+x for x in usage_flags[:3]])
     if cal_scale != 1.0: notes.append(cal_note)
     elif row.get("source")!="DEMO": notes.append(cal_note)
+    if xgb_info.get("enabled"):
+        notes.append(f"XGBoost Assist: {xgb_info.get('status')}" + (f" · blend {xgb_info.get('blend')}" if xgb_info.get('blend') else ""))
+    if bayes_markov_info.get("enabled"):
+        notes.append(f"Bayesian/Markov Assist: {bayes_markov_info.get('status')}" + (f" · factor {bayes_markov_info.get('factor')}" if bayes_markov_info.get('factor') else ""))
+        notes.extend((bayes_markov_info.get("notes") or [])[:3])
+    if ensemble_info.get("enabled"):
+        notes.append(f"Ensemble ML Assist: {ensemble_info.get('status')}" + (f" · blend {ensemble_info.get('blend')}" if ensemble_info.get('blend') else ""))
     if row.get("source")=="DEMO": notes.append("Demo row until live NFL props are available")
 
-    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"advanced_context":advanced_context,"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     signal, action_tier, rejections = build_signal(out)
     out["signal"]=signal; out["action_tier"]=action_tier; out["official_rejections"]=rejections; out["bettable"]=action_tier=="BET"
     return out
@@ -2413,7 +2858,7 @@ def _render_prop_table(rows, title="Board"):
         st.warning("No props available for this view.")
         return
     view = pd.DataFrame(rows)
-    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","opportunity_score","game_script_factor","matchup_factor","blowout_prob","pure_upside","volatility","stability_score","data_score","line_delta","source"]
+    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","opportunity_score","xgb_status","advanced_factor","game_script_factor","matchup_factor","blowout_prob","pure_upside","volatility","stability_score","data_score","line_delta","source"]
     st.dataframe(view[[c for c in show_cols if c in view.columns]], use_container_width=True, hide_index=True)
 
 
@@ -2475,6 +2920,13 @@ def _render_player_cards(rows, limit=None, header=None):
                 st.write(f"Matchup Factor: **{p.get('matchup_factor')}**")
                 st.write(f"Game Script Factor: **{p.get('game_script_factor')}**")
                 st.write(f"Blowout Prob: **{p.get('blowout_prob')}**")
+                st.write(f"Advanced Factor: **{p.get('advanced_factor')}**")
+                if p.get('xgb_assist'):
+                    st.write(f"XGBoost Assist: **{(p.get('xgb_assist') or {}).get('status','OFF')}**")
+                    st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
+                    st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
+                    with st.expander("XGBoost / Bayesian / advanced context", expanded=False):
+                        st.json({"xgb_assist": p.get('xgb_assist'), "advanced_context": p.get('advanced_context')})
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
                 if p.get('game_script_branches'):
@@ -2567,6 +3019,17 @@ with st.sidebar:
     # Prop filtering is now handled by the main QBs / RBs / Receivers tabs.
     # Keep every supported market active in the engine and hide the old sidebar multiselect.
     prop_filter=list(PROP_CONFIG.keys())
+    st.session_state["xgb_assist_enabled"] = st.toggle("XGBoost Assist after grading", value=bool(st.session_state.get("xgb_assist_enabled", False)), help="Uses your graded results to assist the main projection before Monte Carlo. Stays neutral until enough grades exist.")
+    if st.session_state.get("xgb_assist_enabled", False):
+        st.session_state["xgb_min_rows"] = st.slider("XGB min graded rows", 25, 250, int(st.session_state.get("xgb_min_rows", 50)), 5)
+        st.session_state["xgb_blend_weight"] = st.slider("XGB max blend", 0.05, 0.40, float(st.session_state.get("xgb_blend_weight", 0.22)), 0.01)
+    st.session_state["advanced_sim_assist_enabled"] = st.toggle("Bayesian / Markov / Poisson Assist", value=bool(st.session_state.get("advanced_sim_assist_enabled", True)), help="Adds bounded Bayesian historical-log updating, Markov game-state volume, Poisson event-rate nudges, and Elo/efficiency matchup context before Monte Carlo.")
+    if st.session_state.get("advanced_sim_assist_enabled", True):
+        st.session_state["bayes_min_games"] = st.slider("Bayesian min player games", 3, 12, int(st.session_state.get("bayes_min_games", 5)), 1)
+    st.session_state["ensemble_ml_assist_enabled"] = st.toggle("Random Forest / Tree Ensemble Assist after grading", value=bool(st.session_state.get("ensemble_ml_assist_enabled", False)), help="Optional ML assist from graded results. Stays neutral until enough graded props exist.")
+    if st.session_state.get("ensemble_ml_assist_enabled", False):
+        st.session_state["ensemble_min_rows"] = st.slider("Ensemble min graded rows", 50, 400, int(st.session_state.get("ensemble_min_rows", 75)), 5)
+        st.session_state["ensemble_blend_weight"] = st.slider("Ensemble max blend", 0.04, 0.30, float(st.session_state.get("ensemble_blend_weight", 0.16)), 0.01)
     min_score=st.slider("Minimum Data Score",0,99,0)
     show_all=st.checkbox("Show all player cards", True)
     st.divider()
@@ -2580,6 +3043,9 @@ live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props()
 moneylines=[] if source_mode=="Demo board only" else fetch_underdog_nfl_moneylines()
 raw = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
 projected=[project_row(r) for r in raw if r.get("prop") in prop_filter]
+for _p in projected:
+    _x=_p.get("xgb_assist") or {}
+    _p["xgb_status"] = _x.get("status", "OFF")
 projected=[p for p in projected if p.get("data_score",0)>=min_score]
 
 df=pd.DataFrame(projected)
