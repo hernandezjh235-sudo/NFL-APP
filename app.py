@@ -373,13 +373,12 @@ def build_signal(p):
     if strong:
         return f"✅ {side}", "BET", reasons
 
-    # Non-official plays still deserve a clean model direction.
-    # LEAN means there is some edge/probability, but one or more gates blocked it from official.
+    # LEAN means there is enough direction to track, but not enough for official.
     if prob >= 0.57 or edge_abs >= req*0.55:
         return f"⚠️ LEAN {side}", "LEAN", reasons
 
-    # Thin direction: model barely prefers a side. Still do not label it PASS on the card.
-    return f"{side}", "WATCH", reasons
+    # Thin/no-edge spots should not be forced into OVER/UNDER.
+    return "🚫 PASS", "PASS", reasons
 
 def get_secret(key, default=""):
     try: return st.secrets[key]
@@ -1669,12 +1668,34 @@ def merge_nfl_context(row):
     opp=str(row.get("opp") or "")
     team_ctx=teams.get(team,{}) if isinstance(teams.get(team,{}),dict) else {}
     opp_ctx=teams.get(opp,{}) if isinstance(teams.get(opp,{}),dict) else {}
-    for k in ["pace","pass_rate","plays_pg","spread","game_total","weather_risk"]:
+    # Team offense / pace / Vegas / coach-style context.  These are NFL-specific
+    # equivalents of the MLB environment and lineup context layers.
+    team_keys = [
+        "pace","pass_rate","rush_rate","plays_pg","spread","game_total","team_total",
+        "weather_risk","pbp_plays_pg","pbp_pass_rate","pbp_rush_rate",
+        "epa_per_play","success_rate","early_down_pass_rate","early_down_success_rate",
+        "red_zone_pass_rate","goal_line_rush_rate","penalties_pg","fumbles_pg",
+        "sacks_allowed_pg","qb_hits_allowed_pg","explosive_pass_rate","explosive_rush_rate",
+        "ot_rate","team_identity","coach_pace_proxy","seconds_per_play","no_huddle_rate"
+    ]
+    for k in team_keys:
         if row.get(k) in [None, ""] and team_ctx.get(k) not in [None, ""]:
             row[k]=team_ctx.get(k)
-    for k in ["def_pass_rank","def_run_rank","def_slot_rank","def_te_rank","def_rb_rec_rank","pressure_rate","coverage_grade"]:
-        if row.get(k) in [None, ""] and opp_ctx.get(k) not in [None, ""]:
-            row[k]=opp_ctx.get(k)
+
+    # Opponent defensive context.  Prefix advanced fields with opp_ so we never
+    # accidentally confuse offense and defense.
+    opp_keys = [
+        "def_pass_rank","def_run_rank","def_slot_rank","def_te_rank","def_rb_rec_rank",
+        "def_role_rank","coverage_grade","pressure_rate","def_pressure_rate",
+        "def_epa_allowed_per_play","def_success_allowed_rate","def_sacks_pg",
+        "def_qb_hits_pg","def_fumbles_forced_pg","explosive_pass_allowed_rate",
+        "explosive_rush_allowed_rate","def_explosive_pass_rank","def_explosive_run_rank",
+        "def_pressure_rank","def_run_stop_rank"
+    ]
+    for k in opp_keys:
+        if opp_ctx.get(k) not in [None, ""]:
+            row.setdefault(k, opp_ctx.get(k))
+            row.setdefault("opp_"+k, opp_ctx.get(k))
     injuries=load_injury_bank()
     inj=injuries.get(norm(row.get("player"))) or injuries.get(str(row.get("player") or ""))
     if inj and row.get("injury_status") in [None, ""]:
@@ -1716,12 +1737,174 @@ def usage_data_quality(row, prop):
     q=int(clamp(q + min(10, bonus*2), 0, 100))
     return q, flags[:5]
 
+def opportunity_engine(row, role, prop):
+    """Estimate the opportunity behind the prop before translating to yards/stats.
+
+    This is the NFL equivalent of MLB volume logic: for props, opportunity is usually
+    more predictive than raw yards.  The function is intentionally small and capped so
+    it improves projections without overpowering live lines.
+    """
+    notes=[]
+    pos=str(row.get("position") or "").upper()
+    plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
+    pass_rate=safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"), 56)) or 56
+    rush_rate=safe_float(row.get("pbp_rush_rate"), safe_float(row.get("rush_rate"), 44)) or 44
+    spread=safe_float(row.get("spread"), 0) or 0
+    total=safe_float(row.get("game_total"), 44) or 44
+
+    snap=safe_float(row.get("snap_share"), role.get("snap",70)) or role.get("snap",70)
+    route=safe_float(row.get("route_participation"), role.get("route",60)) or role.get("route",60)
+    target=safe_float(row.get("target_share"), role.get("target",15)) or role.get("target",15)
+    carry=safe_float(row.get("carries_share"), role.get("carry",10)) or role.get("carry",10)
+    rz=safe_float(row.get("red_zone_touch_share"), role.get("rz",10)) or role.get("rz",10)
+
+    # Simple expected opportunity estimates shown on cards/debug tables.
+    dropbacks = plays * pass_rate/100.0
+    rush_team = plays * rush_rate/100.0
+    expected = {
+        "plays_pg": round(plays,2),
+        "dropbacks_pg": round(dropbacks,2),
+        "team_rushes_pg": round(rush_team,2),
+        "routes_pg": round(dropbacks * route/100.0,2),
+        "targets_pg_est": round(dropbacks * target/100.0,2),
+        "carries_pg_est": round(rush_team * carry/100.0,2),
+        "rz_usage": round(rz,2),
+        "snap_share": round(snap,2),
+    }
+
+    factor=1.0
+    if prop in ["Passing Yards","Passing TDs","Pass Attempts","Completions","Interceptions"]:
+        factor *= clamp(1 + (dropbacks-34)*0.006, 0.90, 1.10)
+        if pass_rate >= 61: notes.append("Opportunity boost: pass-first team profile")
+        elif pass_rate <= 51: notes.append("Opportunity tax: low pass-rate profile")
+    elif prop in ["Receiving Yards","Receptions","Longest Reception"]:
+        factor *= clamp(1 + (expected["routes_pg"]-25)*0.004, 0.90, 1.10)
+        factor *= clamp(1 + (expected["targets_pg_est"]-5.5)*0.018, 0.88, 1.12)
+        if target >= 24: notes.append("Opportunity boost: elite target share")
+        elif target < 13: notes.append("Opportunity warning: thin target share")
+    elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+        factor *= clamp(1 + (expected["carries_pg_est"]-12)*0.018, 0.86, 1.14)
+        if carry >= 55: notes.append("Opportunity boost: workhorse carry share")
+        elif carry < 30: notes.append("Opportunity warning: committee rushing role")
+    elif prop in ["Fantasy Points","Anytime TD"]:
+        blended = (snap/100)*0.40 + (target/30)*0.25 + (carry/65)*0.20 + (rz/35)*0.15
+        factor *= clamp(0.88 + blended*0.24, 0.86, 1.14)
+    elif prop in ["Kicking Points","Field Goals Made"]:
+        factor *= clamp(1 + (total-44)*0.008, 0.90, 1.10)
+
+    # Pre-adjustment for likely trailing/favorite scripts.  Game script simulator below
+    # handles the larger branch logic; this just reflects base opportunity.
+    if spread > 5.5 and prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions"]:
+        factor *= 1.025; notes.append("Opportunity boost: projected trailing pass volume")
+    if spread < -7.5 and prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+        factor *= 1.025; notes.append("Opportunity boost: favorite rushing script")
+
+    return {"factor": clamp(factor,0.82,1.18), "expected": expected, "notes": notes}
+
+def pace_engine(row, prop):
+    """Team pace / total-play context."""
+    factor=1.0; notes=[]; risk="LOW"
+    plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), None))
+    seconds=safe_float(row.get("seconds_per_play"))
+    pace_label=str(row.get("coach_pace_proxy") or "").upper()
+    no_huddle=safe_float(row.get("no_huddle_rate"))
+    if plays is not None:
+        if plays >= 65: factor*=1.035; notes.append("Pace boost: high play-volume offense")
+        elif plays <= 57: factor*=0.955; risk="MED"; notes.append("Pace tax: low play-volume offense")
+    if seconds is not None:
+        if seconds <= 26: factor*=1.018; notes.append("Pace boost: fast seconds/play")
+        elif seconds >= 31: factor*=0.982; notes.append("Pace tax: slow seconds/play")
+    if pace_label == "FAST": factor*=1.015; notes.append("Coach pace proxy: FAST")
+    elif pace_label == "SLOW": factor*=0.985; notes.append("Coach pace proxy: SLOW")
+    if no_huddle is not None and no_huddle >= 12:
+        factor*=1.01; notes.append("No-huddle pace nudge")
+    return clamp(factor,0.93,1.07), risk, notes
+
+def vegas_environment_engine(row, prop):
+    """Spread, total and implied team-volume context."""
+    factor=1.0; notes=[]; risk="LOW"
+    spread=safe_float(row.get("spread"))
+    total=safe_float(row.get("game_total"))
+    team_total=safe_float(row.get("team_total"))
+    if total is not None:
+        if total >= 49 and prop not in ["Interceptions"]:
+            factor*=1.025; notes.append("Vegas boost: high total")
+        elif total <= 39 and prop in ["Passing Yards","Receiving Yards","Receptions","Passing TDs","Fantasy Points","Pass Attempts","Completions"]:
+            factor*=0.955; risk="HIGH"; notes.append("Vegas tax: low total")
+    if team_total is not None:
+        if team_total >= 27 and prop in ["Passing TDs","Anytime TD","Fantasy Points","Kicking Points","Field Goals Made"]:
+            factor*=1.025; notes.append("Team-total scoring boost")
+        elif team_total <= 18.5 and prop in ["Passing TDs","Anytime TD","Fantasy Points"]:
+            factor*=0.94; risk="HIGH"; notes.append("Low team-total scoring tax")
+    if spread is not None and abs(spread) <= 3:
+        factor*=1.01; notes.append("Close spread: full-game volume stability")
+    return clamp(factor,0.90,1.08), risk, notes
+
+def game_script_simulator(row, prop):
+    """Small three-branch game-script model: close, trailing, blowout/favorite.
+
+    This is not a moneyline model; it is a volume model for props. It nudges
+    attempts/targets/carries based on likely script without changing raw database data.
+    """
+    spread=safe_float(row.get("spread"), 0) or 0
+    total=safe_float(row.get("game_total"), 44) or 44
+    pass_rate=safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"),56)) or 56
+    factor=1.0; notes=[]; risk="LOW"
+    close_weight=clamp(0.62 - abs(spread)*0.025, 0.28, 0.70)
+    trailing_weight=clamp(0.19 + max(spread,0)*0.035, 0.12, 0.48)
+    leading_weight=clamp(1.0 - close_weight - trailing_weight, 0.10, 0.50)
+    branch={"close":round(close_weight,3),"trailing":round(trailing_weight,3),"leading":round(leading_weight,3)}
+
+    if prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions","Longest Reception"]:
+        branch_factor = close_weight*1.00 + trailing_weight*1.07 + leading_weight*0.94
+        factor *= branch_factor
+        if trailing_weight >= 0.34: notes.append("Game script boost: trailing pass-volume branch")
+        if leading_weight >= 0.36: notes.append("Game script tax: leading/blowout pass-volume branch")
+    elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+        branch_factor = close_weight*1.00 + trailing_weight*0.90 + leading_weight*1.07
+        factor *= branch_factor
+        if leading_weight >= 0.36: notes.append("Game script boost: favorite/lead rushing branch")
+        if trailing_weight >= 0.34: notes.append("Game script tax: trailing rush-volume branch")
+    elif prop in ["Passing TDs","Anytime TD","Fantasy Points"]:
+        factor *= close_weight*1.00 + trailing_weight*1.02 + leading_weight*0.99
+
+    if abs(spread) >= 8.5:
+        risk="HIGH"; notes.append("High blowout-risk branch")
+    elif abs(spread) >= 6.5:
+        risk="MED"; notes.append("Moderate blowout-risk branch")
+    if total >= 50 and prop not in ["Interceptions"]:
+        factor*=1.01; notes.append("Shootout environment nudge")
+    return clamp(factor,0.86,1.12), risk, notes, branch
+
+def blowout_risk_engine(row, prop):
+    spread=safe_float(row.get("spread"), 0) or 0
+    factor=1.0; notes=[]; risk="LOW"
+    blowout_prob=clamp((abs(spread)-3.0)/12.0, 0.04, 0.45)
+    if abs(spread) >= 7.5:
+        risk="HIGH"
+        if spread < 0 and prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions","Longest Reception"]:
+            factor*=0.965; notes.append("Blowout tax: favorite may reduce late passing")
+        if spread < 0 and prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+            factor*=1.025; notes.append("Blowout boost: favorite late rushing volume")
+        if spread > 0 and prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+            factor*=0.945; notes.append("Blowout tax: underdog rushing volume risk")
+        if spread > 0 and prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions"]:
+            factor*=1.015; notes.append("Blowout boost: underdog catch-up passing")
+    return clamp(factor,0.90,1.07), risk, notes, round(blowout_prob,3)
+
 def defensive_matchup_factor(row, prop):
     factor=1.0; notes=[]; risk="LOW"
     rank=safe_float(row.get("def_role_rank"))
     cov=safe_float(row.get("coverage_grade"))
     pass_rank=safe_float(row.get("def_pass_rank"))
     run_rank=safe_float(row.get("def_run_rank"))
+    def_epa=safe_float(row.get("opp_def_epa_allowed_per_play"), safe_float(row.get("def_epa_allowed_per_play")))
+    def_success=safe_float(row.get("opp_def_success_allowed_rate"), safe_float(row.get("def_success_allowed_rate")))
+    pressure_rank=safe_float(row.get("opp_def_pressure_rank"), safe_float(row.get("def_pressure_rank")))
+    def_sacks=safe_float(row.get("opp_def_sacks_pg"), safe_float(row.get("def_sacks_pg")))
+    explosive_pass=safe_float(row.get("opp_explosive_pass_allowed_rate"), safe_float(row.get("explosive_pass_allowed_rate")))
+    explosive_rush=safe_float(row.get("opp_explosive_rush_allowed_rate"), safe_float(row.get("explosive_rush_allowed_rate")))
+
     if prop in ["Receiving Yards","Receptions","Passing Yards","Passing TDs","Pass Attempts","Completions","Longest Reception"]:
         if rank is not None:
             if rank <= 8: factor*=0.94; risk="HIGH"; notes.append("Tough defensive role matchup")
@@ -1732,10 +1915,26 @@ def defensive_matchup_factor(row, prop):
         if pass_rank is not None:
             if pass_rank <= 8: factor*=0.975; notes.append("Top pass defense tax")
             elif pass_rank >= 24: factor*=1.02; notes.append("Bottom pass defense boost")
-    if prop in ["Rushing Yards","Rush Attempts","Longest Rush"] and run_rank is not None:
-        if run_rank <= 8: factor*=0.94; risk="HIGH"; notes.append("Top run defense tax")
-        elif run_rank >= 24: factor*=1.04; notes.append("Weak run defense boost")
-    return clamp(factor,0.88,1.10), risk, notes
+        if pressure_rank is not None and pressure_rank <= 8:
+            factor*=0.972; risk="HIGH"; notes.append("Elite opponent pass-rush pressure tax")
+        if def_sacks is not None and def_sacks >= 3.0:
+            factor*=0.985; notes.append("High sack-rate opponent tax")
+        if explosive_pass is not None:
+            if explosive_pass >= 9: factor*=1.018; notes.append("Explosive pass allowance boost")
+            elif explosive_pass <= 5: factor*=0.988; notes.append("Explosive pass prevention tax")
+    if prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
+        if run_rank is not None:
+            if run_rank <= 8: factor*=0.94; risk="HIGH"; notes.append("Top run defense tax")
+            elif run_rank >= 24: factor*=1.04; notes.append("Weak run defense boost")
+        if explosive_rush is not None:
+            if explosive_rush >= 8: factor*=1.02; notes.append("Explosive run allowance boost")
+            elif explosive_rush <= 4: factor*=0.985; notes.append("Explosive run prevention tax")
+    if def_epa is not None:
+        if def_epa <= -0.06: factor*=0.985; notes.append("Defense efficiency tax")
+        elif def_epa >= 0.06: factor*=1.015; notes.append("Defense efficiency boost")
+    if def_success is not None and def_success >= 48 and prop not in ["Interceptions"]:
+        factor*=1.01; notes.append("High success allowed boost")
+    return clamp(factor,0.86,1.12), risk, notes
 
 def game_environment_factor(row, prop):
     factor=1.0; notes=[]; risk="LOW"
@@ -1900,12 +2099,18 @@ def project_row(row, sims=12000):
     usage_quality, usage_flags = usage_data_quality(row, prop)
     base=cfg["base"]*usage_adjustment(role,prop)
     base, env_notes, env=apply_environment(base,row,prop)
+
+    opportunity = opportunity_engine(row, role, prop)
+    pace_factor, pace_risk, pace_notes = pace_engine(row, prop)
     defense_factor, defense_risk, defense_notes = defensive_matchup_factor(row, prop)
     game_factor, game_env_risk, game_notes = game_environment_factor(row, prop)
+    vegas_factor, vegas_risk, vegas_notes = vegas_environment_engine(row, prop)
+    script_factor, script_risk, script_notes, script_branches = game_script_simulator(row, prop)
+    blowout_factor, blowout_risk, blowout_notes, blowout_prob = blowout_risk_engine(row, prop)
     role_factor, injury_risk, game_script_risk, risk_notes = role_risk_adjustments(row, role, prop)
-    if defense_risk == "HIGH" or game_env_risk == "HIGH":
+    if defense_risk == "HIGH" or game_env_risk == "HIGH" or script_risk == "HIGH" or blowout_risk == "HIGH" or vegas_risk == "HIGH":
         game_script_risk="HIGH"
-    base*=role_factor*defense_factor*game_factor
+    base*=role_factor*defense_factor*game_factor*opportunity["factor"]*pace_factor*vegas_factor*script_factor*blowout_factor
     learn=learning_scale(row.get("player"),prop)
     cal_scale, cal_note=calibration_scale(row.get("player"),prop)
     base*=learn*cal_scale
@@ -1920,6 +2125,9 @@ def project_row(row, sims=12000):
     if game_script_risk=="HIGH": sigma*=1.08
     if usage_quality < 72: sigma*=1.07
     collapse_prob, ceiling_prob = simulation_branch_rates(row, prop, injury_risk, game_script_risk)
+    collapse_prob = clamp(collapse_prob + (blowout_prob*0.12 if prop in ["Passing Yards","Receiving Yards","Receptions","Rushing Yards","Rush Attempts"] else 0), 0.05, 0.46)
+    if script_risk == "HIGH":
+        sigma *= 1.04
     seed=stable_projection_seed(row.get("player","x"), prop, line, row.get("team",""), row.get("opp",""), row.get("source",""))
     sim=simulate_prop_distribution(base, sigma, prop, sims, seed, collapse_prob, ceiling_prob)
 
@@ -1958,14 +2166,14 @@ def project_row(row, sims=12000):
     line_delta=update_clv_snapshot(row.get("player"), prop, row.get("source"), line) if line is not None else None
     true_line_delta=track_line_delta(row.get("player"), prop, row.get("source"), line) if line is not None else None
 
-    notes=[]+env_notes+risk_notes+defense_notes+game_notes
+    notes=[]+env_notes+opportunity.get("notes",[])+pace_notes+risk_notes+defense_notes+game_notes+vegas_notes+script_notes+blowout_notes
     if usage_flags:
         notes.extend(["Usage data: "+x for x in usage_flags[:3]])
     if cal_scale != 1.0: notes.append(cal_note)
     elif row.get("source")!="DEMO": notes.append(cal_note)
     if row.get("source")=="DEMO": notes.append("Demo row until live NFL props are available")
 
-    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     signal, action_tier, rejections = build_signal(out)
     out["signal"]=signal; out["action_tier"]=action_tier; out["official_rejections"]=rejections; out["bettable"]=action_tier=="BET"
     return out
@@ -1983,13 +2191,80 @@ def alt_ladder(p):
     return pd.DataFrame(rows)
 
 # ---------- logging / grading ----------
-def save_snapshot(path, rows, label):
+def _json_safe(v):
+    """Convert numpy/pandas objects so full slate snapshots always save cleanly."""
+    try:
+        if pd.isna(v) and not isinstance(v, (dict, list, tuple)):
+            return None
+    except Exception:
+        pass
+    if isinstance(v, dict):
+        return {str(k): _json_safe(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    if isinstance(v, (np.integer,)):
+        return int(v)
+    if isinstance(v, (np.floating,)):
+        return float(v)
+    if isinstance(v, (np.bool_,)):
+        return bool(v)
+    if isinstance(v, pd.Timestamp):
+        return v.isoformat()
+    return v
+
+def _clean_snapshot_row(row):
+    keep = dict(row or {})
+    # Keep the model output and context, but avoid any future massive objects.
+    keep.pop("sim", None)
+    keep.pop("samples", None)
+    return _json_safe(keep)
+
+def _snapshot_slate_id(label):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"NFL_{str(label).upper()}_{stamp}"
+
+def save_snapshot(path, rows, label, scope="ALL", source_note="manual_button"):
+    """Save a complete slate/board snapshot, grouped by slate_id.
+
+    This is the NFL version of the MLB Save Official Before / After workflow:
+    one click saves the whole board, not just a single player prop.
+    """
     old=load_json(path,[])
     stamp=now_iso()
+    slate_id=_snapshot_slate_id(label)
+    saved=[]
     for r in rows:
-        old.append({**r,"snapshot_type":label,"saved_at":stamp})
-    save_json(path, old[-5000:])
-    return len(rows)
+        if scope == "LIVE_ONLY" and r.get("source") == "DEMO":
+            continue
+        if scope == "OFFICIAL_ONLY" and not r.get("bettable"):
+            continue
+        rr=_clean_snapshot_row(r)
+        rr.update({
+            "snapshot_type":label,
+            "saved_at":stamp,
+            "slate_id":slate_id,
+            "snapshot_scope":scope,
+            "source_note":source_note,
+        })
+        saved.append(rr)
+    old.extend(saved)
+    save_json(path, old[-12000:])
+    return len(saved), slate_id
+
+def _snapshot_groups(path, label=None):
+    rows=load_json(path,[])
+    groups={}
+    for r in rows:
+        if label and str(r.get("snapshot_type")) != str(label):
+            continue
+        key=r.get("slate_id") or r.get("saved_at") or "UNKNOWN"
+        groups.setdefault(key,[]).append(r)
+    out=[]
+    for key, vals in groups.items():
+        ts=vals[0].get("saved_at", key)
+        srcs=sorted(set(str(v.get("source","")) for v in vals))
+        out.append({"key":key,"label":f"{ts} · {len(vals)} rows · {', '.join([x for x in srcs if x])}","rows":vals})
+    return sorted(out, key=lambda x: str(x["label"]), reverse=True)
 
 def update_learning_from_result(player, prop, projected, actual):
     data=load_json(LEARN_FILE,{})
@@ -2001,6 +2276,62 @@ def update_learning_from_result(player, prop, projected, actual):
         data[key]=round(clamp(cur*(1+0.05*err),0.90,1.10),4)
         save_json(LEARN_FILE,data)
     return data.get(key,cur)
+
+def grade_rows_and_learn(rows_to_grade, actual_values, grade_note="bulk_grade"):
+    """Grade many saved props at once and update the learning file for each graded row."""
+    results=load_json(RESULT_LOG,[])
+    graded=[]
+    for r, actual in zip(rows_to_grade, actual_values):
+        actual=safe_float(actual)
+        if actual is None:
+            continue
+        line=safe_float(r.get("line")); pick=str(r.get("pick") or "").upper(); win=None
+        if line is not None:
+            if pick == "OVER": win = actual > line
+            elif pick == "UNDER": win = actual < line
+        scale=update_learning_from_result(r.get("player"), r.get("prop"), r.get("projection"), actual)
+        out=_clean_snapshot_row(r)
+        out.update({
+            "actual":actual,
+            "win":win,
+            "graded_at":now_iso(),
+            "new_learning_scale":scale,
+            "grade_note":grade_note,
+            "projection_error":None if safe_float(r.get("projection")) is None else round(actual - safe_float(r.get("projection")), 3),
+            "line_result_margin":None if line is None else round(actual - line, 3),
+        })
+        results.append(out); graded.append(out)
+    save_json(RESULT_LOG, results[-12000:])
+    return graded
+
+def build_learning_summary_df(results):
+    if not results:
+        return pd.DataFrame()
+    rdf=pd.DataFrame(results)
+    if rdf.empty:
+        return pd.DataFrame()
+    for c in ["projection","actual","line"]:
+        if c in rdf.columns:
+            rdf[c]=pd.to_numeric(rdf[c], errors="coerce")
+    if "win" in rdf.columns:
+        rdf["win_num"] = rdf["win"].apply(lambda x: 1 if x is True else 0 if x is False else np.nan)
+    else:
+        rdf["win_num"] = np.nan
+    if "projection_error" not in rdf.columns:
+        rdf["projection_error"] = rdf.get("actual", np.nan) - rdf.get("projection", np.nan)
+    grp_cols=[c for c in ["prop","player"] if c in rdf.columns]
+    if not grp_cols:
+        return pd.DataFrame()
+    summ=rdf.groupby(grp_cols, dropna=False).agg(
+        graded=("actual","count"),
+        hit_rate=("win_num","mean"),
+        avg_projection_error=("projection_error","mean"),
+        avg_abs_error=("projection_error", lambda x: float(np.nanmean(np.abs(x))) if len(x) else np.nan),
+    ).reset_index()
+    summ["hit_rate"]=(summ["hit_rate"]*100).round(1)
+    summ["avg_projection_error"]=summ["avg_projection_error"].round(3)
+    summ["avg_abs_error"]=summ["avg_abs_error"].round(3)
+    return summ.sort_values(["graded","avg_abs_error"], ascending=[False, True])
 
 # ---------- UI ----------
 POSITION_TAB_PROPS = {
@@ -2051,7 +2382,7 @@ def _render_prop_table(rows, title="Board"):
         st.warning("No props available for this view.")
         return
     view = pd.DataFrame(rows)
-    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","pure_upside","volatility","stability_score","data_score","line_delta","source"]
+    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","opportunity_score","game_script_factor","matchup_factor","blowout_prob","pure_upside","volatility","stability_score","data_score","line_delta","source"]
     st.dataframe(view[[c for c in show_cols if c in view.columns]], use_container_width=True, hide_index=True)
 
 
@@ -2089,6 +2420,14 @@ def _render_player_cards(rows, limit=None, header=None):
                 st.write(f"Target Share: **{role.get('target','')}%**")
                 st.write(f"Carry Share: **{role.get('carry','')}%**")
                 st.write(f"Red-Zone Usage: **{role.get('rz','')}%**")
+                opp_ctx=p.get("expected_opportunity", {}) or {}
+                if opp_ctx:
+                    st.write("---")
+                    st.write(f"Expected Plays: **{opp_ctx.get('plays_pg','')}**")
+                    st.write(f"Dropbacks: **{opp_ctx.get('dropbacks_pg','')}**")
+                    st.write(f"Routes: **{opp_ctx.get('routes_pg','')}**")
+                    st.write(f"Targets Est: **{opp_ctx.get('targets_pg_est','')}**")
+                    st.write(f"Carries Est: **{opp_ctx.get('carries_pg_est','')}**")
             with c2:
                 st.subheader("Environment")
                 env=p.get("env", {})
@@ -2101,8 +2440,15 @@ def _render_player_cards(rows, limit=None, header=None):
                 st.subheader("Risk Notes")
                 for n in p.get("notes",[]): st.write("- "+str(n))
                 st.write(f"Data Score: **{p.get('data_score')}/99**")
+                st.write(f"Opportunity Score: **{p.get('opportunity_score')}**")
+                st.write(f"Matchup Factor: **{p.get('matchup_factor')}**")
+                st.write(f"Game Script Factor: **{p.get('game_script_factor')}**")
+                st.write(f"Blowout Prob: **{p.get('blowout_prob')}**")
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
+                if p.get('game_script_branches'):
+                    st.write("Game Script Branches:")
+                    st.json(p.get('game_script_branches'))
                 rejects=p.get('official_rejections') or []
                 if rejects:
                     st.write("Official Filter Rejections:")
@@ -2308,37 +2654,123 @@ with tabs[7]:
         st.success(f"Correlation Read: {corr}")
 
 with tabs[8]:
-    st.markdown("<div class='section-title-pro'>Save Before / After / Final Grade</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title-pro'>Save Full Board / After / Bulk Grade</div>", unsafe_allow_html=True)
+    st.write("This now works like the MLB workflow: save the whole pulled board/slate in one click, then bulk-grade it later.")
+
+    source_warning = any(p.get("source") == "DEMO" for p in projected)
+    if source_warning:
+        st.warning("Demo rows are currently on the board. Use Live Underdog only for real official saves once NFL props are posted.")
+
     c1,c2,c3=st.columns(3)
     with c1:
-        if st.button("Save BEFORE Snapshot", use_container_width=True): st.success(f"Saved {save_snapshot(PICK_LOG, projected, 'BEFORE')} before rows")
+        before_scope=st.selectbox("Before save scope", ["ALL", "LIVE_ONLY", "OFFICIAL_ONLY"], index=0, help="ALL saves the full visible board. LIVE_ONLY excludes demo rows. OFFICIAL_ONLY saves only bettable rows.")
+        if st.button("💾 Save OFFICIAL BEFORE — Full Board", use_container_width=True):
+            n, slate_id = save_snapshot(PICK_LOG, projected, "BEFORE", scope=before_scope, source_note="full_board_before")
+            st.success(f"Saved {n} BEFORE rows · Slate ID: {slate_id}")
     with c2:
-        if st.button("Save AFTER Snapshot", use_container_width=True): st.success(f"Saved {save_snapshot(AFTER_LOG, projected, 'AFTER')} after rows")
+        after_scope=st.selectbox("After save scope", ["ALL", "LIVE_ONLY", "OFFICIAL_ONLY"], index=0, help="Use this before grading if you want a closing snapshot of the same board.")
+        if st.button("📌 Save AFTER / Closing — Full Board", use_container_width=True):
+            n, slate_id = save_snapshot(AFTER_LOG, projected, "AFTER", scope=after_scope, source_note="full_board_after")
+            st.success(f"Saved {n} AFTER rows · Slate ID: {slate_id}")
     with c3:
-        st.write("Final grading below")
+        st.metric("Current Board Rows", len(projected))
+        st.metric("Bettable Rows", sum(1 for p in projected if p.get("bettable")))
+        st.metric("Live Rows", sum(1 for p in projected if p.get("source") != "DEMO"))
+
     st.divider()
+    st.subheader("Bulk Grade Saved BEFORE Slate")
+    before_groups=_snapshot_groups(PICK_LOG, "BEFORE")
+    if not before_groups:
+        st.info("No BEFORE slates saved yet. Save the full board first, then come back here to grade it.")
+    else:
+        choice=st.selectbox("Choose saved BEFORE slate", before_groups, format_func=lambda x: x["label"])
+        saved_rows=choice["rows"]
+        grade_rows=[]
+        for idx,r in enumerate(saved_rows):
+            grade_rows.append({
+                "idx": idx,
+                "Player": r.get("player"),
+                "Team": r.get("team"),
+                "Prop": r.get("prop"),
+                "Line": r.get("line"),
+                "Pick": r.get("pick"),
+                "Signal": r.get("signal"),
+                "Projection": r.get("projection"),
+                "Actual": None,
+            })
+        gdf=pd.DataFrame(grade_rows)
+        st.caption("Enter actual results for as many rows as you want. Blank Actual rows will be skipped.")
+        edited=st.data_editor(
+            gdf,
+            use_container_width=True,
+            hide_index=True,
+            num_rows="fixed",
+            column_config={"Actual": st.column_config.NumberColumn("Actual", step=0.5)},
+            disabled=["idx","Player","Team","Prop","Line","Pick","Signal","Projection"],
+            key="bulk_grade_editor",
+        )
+        col_a,col_b=st.columns([1,2])
+        with col_a:
+            if st.button("✅ Grade Entered Rows + Learn", use_container_width=True):
+                actuals=[]; rows_for_grade=[]
+                for _,er in edited.iterrows():
+                    actual=safe_float(er.get("Actual"))
+                    if actual is not None:
+                        rows_for_grade.append(saved_rows[int(er.get("idx"))])
+                        actuals.append(actual)
+                graded=grade_rows_and_learn(rows_for_grade, actuals, grade_note=f"bulk_grade_{choice['key']}")
+                if graded:
+                    wins=[g.get("win") for g in graded if g.get("win") is not None]
+                    hit = round(100*np.mean(wins),1) if wins else "N/A"
+                    st.success(f"Graded {len(graded)} rows · Hit Rate: {hit}% · Learning updated")
+                else:
+                    st.warning("No Actual values entered.")
+        with col_b:
+            st.info("You can still grade one or two props manually, but the main workflow is now full-board save → bulk grade → learning update, like MLB.")
+
+    st.divider()
+    st.subheader("Single Prop Quick Grade")
     if projected:
         g_choice=st.selectbox("Prop to grade", [f"{p['player']} — {p['prop']}" for p in projected])
         g=projected[[f"{p['player']} — {p['prop']}" for p in projected].index(g_choice)]
         actual=st.number_input("Actual result", min_value=0.0, step=0.5)
-        if st.button("Submit Final Grade + Learn"):
-            line=safe_float(g.get("line")); pick=g.get("pick"); win=None
-            if line is not None:
-                win = actual > line if pick=="OVER" else actual < line if pick=="UNDER" else None
-            scale=update_learning_from_result(g["player"],g["prop"],g["projection"],actual)
-            rows=load_json(RESULT_LOG,[]); rows.append({**g,"actual":actual,"win":win,"graded_at":now_iso(),"new_learning_scale":scale}); save_json(RESULT_LOG,rows[-5000:])
+        if st.button("Submit Single Grade + Learn"):
+            graded=grade_rows_and_learn([g], [actual], grade_note="single_quick_grade")
+            win=graded[0].get("win") if graded else None
+            scale=graded[0].get("new_learning_scale") if graded else None
             st.success(f"Graded. Result: {'WIN' if win else 'LOSS' if win is False else 'NO LINE'} · New learning scale: {scale}")
 
 with tabs[9]:
-    st.markdown("<div class='section-title-pro'>Learning Dashboard</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title-pro'>Learning Dashboard + Calibration</div>", unsafe_allow_html=True)
     results=load_json(RESULT_LOG,[]); learn=load_json(LEARN_FILE,{})
     if results:
         rdf=pd.DataFrame(results)
-        st.metric("Graded Props",len(rdf))
-        if "win" in rdf.columns: st.metric("Hit Rate", f"{round(rdf['win'].dropna().mean()*100,1)}%" if len(rdf['win'].dropna()) else "N/A")
-        st.dataframe(rdf.tail(100), use_container_width=True)
-    else: st.info("No graded NFL props yet. Once you grade results, this dashboard will populate.")
-    if learn: st.json(learn)
+        total=len(rdf)
+        graded_actual = rdf["actual"].notna().sum() if "actual" in rdf.columns else total
+        win_series = rdf["win"].dropna() if "win" in rdf.columns else pd.Series(dtype=float)
+        hit_rate = f"{round(win_series.mean()*100,1)}%" if len(win_series) else "N/A"
+        avg_err = "N/A"
+        if "projection_error" in rdf.columns:
+            err=pd.to_numeric(rdf["projection_error"], errors="coerce").dropna()
+            if len(err): avg_err=round(float(err.mean()),3)
+        k1,k2,k3,k4=st.columns(4)
+        k1.metric("Graded Props", graded_actual)
+        k2.metric("Hit Rate", hit_rate)
+        k3.metric("Avg Projection Bias", avg_err)
+        k4.metric("Learning Keys", len(learn))
+
+        st.subheader("Calibration by Prop + Player")
+        summ=build_learning_summary_df(results)
+        if not summ.empty:
+            st.dataframe(summ.head(200), use_container_width=True, hide_index=True)
+        st.subheader("Recent Graded Rows")
+        show_cols=[c for c in ["graded_at","player","team","prop","line","pick","projection","actual","projection_error","win","new_learning_scale","slate_id","grade_note"] if c in rdf.columns]
+        st.dataframe(rdf[show_cols].tail(200), use_container_width=True, hide_index=True)
+    else:
+        st.info("No graded NFL props yet. Once you bulk-grade a saved slate, calibration and learning will populate here.")
+    if learn:
+        with st.expander("Raw Learning Scale JSON"):
+            st.json(learn)
 
 with tabs[10]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
