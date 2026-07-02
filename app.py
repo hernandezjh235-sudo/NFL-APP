@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v2.8 — BAYESIAN MARKOV + ADVANCED SIM ASSIST + XGB"
+APP_VERSION = "NFL v2.6 — POSITION TABS + RECEIVERS + SAVED DATABASE"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -30,8 +30,6 @@ LEARN_FILE = LOCAL_DIR / "nfl_learning.json"
 CLV_FILE = LOCAL_DIR / "nfl_clv_tracker.json"
 LINE_HISTORY_FILE = LOCAL_DIR / "nfl_line_history.json"
 REQUEST_LOG = LOCAL_DIR / "request_log.json"
-BOARD_CACHE_FILE = LOCAL_DIR / "nfl_last_pulled_board.json"
-MONEYLINE_CACHE_FILE = LOCAL_DIR / "nfl_last_pulled_moneylines.json"
 USAGE_FILE = LOCAL_DIR / "nfl_player_usage.csv"
 TEAM_CONTEXT_FILE = LOCAL_DIR / "nfl_team_context.json"
 INJURY_FILE = LOCAL_DIR / "nfl_injuries.json"
@@ -250,37 +248,6 @@ def load_json(path, default):
 def save_json(path, data):
     try: Path(path).write_text(json.dumps(data, indent=2))
     except Exception: pass
-
-def clear_json_file(path, empty_value=None):
-    """Clear one saved app log safely without deleting the file path itself."""
-    if empty_value is None:
-        empty_value = []
-    try:
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_text(json.dumps(empty_value, indent=2))
-        return True
-    except Exception:
-        return False
-
-def clear_board_logs(clear_learning=False, clear_line_history=False):
-    """Clear board snapshot/grade logs. Phase 6 historical database files are not touched."""
-    cleared = []
-    for label, path, empty in [
-        ("Before snapshots", PICK_LOG, []),
-        ("After snapshots", AFTER_LOG, []),
-        ("Final graded results", RESULT_LOG, []),
-    ]:
-        if clear_json_file(path, empty):
-            cleared.append(label)
-    if clear_learning:
-        if clear_json_file(LEARN_FILE, {}):
-            cleared.append("Learning calibration")
-    if clear_line_history:
-        if clear_json_file(CLV_FILE, {}):
-            cleared.append("CLV tracker")
-        if clear_json_file(LINE_HISTORY_FILE, {}):
-            cleared.append("Line history")
-    return cleared
 def strip_accents(text):
     try: return "".join(ch for ch in unicodedata.normalize("NFKD", str(text or "")) if not unicodedata.combining(ch))
     except Exception: return str(text or "")
@@ -406,12 +373,13 @@ def build_signal(p):
     if strong:
         return f"✅ {side}", "BET", reasons
 
-    # LEAN means there is enough direction to track, but not enough for official.
+    # Non-official plays still deserve a clean model direction.
+    # LEAN means there is some edge/probability, but one or more gates blocked it from official.
     if prob >= 0.57 or edge_abs >= req*0.55:
         return f"⚠️ LEAN {side}", "LEAN", reasons
 
-    # Thin/no-edge spots should not be forced into OVER/UNDER.
-    return "🚫 PASS", "PASS", reasons
+    # Thin direction: model barely prefers a side. Still do not label it PASS on the card.
+    return f"{side}", "WATCH", reasons
 
 def get_secret(key, default=""):
     try: return st.secrets[key]
@@ -583,7 +551,7 @@ def flatten(obj):
     return out
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_nfl_props(cache_bust=0):
+def fetch_underdog_nfl_props():
     """Pull live Underdog NFL props when available.
 
     Safety behavior:
@@ -647,7 +615,7 @@ def fetch_underdog_nfl_props(cache_bust=0):
     return clean[:500]
 
 @st.cache_data(ttl=120, show_spinner=False)
-def fetch_underdog_nfl_moneylines(cache_bust=0):
+def fetch_underdog_nfl_moneylines():
     """Scan Underdog feeds for NFL moneyline/winner markets when Underdog posts them.
 
     Some Underdog endpoints only expose player over/under props. This function is intentionally
@@ -693,42 +661,6 @@ def fetch_underdog_nfl_moneylines(cache_bust=0):
             seen.add(key); clean.append(r)
     request_log("UNDERDOG_NFL_MONEYLINE_PULL", "FOUND" if clean else "NO_MONEYLINE_ROWS", endpoint_debug)
     return clean[:200]
-
-
-def save_last_pulled_board(live_rows, moneyline_rows=None):
-    """Persist the latest real Underdog pull so the board can be inspected and reused.
-
-    This mirrors the MLB workflow: pull the board, keep the exact slate snapshot, then
-    allow Save BEFORE / AFTER to operate on the full current board.
-    """
-    live_rows = live_rows or []
-    moneyline_rows = moneyline_rows or []
-    payload = {
-        "pulled_at": now_iso(),
-        "source": "Underdog",
-        "row_count": len(live_rows),
-        "rows": live_rows,
-    }
-    save_json(BOARD_CACHE_FILE, payload)
-    save_json(MONEYLINE_CACHE_FILE, {
-        "pulled_at": now_iso(),
-        "source": "Underdog",
-        "row_count": len(moneyline_rows),
-        "rows": moneyline_rows,
-    })
-    return payload
-
-def load_last_pulled_board():
-    data = load_json(BOARD_CACHE_FILE, {})
-    if isinstance(data, dict) and isinstance(data.get("rows"), list):
-        return data
-    return {"pulled_at": None, "row_count": 0, "rows": []}
-
-def load_last_pulled_moneylines():
-    data = load_json(MONEYLINE_CACHE_FILE, {})
-    if isinstance(data, dict) and isinstance(data.get("rows"), list):
-        return data
-    return {"pulled_at": None, "row_count": 0, "rows": []}
 
 
 # ---------- MLB-style stable seeds + Phase 6 NFL database ----------
@@ -1737,34 +1669,12 @@ def merge_nfl_context(row):
     opp=str(row.get("opp") or "")
     team_ctx=teams.get(team,{}) if isinstance(teams.get(team,{}),dict) else {}
     opp_ctx=teams.get(opp,{}) if isinstance(teams.get(opp,{}),dict) else {}
-    # Team offense / pace / Vegas / coach-style context.  These are NFL-specific
-    # equivalents of the MLB environment and lineup context layers.
-    team_keys = [
-        "pace","pass_rate","rush_rate","plays_pg","spread","game_total","team_total",
-        "weather_risk","pbp_plays_pg","pbp_pass_rate","pbp_rush_rate",
-        "epa_per_play","success_rate","early_down_pass_rate","early_down_success_rate",
-        "red_zone_pass_rate","goal_line_rush_rate","penalties_pg","fumbles_pg",
-        "sacks_allowed_pg","qb_hits_allowed_pg","explosive_pass_rate","explosive_rush_rate",
-        "ot_rate","team_identity","coach_pace_proxy","seconds_per_play","no_huddle_rate"
-    ]
-    for k in team_keys:
+    for k in ["pace","pass_rate","plays_pg","spread","game_total","weather_risk"]:
         if row.get(k) in [None, ""] and team_ctx.get(k) not in [None, ""]:
             row[k]=team_ctx.get(k)
-
-    # Opponent defensive context.  Prefix advanced fields with opp_ so we never
-    # accidentally confuse offense and defense.
-    opp_keys = [
-        "def_pass_rank","def_run_rank","def_slot_rank","def_te_rank","def_rb_rec_rank",
-        "def_role_rank","coverage_grade","pressure_rate","def_pressure_rate",
-        "def_epa_allowed_per_play","def_success_allowed_rate","def_sacks_pg",
-        "def_qb_hits_pg","def_fumbles_forced_pg","explosive_pass_allowed_rate",
-        "explosive_rush_allowed_rate","def_explosive_pass_rank","def_explosive_run_rank",
-        "def_pressure_rank","def_run_stop_rank"
-    ]
-    for k in opp_keys:
-        if opp_ctx.get(k) not in [None, ""]:
-            row.setdefault(k, opp_ctx.get(k))
-            row.setdefault("opp_"+k, opp_ctx.get(k))
+    for k in ["def_pass_rank","def_run_rank","def_slot_rank","def_te_rank","def_rb_rec_rank","pressure_rate","coverage_grade"]:
+        if row.get(k) in [None, ""] and opp_ctx.get(k) not in [None, ""]:
+            row[k]=opp_ctx.get(k)
     injuries=load_injury_bank()
     inj=injuries.get(norm(row.get("player"))) or injuries.get(str(row.get("player") or ""))
     if inj and row.get("injury_status") in [None, ""]:
@@ -1806,174 +1716,12 @@ def usage_data_quality(row, prop):
     q=int(clamp(q + min(10, bonus*2), 0, 100))
     return q, flags[:5]
 
-def opportunity_engine(row, role, prop):
-    """Estimate the opportunity behind the prop before translating to yards/stats.
-
-    This is the NFL equivalent of MLB volume logic: for props, opportunity is usually
-    more predictive than raw yards.  The function is intentionally small and capped so
-    it improves projections without overpowering live lines.
-    """
-    notes=[]
-    pos=str(row.get("position") or "").upper()
-    plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
-    pass_rate=safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"), 56)) or 56
-    rush_rate=safe_float(row.get("pbp_rush_rate"), safe_float(row.get("rush_rate"), 44)) or 44
-    spread=safe_float(row.get("spread"), 0) or 0
-    total=safe_float(row.get("game_total"), 44) or 44
-
-    snap=safe_float(row.get("snap_share"), role.get("snap",70)) or role.get("snap",70)
-    route=safe_float(row.get("route_participation"), role.get("route",60)) or role.get("route",60)
-    target=safe_float(row.get("target_share"), role.get("target",15)) or role.get("target",15)
-    carry=safe_float(row.get("carries_share"), role.get("carry",10)) or role.get("carry",10)
-    rz=safe_float(row.get("red_zone_touch_share"), role.get("rz",10)) or role.get("rz",10)
-
-    # Simple expected opportunity estimates shown on cards/debug tables.
-    dropbacks = plays * pass_rate/100.0
-    rush_team = plays * rush_rate/100.0
-    expected = {
-        "plays_pg": round(plays,2),
-        "dropbacks_pg": round(dropbacks,2),
-        "team_rushes_pg": round(rush_team,2),
-        "routes_pg": round(dropbacks * route/100.0,2),
-        "targets_pg_est": round(dropbacks * target/100.0,2),
-        "carries_pg_est": round(rush_team * carry/100.0,2),
-        "rz_usage": round(rz,2),
-        "snap_share": round(snap,2),
-    }
-
-    factor=1.0
-    if prop in ["Passing Yards","Passing TDs","Pass Attempts","Completions","Interceptions"]:
-        factor *= clamp(1 + (dropbacks-34)*0.006, 0.90, 1.10)
-        if pass_rate >= 61: notes.append("Opportunity boost: pass-first team profile")
-        elif pass_rate <= 51: notes.append("Opportunity tax: low pass-rate profile")
-    elif prop in ["Receiving Yards","Receptions","Longest Reception"]:
-        factor *= clamp(1 + (expected["routes_pg"]-25)*0.004, 0.90, 1.10)
-        factor *= clamp(1 + (expected["targets_pg_est"]-5.5)*0.018, 0.88, 1.12)
-        if target >= 24: notes.append("Opportunity boost: elite target share")
-        elif target < 13: notes.append("Opportunity warning: thin target share")
-    elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-        factor *= clamp(1 + (expected["carries_pg_est"]-12)*0.018, 0.86, 1.14)
-        if carry >= 55: notes.append("Opportunity boost: workhorse carry share")
-        elif carry < 30: notes.append("Opportunity warning: committee rushing role")
-    elif prop in ["Fantasy Points","Anytime TD"]:
-        blended = (snap/100)*0.40 + (target/30)*0.25 + (carry/65)*0.20 + (rz/35)*0.15
-        factor *= clamp(0.88 + blended*0.24, 0.86, 1.14)
-    elif prop in ["Kicking Points","Field Goals Made"]:
-        factor *= clamp(1 + (total-44)*0.008, 0.90, 1.10)
-
-    # Pre-adjustment for likely trailing/favorite scripts.  Game script simulator below
-    # handles the larger branch logic; this just reflects base opportunity.
-    if spread > 5.5 and prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions"]:
-        factor *= 1.025; notes.append("Opportunity boost: projected trailing pass volume")
-    if spread < -7.5 and prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-        factor *= 1.025; notes.append("Opportunity boost: favorite rushing script")
-
-    return {"factor": clamp(factor,0.82,1.18), "expected": expected, "notes": notes}
-
-def pace_engine(row, prop):
-    """Team pace / total-play context."""
-    factor=1.0; notes=[]; risk="LOW"
-    plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), None))
-    seconds=safe_float(row.get("seconds_per_play"))
-    pace_label=str(row.get("coach_pace_proxy") or "").upper()
-    no_huddle=safe_float(row.get("no_huddle_rate"))
-    if plays is not None:
-        if plays >= 65: factor*=1.035; notes.append("Pace boost: high play-volume offense")
-        elif plays <= 57: factor*=0.955; risk="MED"; notes.append("Pace tax: low play-volume offense")
-    if seconds is not None:
-        if seconds <= 26: factor*=1.018; notes.append("Pace boost: fast seconds/play")
-        elif seconds >= 31: factor*=0.982; notes.append("Pace tax: slow seconds/play")
-    if pace_label == "FAST": factor*=1.015; notes.append("Coach pace proxy: FAST")
-    elif pace_label == "SLOW": factor*=0.985; notes.append("Coach pace proxy: SLOW")
-    if no_huddle is not None and no_huddle >= 12:
-        factor*=1.01; notes.append("No-huddle pace nudge")
-    return clamp(factor,0.93,1.07), risk, notes
-
-def vegas_environment_engine(row, prop):
-    """Spread, total and implied team-volume context."""
-    factor=1.0; notes=[]; risk="LOW"
-    spread=safe_float(row.get("spread"))
-    total=safe_float(row.get("game_total"))
-    team_total=safe_float(row.get("team_total"))
-    if total is not None:
-        if total >= 49 and prop not in ["Interceptions"]:
-            factor*=1.025; notes.append("Vegas boost: high total")
-        elif total <= 39 and prop in ["Passing Yards","Receiving Yards","Receptions","Passing TDs","Fantasy Points","Pass Attempts","Completions"]:
-            factor*=0.955; risk="HIGH"; notes.append("Vegas tax: low total")
-    if team_total is not None:
-        if team_total >= 27 and prop in ["Passing TDs","Anytime TD","Fantasy Points","Kicking Points","Field Goals Made"]:
-            factor*=1.025; notes.append("Team-total scoring boost")
-        elif team_total <= 18.5 and prop in ["Passing TDs","Anytime TD","Fantasy Points"]:
-            factor*=0.94; risk="HIGH"; notes.append("Low team-total scoring tax")
-    if spread is not None and abs(spread) <= 3:
-        factor*=1.01; notes.append("Close spread: full-game volume stability")
-    return clamp(factor,0.90,1.08), risk, notes
-
-def game_script_simulator(row, prop):
-    """Small three-branch game-script model: close, trailing, blowout/favorite.
-
-    This is not a moneyline model; it is a volume model for props. It nudges
-    attempts/targets/carries based on likely script without changing raw database data.
-    """
-    spread=safe_float(row.get("spread"), 0) or 0
-    total=safe_float(row.get("game_total"), 44) or 44
-    pass_rate=safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"),56)) or 56
-    factor=1.0; notes=[]; risk="LOW"
-    close_weight=clamp(0.62 - abs(spread)*0.025, 0.28, 0.70)
-    trailing_weight=clamp(0.19 + max(spread,0)*0.035, 0.12, 0.48)
-    leading_weight=clamp(1.0 - close_weight - trailing_weight, 0.10, 0.50)
-    branch={"close":round(close_weight,3),"trailing":round(trailing_weight,3),"leading":round(leading_weight,3)}
-
-    if prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions","Longest Reception"]:
-        branch_factor = close_weight*1.00 + trailing_weight*1.07 + leading_weight*0.94
-        factor *= branch_factor
-        if trailing_weight >= 0.34: notes.append("Game script boost: trailing pass-volume branch")
-        if leading_weight >= 0.36: notes.append("Game script tax: leading/blowout pass-volume branch")
-    elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-        branch_factor = close_weight*1.00 + trailing_weight*0.90 + leading_weight*1.07
-        factor *= branch_factor
-        if leading_weight >= 0.36: notes.append("Game script boost: favorite/lead rushing branch")
-        if trailing_weight >= 0.34: notes.append("Game script tax: trailing rush-volume branch")
-    elif prop in ["Passing TDs","Anytime TD","Fantasy Points"]:
-        factor *= close_weight*1.00 + trailing_weight*1.02 + leading_weight*0.99
-
-    if abs(spread) >= 8.5:
-        risk="HIGH"; notes.append("High blowout-risk branch")
-    elif abs(spread) >= 6.5:
-        risk="MED"; notes.append("Moderate blowout-risk branch")
-    if total >= 50 and prop not in ["Interceptions"]:
-        factor*=1.01; notes.append("Shootout environment nudge")
-    return clamp(factor,0.86,1.12), risk, notes, branch
-
-def blowout_risk_engine(row, prop):
-    spread=safe_float(row.get("spread"), 0) or 0
-    factor=1.0; notes=[]; risk="LOW"
-    blowout_prob=clamp((abs(spread)-3.0)/12.0, 0.04, 0.45)
-    if abs(spread) >= 7.5:
-        risk="HIGH"
-        if spread < 0 and prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions","Longest Reception"]:
-            factor*=0.965; notes.append("Blowout tax: favorite may reduce late passing")
-        if spread < 0 and prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-            factor*=1.025; notes.append("Blowout boost: favorite late rushing volume")
-        if spread > 0 and prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-            factor*=0.945; notes.append("Blowout tax: underdog rushing volume risk")
-        if spread > 0 and prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions"]:
-            factor*=1.015; notes.append("Blowout boost: underdog catch-up passing")
-    return clamp(factor,0.90,1.07), risk, notes, round(blowout_prob,3)
-
 def defensive_matchup_factor(row, prop):
     factor=1.0; notes=[]; risk="LOW"
     rank=safe_float(row.get("def_role_rank"))
     cov=safe_float(row.get("coverage_grade"))
     pass_rank=safe_float(row.get("def_pass_rank"))
     run_rank=safe_float(row.get("def_run_rank"))
-    def_epa=safe_float(row.get("opp_def_epa_allowed_per_play"), safe_float(row.get("def_epa_allowed_per_play")))
-    def_success=safe_float(row.get("opp_def_success_allowed_rate"), safe_float(row.get("def_success_allowed_rate")))
-    pressure_rank=safe_float(row.get("opp_def_pressure_rank"), safe_float(row.get("def_pressure_rank")))
-    def_sacks=safe_float(row.get("opp_def_sacks_pg"), safe_float(row.get("def_sacks_pg")))
-    explosive_pass=safe_float(row.get("opp_explosive_pass_allowed_rate"), safe_float(row.get("explosive_pass_allowed_rate")))
-    explosive_rush=safe_float(row.get("opp_explosive_rush_allowed_rate"), safe_float(row.get("explosive_rush_allowed_rate")))
-
     if prop in ["Receiving Yards","Receptions","Passing Yards","Passing TDs","Pass Attempts","Completions","Longest Reception"]:
         if rank is not None:
             if rank <= 8: factor*=0.94; risk="HIGH"; notes.append("Tough defensive role matchup")
@@ -1984,26 +1732,10 @@ def defensive_matchup_factor(row, prop):
         if pass_rank is not None:
             if pass_rank <= 8: factor*=0.975; notes.append("Top pass defense tax")
             elif pass_rank >= 24: factor*=1.02; notes.append("Bottom pass defense boost")
-        if pressure_rank is not None and pressure_rank <= 8:
-            factor*=0.972; risk="HIGH"; notes.append("Elite opponent pass-rush pressure tax")
-        if def_sacks is not None and def_sacks >= 3.0:
-            factor*=0.985; notes.append("High sack-rate opponent tax")
-        if explosive_pass is not None:
-            if explosive_pass >= 9: factor*=1.018; notes.append("Explosive pass allowance boost")
-            elif explosive_pass <= 5: factor*=0.988; notes.append("Explosive pass prevention tax")
-    if prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-        if run_rank is not None:
-            if run_rank <= 8: factor*=0.94; risk="HIGH"; notes.append("Top run defense tax")
-            elif run_rank >= 24: factor*=1.04; notes.append("Weak run defense boost")
-        if explosive_rush is not None:
-            if explosive_rush >= 8: factor*=1.02; notes.append("Explosive run allowance boost")
-            elif explosive_rush <= 4: factor*=0.985; notes.append("Explosive run prevention tax")
-    if def_epa is not None:
-        if def_epa <= -0.06: factor*=0.985; notes.append("Defense efficiency tax")
-        elif def_epa >= 0.06: factor*=1.015; notes.append("Defense efficiency boost")
-    if def_success is not None and def_success >= 48 and prop not in ["Interceptions"]:
-        factor*=1.01; notes.append("High success allowed boost")
-    return clamp(factor,0.86,1.12), risk, notes
+    if prop in ["Rushing Yards","Rush Attempts","Longest Rush"] and run_rank is not None:
+        if run_rank <= 8: factor*=0.94; risk="HIGH"; notes.append("Top run defense tax")
+        elif run_rank >= 24: factor*=1.04; notes.append("Weak run defense boost")
+    return clamp(factor,0.88,1.10), risk, notes
 
 def game_environment_factor(row, prop):
     factor=1.0; notes=[]; risk="LOW"
@@ -2159,430 +1891,6 @@ def simulate_prop_distribution(base, sigma, prop, sims, seed, collapse_prob=0.11
         sim=np.clip(core,0,None)
     return sim
 
-
-
-def _prop_target_columns(prop):
-    """Map NFL prop markets to possible actual stat columns in Phase 6 / graded logs."""
-    mapping = {
-        "Passing Yards": ["passing_yards", "pass_yds", "passing_yards_pg"],
-        "Passing TDs": ["passing_tds", "pass_tds", "passing_tds_pg"],
-        "Interceptions": ["interceptions", "ints", "interceptions_pg"],
-        "Pass Attempts": ["attempts", "pass_attempts", "pass_attempts_pg"],
-        "Completions": ["completions", "completions_pg"],
-        "Rushing Yards": ["rushing_yards", "rush_yds", "rushing_yards_pg"],
-        "Rush Attempts": ["carries", "rush_attempts", "rush_attempts_pg"],
-        "Receiving Yards": ["receiving_yards", "rec_yds", "receiving_yards_pg"],
-        "Receptions": ["receptions", "receptions_pg"],
-        "Fantasy Points": ["fantasy_points_ppr", "fantasy_points", "fantasy_points_pg"],
-        "Anytime TD": ["touchdowns", "receiving_tds", "rushing_tds", "passing_tds"],
-        "Longest Reception": ["longest_reception", "longest_rec"],
-        "Longest Rush": ["longest_rush"],
-        "Kicking Points": ["kicking_points"],
-        "Field Goals Made": ["fg_made", "field_goals_made"],
-    }
-    return mapping.get(str(prop), [])
-
-XGB_FEATURE_KEYS = [
-    "projection", "line", "edge", "fair_prob", "data_score", "stability_score", "usage_quality",
-    "opportunity_score", "pace_factor", "vegas_factor", "game_script_factor", "matchup_factor",
-    "blowout_prob", "collapse_prob", "ceiling_prob", "snap_share", "route_participation",
-    "target_share", "air_yards_share", "red_zone_touch_share", "targets_pg", "receptions_pg",
-    "rush_attempts_pg", "carries_share", "pass_attempts_pg", "spread", "game_total", "team_total",
-    "plays_pg", "pbp_plays_pg", "pass_rate", "rush_rate", "def_pass_rank", "def_run_rank",
-    "def_role_rank", "pressure_rate", "coverage_grade", "travel_miles", "rest_days",
-]
-
-
-def _numeric_feature(row, key, default=0.0):
-    v = safe_float((row or {}).get(key))
-    return default if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) else float(v)
-
-
-def _xgb_feature_vector(row):
-    return [_numeric_feature(row, k, 0.0) for k in XGB_FEATURE_KEYS]
-
-
-def _graded_training_rows(prop=None):
-    rows = load_json(RESULT_LOG, [])
-    out = []
-    for r in rows:
-        if safe_float(r.get("actual")) is None or safe_float(r.get("projection")) is None:
-            continue
-        if prop and r.get("prop") != prop:
-            continue
-        out.append(r)
-    return out
-
-
-def xgboost_assist_projection(row, rule_projection):
-    """Optional post-grade XGBoost assist.
-
-    This intentionally does NOT replace Monte Carlo.  The rules/opportunity engine produces
-    the first projection, XGBoost learns from your graded results after enough samples, then
-    Monte Carlo converts the final blended projection into probabilities.
-    """
-    enabled = bool(st.session_state.get("xgb_assist_enabled", False))
-    if not enabled:
-        return float(rule_projection), {"enabled": False, "status": "OFF", "blend": 0.0}
-
-    prop = row.get("prop")
-    same_prop = _graded_training_rows(prop)
-    all_rows = _graded_training_rows(None)
-    train_rows = same_prop if len(same_prop) >= 35 else all_rows
-    min_rows = int(st.session_state.get("xgb_min_rows", 50) or 50)
-    if len(train_rows) < min_rows:
-        return float(rule_projection), {
-            "enabled": True,
-            "status": f"WARMUP {len(train_rows)}/{min_rows} graded rows",
-            "blend": 0.0,
-            "sample_count": len(train_rows),
-        }
-
-    try:
-        X = np.array([_xgb_feature_vector(r) for r in train_rows], dtype=float)
-        y = np.array([safe_float(r.get("actual"), safe_float(r.get("projection"), 0)) or 0 for r in train_rows], dtype=float)
-        if len(y) < min_rows or np.nanstd(y) <= 0:
-            return float(rule_projection), {"enabled": True, "status": "NO_VARIANCE", "blend": 0.0, "sample_count": len(train_rows)}
-        try:
-            from xgboost import XGBRegressor
-            model = XGBRegressor(
-                n_estimators=120,
-                max_depth=3,
-                learning_rate=0.05,
-                subsample=0.85,
-                colsample_bytree=0.85,
-                objective="reg:squarederror",
-                random_state=42,
-                n_jobs=1,
-            )
-            model_name = "XGBoost"
-        except Exception:
-            from sklearn.ensemble import GradientBoostingRegressor
-            model = GradientBoostingRegressor(n_estimators=120, max_depth=3, learning_rate=0.05, random_state=42)
-            model_name = "GBR fallback"
-        model.fit(X, y)
-        pred = float(model.predict(np.array([_xgb_feature_vector(row)], dtype=float))[0])
-        if not np.isfinite(pred):
-            raise ValueError("non-finite ML prediction")
-        rule = float(rule_projection)
-        # Keep the assist as an assist.  It cannot yank the projection wildly away from the main engine.
-        pred = clamp(pred, rule * 0.72, rule * 1.28) if rule > 0 else max(0, pred)
-        max_blend = safe_float(st.session_state.get("xgb_blend_weight"), 0.22) or 0.22
-        confidence_blend = clamp((len(train_rows) - min_rows) / 250.0, 0.08, max_blend)
-        blended = (rule * (1 - confidence_blend)) + (pred * confidence_blend)
-        return float(blended), {
-            "enabled": True,
-            "status": "ACTIVE",
-            "model": model_name,
-            "rule_projection": round(rule, 3),
-            "xgb_projection": round(pred, 3),
-            "blend": round(confidence_blend, 3),
-            "sample_count": len(train_rows),
-            "same_prop_samples": len(same_prop),
-        }
-    except Exception as e:
-        return float(rule_projection), {"enabled": True, "status": f"ERROR: {str(e)[:90]}", "blend": 0.0, "sample_count": len(train_rows)}
-
-
-def _phase6_consistency_score(player, prop):
-    """Historical consistency from saved weekly logs when available."""
-    try:
-        if not PHASE6_PLAYER_LOG_FILE.exists():
-            return 70, "Consistency neutral: no weekly log file loaded"
-        cols = ["player", "player_display_name", "position", "week"] + _prop_target_columns(prop)
-        # Read only available columns if possible; fall back to full small-ish CSV.
-        sample = pd.read_csv(PHASE6_PLAYER_LOG_FILE, nrows=1)
-        usecols = [c for c in cols if c in sample.columns]
-        df = pd.read_csv(PHASE6_PLAYER_LOG_FILE, usecols=usecols if usecols else None)
-        name_col = "player" if "player" in df.columns else "player_display_name" if "player_display_name" in df.columns else None
-        if not name_col:
-            return 70, "Consistency neutral: no player name column"
-        target = next((c for c in _prop_target_columns(prop) if c in df.columns), None)
-        if not target:
-            return 70, "Consistency neutral: no stat column for prop"
-        g = df[df[name_col].map(norm) == norm(player)].copy()
-        vals = pd.to_numeric(g[target], errors="coerce").dropna()
-        vals = vals[vals >= 0]
-        if len(vals) < 5:
-            return 70, f"Consistency warming up: {len(vals)} games"
-        mean = float(vals.mean())
-        std = float(vals.std())
-        cv = std / max(1.0, mean)
-        score = int(clamp(100 - cv * 48, 30, 96))
-        return score, f"Historical consistency score {score} from {len(vals)} games"
-    except Exception as e:
-        return 70, f"Consistency neutral: {str(e)[:60]}"
-
-
-def advanced_context_engine(row, prop):
-    """Adds the extra football context layer: EP/drive, rest/travel, refs, importance,
-    player consistency, and feature validation.
-    """
-    factor=1.0; notes=[]; risk="LOW"; ctx={}
-    total=safe_float(row.get("game_total"))
-    team_total=safe_float(row.get("team_total"))
-    if team_total is None and total is not None:
-        spread=safe_float(row.get("spread"), 0) or 0
-        # Approx implied points.  Negative spread means favorite.
-        team_total = (total / 2.0) - (spread / 2.0)
-    if team_total is not None:
-        drives=safe_float(row.get("projected_drives"), 10.4) or 10.4
-        ep_drive=team_total / max(7.5, drives)
-        ctx["expected_points_per_drive"] = round(ep_drive,3)
-        if ep_drive >= 2.45 and prop in ["Passing TDs","Fantasy Points","Anytime TD","Kicking Points","Field Goals Made","Receiving Yards"]:
-            factor*=1.018; notes.append("EP/drive boost: strong scoring environment")
-        elif ep_drive <= 1.75 and prop in ["Passing TDs","Fantasy Points","Anytime TD","Receiving Yards","Rushing Yards"]:
-            factor*=0.975; risk="MED"; notes.append("EP/drive tax: weak scoring environment")
-
-    rest=safe_float(row.get("rest_days"))
-    travel=safe_float(row.get("travel_miles"))
-    if rest is not None:
-        ctx["rest_days"] = rest
-        if rest <= 4:
-            factor*=0.985; risk="MED"; notes.append("Short-week fatigue tax")
-        elif rest >= 10:
-            factor*=1.008; notes.append("Extra-rest preparation nudge")
-    if travel is not None:
-        ctx["travel_miles"] = travel
-        if travel >= 2200:
-            factor*=0.99; notes.append("Long-travel fatigue tax")
-        elif travel <= 350 and travel > 0:
-            factor*=1.003; notes.append("Short-travel stability nudge")
-
-    ref_pen=safe_float(row.get("ref_penalty_rate"), safe_float(row.get("ref_flags_pg"), None))
-    if ref_pen is not None:
-        ctx["ref_penalty_rate"] = ref_pen
-        if ref_pen >= 15:
-            risk="MED"; factor*=0.994; notes.append("Referee crew: high penalty/drive volatility")
-        elif ref_pen <= 10:
-            factor*=1.004; notes.append("Referee crew: low-flag pace stability")
-
-    importance=str(row.get("game_importance") or row.get("motivation") or "").upper()
-    starters_rest=str(row.get("starters_rest_risk") or "").upper()
-    if any(x in importance for x in ["HIGH","PLAYOFF","DIVISION","MUST"]):
-        factor*=1.006; notes.append("Game importance nudge: starters/volume more secure")
-    if any(x in starters_rest for x in ["HIGH","REST","LIMIT"]):
-        factor*=0.935; risk="HIGH"; notes.append("Starter rest / limited role risk")
-
-    consistency, consistency_note = _phase6_consistency_score(row.get("player"), prop)
-    ctx["consistency_score"] = consistency
-    if consistency <= 48:
-        risk="MED"; notes.append(consistency_note + " — volatility tax")
-    elif consistency >= 82:
-        notes.append(consistency_note + " — stable profile")
-
-    # Feature validation: tells you when the projection is leaning on defaults.
-    required_by_prop = {
-        "Passing Yards": ["pass_attempts_pg","pass_rate","game_total","def_pass_rank"],
-        "Passing TDs": ["pass_attempts_pg","red_zone_pass_rate","team_total","def_pass_rank"],
-        "Interceptions": ["pass_attempts_pg","pressure_rate","def_pressure_rate"],
-        "Rushing Yards": ["rush_attempts_pg","carries_share","rush_rate","def_run_rank"],
-        "Rush Attempts": ["rush_attempts_pg","carries_share","spread","rush_rate"],
-        "Receiving Yards": ["route_participation","target_share","air_yards_share","def_role_rank"],
-        "Receptions": ["route_participation","target_share","def_role_rank"],
-        "Longest Reception": ["air_yards_share","route_participation","explosive_pass_rate"],
-        "Fantasy Points": ["snap_share","target_share","red_zone_touch_share","team_total"],
-        "Anytime TD": ["red_zone_touch_share","team_total","goal_line_rush_rate"],
-    }
-    req = required_by_prop.get(prop, [])
-    missing = [k for k in req if safe_float(row.get(k)) is None and row.get(k) in [None, ""]]
-    ctx["missing_features"] = missing
-    if missing:
-        notes.append("Feature validation: missing " + ", ".join(missing[:4]))
-        factor*=clamp(1 - 0.006*len(missing), 0.965, 1.0)
-    return clamp(factor,0.90,1.06), risk, notes, ctx
-
-
-def _prop_target_columns(prop):
-    mapping = {
-        "Passing Yards": ["passing_yards", "pass_yds", "passing_yards_pg"],
-        "Passing TDs": ["passing_tds", "pass_tds", "passing_tds_pg"],
-        "Interceptions": ["interceptions", "ints", "interceptions_pg"],
-        "Rushing Yards": ["rushing_yards", "rush_yds", "rushing_yards_pg"],
-        "Rush Attempts": ["carries", "rush_attempts", "rush_attempts_pg"],
-        "Receiving Yards": ["receiving_yards", "rec_yds", "receiving_yards_pg"],
-        "Receptions": ["receptions", "receptions_pg"],
-        "Longest Reception": ["longest_rec", "receiving_yards", "receiving_yards_pg"],
-        "Longest Rush": ["longest_rush", "rushing_yards", "rushing_yards_pg"],
-        "Fantasy Points": ["fantasy_points_ppr", "fantasy_points", "fantasy_points_pg"],
-        "Anytime TD": ["receiving_tds", "rushing_tds", "passing_tds"],
-        "Kicking Points": ["kicking_points"],
-        "Field Goals Made": ["fg_made"],
-        "Pass Attempts": ["attempts", "pass_attempts_pg"],
-        "Completions": ["completions", "completions_pg"],
-    }
-    return mapping.get(str(prop), [])
-
-def _historical_player_values(player, prop, max_games=18):
-    """Read saved Phase 6 weekly logs and return recent values for the matching prop.
-    This is intentionally defensive so a missing column never breaks the board.
-    """
-    try:
-        if not PHASE6_PLAYER_LOG_FILE.exists():
-            return []
-        sample = pd.read_csv(PHASE6_PLAYER_LOG_FILE, nrows=1)
-        possible_name_cols = [c for c in ["player", "player_display_name", "player_name"] if c in sample.columns]
-        stat_cols = [c for c in _prop_target_columns(prop) if c in sample.columns]
-        base_cols = possible_name_cols + [c for c in ["week", "season"] if c in sample.columns] + stat_cols
-        if not possible_name_cols or not stat_cols:
-            return []
-        df = pd.read_csv(PHASE6_PLAYER_LOG_FILE, usecols=list(dict.fromkeys(base_cols)))
-        name_col = possible_name_cols[0]
-        g = df[df[name_col].map(norm) == norm(player)].copy()
-        if g.empty:
-            return []
-        if "week" in g.columns:
-            g = g.sort_values("week")
-        # Some props are composites, especially TD-style markets.
-        vals = None
-        if prop == "Anytime TD":
-            td_cols = [c for c in ["receiving_tds", "rushing_tds"] if c in g.columns]
-            if td_cols:
-                vals = g[td_cols].apply(pd.to_numeric, errors="coerce").fillna(0).sum(axis=1)
-        if vals is None:
-            stat_col = stat_cols[0]
-            vals = pd.to_numeric(g[stat_col], errors="coerce")
-        vals = vals.dropna()
-        vals = vals[vals >= 0]
-        return [float(x) for x in vals.tail(max_games).tolist()]
-    except Exception:
-        return []
-
-def bayesian_markov_poisson_engine(row, prop, rule_projection):
-    """Optional advanced simulation assist.
-
-    Layers added here:
-    - Bayesian update: blends the rules projection with the player's own historical game logs.
-    - Markov game-state proxy: close/trailing/leading game scripts adjust volume by prop type.
-    - Poisson scoring-event nudge: touchdown/kicking/interception style props use scoring-event context.
-    - Elo/efficiency matchup proxy: team strength and opponent defense can apply small bounded nudges.
-
-    It is deliberately bounded. It should help calibration, not overpower the core engine.
-    """
-    enabled = bool(st.session_state.get("advanced_sim_assist_enabled", True))
-    if not enabled:
-        return float(rule_projection), {"enabled": False, "status": "OFF", "blend": 0.0, "notes": []}
-
-    projection = float(rule_projection or 0.0)
-    notes=[]; ctx={}; factor=1.0
-
-    # Bayesian update from saved weekly logs.
-    hist = _historical_player_values(row.get("player"), prop, max_games=18)
-    min_games = int(st.session_state.get("bayes_min_games", 5) or 5)
-    if len(hist) >= min_games:
-        hist_mean = float(np.mean(hist))
-        recent_mean = float(np.mean(hist[-5:])) if len(hist) >= 5 else hist_mean
-        hist_std = float(np.std(hist)) if len(hist) > 1 else 0.0
-        # More games + lower variance = higher confidence, capped so it remains an assist.
-        variance_conf = 1.0 / (1.0 + (hist_std / max(1.0, hist_mean)))
-        sample_conf = clamp(len(hist) / 18.0, 0.20, 1.0)
-        bayes_weight = clamp(0.10 + 0.18 * variance_conf * sample_conf, 0.08, 0.30)
-        bayes_mean = (hist_mean * 0.65) + (recent_mean * 0.35)
-        bounded_mean = clamp(bayes_mean, projection * 0.70, projection * 1.30) if projection > 0 else bayes_mean
-        projection = (projection * (1 - bayes_weight)) + (bounded_mean * bayes_weight)
-        ctx.update({"historical_games": len(hist), "historical_mean": round(hist_mean,3), "recent5_mean": round(recent_mean,3), "bayes_weight": round(bayes_weight,3)})
-        notes.append(f"Bayesian log update active: {len(hist)} games, weight {bayes_weight:.2f}")
-    else:
-        ctx["historical_games"] = len(hist)
-        notes.append(f"Bayesian log update warming up: {len(hist)}/{min_games} games")
-
-    # Markov game-state proxy using spread/total/pace: leading, close, trailing state distribution.
-    spread = safe_float(row.get("spread"), 0.0) or 0.0
-    total = safe_float(row.get("game_total"), 44.0) or 44.0
-    pace = safe_float(row.get("pace"), 50.0) or 50.0
-    lead_prob = clamp(0.34 + (-spread)*0.025, 0.12, 0.72)
-    trail_prob = clamp(0.34 + (spread)*0.025, 0.12, 0.72)
-    close_prob = clamp(1.0 - abs(lead_prob - 0.34) - abs(trail_prob - 0.34), 0.18, 0.58)
-    # normalize
-    z = max(0.01, lead_prob + trail_prob + close_prob)
-    lead_prob, trail_prob, close_prob = lead_prob/z, trail_prob/z, close_prob/z
-    ctx["markov_state_probs"] = {"leading": round(lead_prob,3), "close": round(close_prob,3), "trailing": round(trail_prob,3)}
-    markov_factor = 1.0
-    if prop in ["Passing Yards","Pass Attempts","Completions","Receiving Yards","Receptions","Longest Reception"]:
-        markov_factor *= (1 + trail_prob*0.035 - lead_prob*0.026)
-    elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-        markov_factor *= (1 + lead_prob*0.032 - trail_prob*0.025)
-    elif prop in ["Interceptions"]:
-        markov_factor *= (1 + trail_prob*0.030)
-    elif prop in ["Kicking Points", "Field Goals Made"]:
-        markov_factor *= (1 + close_prob*0.020)
-    if pace >= 56:
-        markov_factor *= 1.006
-    elif pace <= 47:
-        markov_factor *= 0.994
-    factor *= clamp(markov_factor, 0.94, 1.06)
-    notes.append("Markov game-state volume model applied")
-
-    # Poisson event-rate nudge for discrete scoring-like markets.
-    if prop in ["Passing TDs", "Anytime TD", "Interceptions", "Field Goals Made", "Kicking Points"]:
-        team_total = safe_float(row.get("team_total"))
-        if team_total is None:
-            team_total = (total/2.0) - (spread/2.0)
-        drives = safe_float(row.get("projected_drives"), 10.4) or 10.4
-        lam_score = clamp((team_total or 21.0) / max(1.0, drives), 0.9, 3.8)
-        ctx["poisson_lambda_score_drive"] = round(lam_score,3)
-        if prop in ["Passing TDs", "Anytime TD"]:
-            factor *= clamp(0.965 + lam_score*0.018, 0.96, 1.055)
-        elif prop in ["Field Goals Made", "Kicking Points"]:
-            # Kicker volume likes scoring environment but also close/stalled drives.
-            factor *= clamp(0.975 + lam_score*0.011 + close_prob*0.012, 0.965, 1.045)
-        elif prop == "Interceptions":
-            factor *= clamp(0.99 + trail_prob*0.025, 0.985, 1.04)
-        notes.append("Poisson event-rate nudge applied")
-
-    # Elo/efficiency proxy. If exact Elo is supplied, use it; otherwise infer from ranks/spread.
-    team_elo = safe_float(row.get("team_elo"))
-    opp_elo = safe_float(row.get("opp_elo"))
-    if team_elo is not None and opp_elo is not None:
-        elo_diff = clamp((team_elo - opp_elo) / 400.0, -0.22, 0.22)
-    else:
-        # Negative spread means stronger/favorite.
-        elo_diff = clamp((-spread) / 24.0, -0.20, 0.20)
-    ctx["elo_efficiency_diff"] = round(elo_diff,3)
-    if prop in ["Passing Yards","Receiving Yards","Receptions","Passing TDs","Fantasy Points","Anytime TD"]:
-        factor *= clamp(1 + elo_diff*0.035, 0.985, 1.018)
-    elif prop in ["Rushing Yards","Rush Attempts"]:
-        factor *= clamp(1 + elo_diff*0.025, 0.988, 1.016)
-    notes.append("Elo/efficiency matchup proxy applied")
-
-    final_projection = projection * clamp(factor, 0.90, 1.10)
-    return float(final_projection), {"enabled": True, "status": "ACTIVE", "blend": round(abs(final_projection - float(rule_projection or 0.0)) / max(1.0, float(rule_projection or 1.0)),3), "factor": round(factor,3), "context": ctx, "notes": notes}
-
-
-def ensemble_ml_assist_projection(row, rule_projection):
-    """Optional Random Forest / Neural-style assist after enough graded rows.
-    This is separate from XGBoost and stays bounded. It only turns on when the user has grades.
-    """
-    enabled = bool(st.session_state.get("ensemble_ml_assist_enabled", False))
-    if not enabled:
-        return float(rule_projection), {"enabled": False, "status": "OFF", "blend": 0.0}
-    prop = row.get("prop")
-    same_prop = _graded_training_rows(prop)
-    all_rows = _graded_training_rows(None)
-    train_rows = same_prop if len(same_prop) >= 45 else all_rows
-    min_rows = int(st.session_state.get("ensemble_min_rows", 75) or 75)
-    if len(train_rows) < min_rows:
-        return float(rule_projection), {"enabled": True, "status": f"WARMUP {len(train_rows)}/{min_rows} graded rows", "blend": 0.0, "sample_count": len(train_rows)}
-    try:
-        from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor
-        X = np.array([_xgb_feature_vector(r) for r in train_rows], dtype=float)
-        y = np.array([safe_float(r.get("actual"), safe_float(r.get("projection"), 0)) or 0 for r in train_rows], dtype=float)
-        if len(y) < min_rows or np.nanstd(y) <= 0:
-            return float(rule_projection), {"enabled": True, "status": "NO_VARIANCE", "blend": 0.0, "sample_count": len(train_rows)}
-        rf = RandomForestRegressor(n_estimators=160, max_depth=6, min_samples_leaf=3, random_state=77, n_jobs=1)
-        et = ExtraTreesRegressor(n_estimators=160, max_depth=6, min_samples_leaf=3, random_state=88, n_jobs=1)
-        rf.fit(X, y); et.fit(X, y)
-        xrow = np.array([_xgb_feature_vector(row)], dtype=float)
-        pred = float((rf.predict(xrow)[0] * 0.55) + (et.predict(xrow)[0] * 0.45))
-        rule = float(rule_projection or 0.0)
-        pred = clamp(pred, rule * 0.76, rule * 1.24) if rule > 0 else max(0, pred)
-        max_blend = safe_float(st.session_state.get("ensemble_blend_weight"), 0.16) or 0.16
-        blend = clamp((len(train_rows) - min_rows) / 350.0, 0.04, max_blend)
-        blended = (rule * (1 - blend)) + (pred * blend)
-        return float(blended), {"enabled": True, "status": "ACTIVE", "model": "RF/ExtraTrees", "ensemble_projection": round(pred,3), "rule_projection": round(rule,3), "blend": round(blend,3), "sample_count": len(train_rows), "same_prop_samples": len(same_prop)}
-    except Exception as e:
-        return float(rule_projection), {"enabled": True, "status": f"ERROR: {str(e)[:90]}", "blend": 0.0, "sample_count": len(train_rows)}
-
 def project_row(row, sims=12000):
     row=merge_nfl_context(row)
     prop=row.get("prop","Receiving Yards")
@@ -2592,19 +1900,12 @@ def project_row(row, sims=12000):
     usage_quality, usage_flags = usage_data_quality(row, prop)
     base=cfg["base"]*usage_adjustment(role,prop)
     base, env_notes, env=apply_environment(base,row,prop)
-
-    opportunity = opportunity_engine(row, role, prop)
-    pace_factor, pace_risk, pace_notes = pace_engine(row, prop)
     defense_factor, defense_risk, defense_notes = defensive_matchup_factor(row, prop)
     game_factor, game_env_risk, game_notes = game_environment_factor(row, prop)
-    vegas_factor, vegas_risk, vegas_notes = vegas_environment_engine(row, prop)
-    script_factor, script_risk, script_notes, script_branches = game_script_simulator(row, prop)
-    blowout_factor, blowout_risk, blowout_notes, blowout_prob = blowout_risk_engine(row, prop)
-    advanced_factor, advanced_risk, advanced_notes, advanced_context = advanced_context_engine(row, prop)
     role_factor, injury_risk, game_script_risk, risk_notes = role_risk_adjustments(row, role, prop)
-    if defense_risk == "HIGH" or game_env_risk == "HIGH" or script_risk == "HIGH" or blowout_risk == "HIGH" or vegas_risk == "HIGH" or advanced_risk == "HIGH":
+    if defense_risk == "HIGH" or game_env_risk == "HIGH":
         game_script_risk="HIGH"
-    base*=role_factor*defense_factor*game_factor*opportunity["factor"]*pace_factor*vegas_factor*script_factor*blowout_factor*advanced_factor
+    base*=role_factor*defense_factor*game_factor
     learn=learning_scale(row.get("player"),prop)
     cal_scale, cal_note=calibration_scale(row.get("player"),prop)
     base*=learn*cal_scale
@@ -2614,27 +1915,11 @@ def project_row(row, sims=12000):
     if line is not None and row.get("source")!="DEMO":
         base=base*0.62 + line*0.38
 
-    xgb_info = {"enabled": bool(st.session_state.get("xgb_assist_enabled", False)), "status": "OFF"}
-    if st.session_state.get("xgb_assist_enabled", False):
-        base, xgb_info = xgboost_assist_projection({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "collapse_prob": 0.0, "ceiling_prob": 0.0, "usage_quality": usage_quality, "data_score": 70}, base)
-
-    bayes_markov_info = {"enabled": bool(st.session_state.get("advanced_sim_assist_enabled", True)), "status": "OFF"}
-    if st.session_state.get("advanced_sim_assist_enabled", True):
-        base, bayes_markov_info = bayesian_markov_poisson_engine({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "usage_quality": usage_quality, "data_score": 70}, prop, base)
-
-    ensemble_info = {"enabled": bool(st.session_state.get("ensemble_ml_assist_enabled", False)), "status": "OFF"}
-    if st.session_state.get("ensemble_ml_assist_enabled", False):
-        base, ensemble_info = ensemble_ml_assist_projection({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "collapse_prob": 0.0, "ceiling_prob": 0.0, "usage_quality": usage_quality, "data_score": 70}, base)
-
     sigma=cfg["sigma"]
     if injury_risk in ["HIGH","EXTREME"]: sigma*=1.12
     if game_script_risk=="HIGH": sigma*=1.08
     if usage_quality < 72: sigma*=1.07
-    if (advanced_context or {}).get("consistency_score", 70) <= 48: sigma*=1.06
     collapse_prob, ceiling_prob = simulation_branch_rates(row, prop, injury_risk, game_script_risk)
-    collapse_prob = clamp(collapse_prob + (blowout_prob*0.12 if prop in ["Passing Yards","Receiving Yards","Receptions","Rushing Yards","Rush Attempts"] else 0), 0.05, 0.46)
-    if script_risk == "HIGH":
-        sigma *= 1.04
     seed=stable_projection_seed(row.get("player","x"), prop, line, row.get("team",""), row.get("opp",""), row.get("source",""))
     sim=simulate_prop_distribution(base, sigma, prop, sims, seed, collapse_prob, ceiling_prob)
 
@@ -2673,21 +1958,14 @@ def project_row(row, sims=12000):
     line_delta=update_clv_snapshot(row.get("player"), prop, row.get("source"), line) if line is not None else None
     true_line_delta=track_line_delta(row.get("player"), prop, row.get("source"), line) if line is not None else None
 
-    notes=[]+env_notes+opportunity.get("notes",[])+pace_notes+risk_notes+defense_notes+game_notes+vegas_notes+script_notes+blowout_notes+advanced_notes
+    notes=[]+env_notes+risk_notes+defense_notes+game_notes
     if usage_flags:
         notes.extend(["Usage data: "+x for x in usage_flags[:3]])
     if cal_scale != 1.0: notes.append(cal_note)
     elif row.get("source")!="DEMO": notes.append(cal_note)
-    if xgb_info.get("enabled"):
-        notes.append(f"XGBoost Assist: {xgb_info.get('status')}" + (f" · blend {xgb_info.get('blend')}" if xgb_info.get('blend') else ""))
-    if bayes_markov_info.get("enabled"):
-        notes.append(f"Bayesian/Markov Assist: {bayes_markov_info.get('status')}" + (f" · factor {bayes_markov_info.get('factor')}" if bayes_markov_info.get('factor') else ""))
-        notes.extend((bayes_markov_info.get("notes") or [])[:3])
-    if ensemble_info.get("enabled"):
-        notes.append(f"Ensemble ML Assist: {ensemble_info.get('status')}" + (f" · blend {ensemble_info.get('blend')}" if ensemble_info.get('blend') else ""))
     if row.get("source")=="DEMO": notes.append("Demo row until live NFL props are available")
 
-    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"advanced_context":advanced_context,"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     signal, action_tier, rejections = build_signal(out)
     out["signal"]=signal; out["action_tier"]=action_tier; out["official_rejections"]=rejections; out["bettable"]=action_tier=="BET"
     return out
@@ -2705,80 +1983,13 @@ def alt_ladder(p):
     return pd.DataFrame(rows)
 
 # ---------- logging / grading ----------
-def _json_safe(v):
-    """Convert numpy/pandas objects so full slate snapshots always save cleanly."""
-    try:
-        if pd.isna(v) and not isinstance(v, (dict, list, tuple)):
-            return None
-    except Exception:
-        pass
-    if isinstance(v, dict):
-        return {str(k): _json_safe(val) for k, val in v.items()}
-    if isinstance(v, (list, tuple)):
-        return [_json_safe(x) for x in v]
-    if isinstance(v, (np.integer,)):
-        return int(v)
-    if isinstance(v, (np.floating,)):
-        return float(v)
-    if isinstance(v, (np.bool_,)):
-        return bool(v)
-    if isinstance(v, pd.Timestamp):
-        return v.isoformat()
-    return v
-
-def _clean_snapshot_row(row):
-    keep = dict(row or {})
-    # Keep the model output and context, but avoid any future massive objects.
-    keep.pop("sim", None)
-    keep.pop("samples", None)
-    return _json_safe(keep)
-
-def _snapshot_slate_id(label):
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"NFL_{str(label).upper()}_{stamp}"
-
-def save_snapshot(path, rows, label, scope="ALL", source_note="manual_button"):
-    """Save a complete slate/board snapshot, grouped by slate_id.
-
-    This is the NFL version of the MLB Save Official Before / After workflow:
-    one click saves the whole board, not just a single player prop.
-    """
+def save_snapshot(path, rows, label):
     old=load_json(path,[])
     stamp=now_iso()
-    slate_id=_snapshot_slate_id(label)
-    saved=[]
     for r in rows:
-        if scope == "LIVE_ONLY" and r.get("source") == "DEMO":
-            continue
-        if scope == "OFFICIAL_ONLY" and not r.get("bettable"):
-            continue
-        rr=_clean_snapshot_row(r)
-        rr.update({
-            "snapshot_type":label,
-            "saved_at":stamp,
-            "slate_id":slate_id,
-            "snapshot_scope":scope,
-            "source_note":source_note,
-        })
-        saved.append(rr)
-    old.extend(saved)
-    save_json(path, old[-12000:])
-    return len(saved), slate_id
-
-def _snapshot_groups(path, label=None):
-    rows=load_json(path,[])
-    groups={}
-    for r in rows:
-        if label and str(r.get("snapshot_type")) != str(label):
-            continue
-        key=r.get("slate_id") or r.get("saved_at") or "UNKNOWN"
-        groups.setdefault(key,[]).append(r)
-    out=[]
-    for key, vals in groups.items():
-        ts=vals[0].get("saved_at", key)
-        srcs=sorted(set(str(v.get("source","")) for v in vals))
-        out.append({"key":key,"label":f"{ts} · {len(vals)} rows · {', '.join([x for x in srcs if x])}","rows":vals})
-    return sorted(out, key=lambda x: str(x["label"]), reverse=True)
+        old.append({**r,"snapshot_type":label,"saved_at":stamp})
+    save_json(path, old[-5000:])
+    return len(rows)
 
 def update_learning_from_result(player, prop, projected, actual):
     data=load_json(LEARN_FILE,{})
@@ -2790,62 +2001,6 @@ def update_learning_from_result(player, prop, projected, actual):
         data[key]=round(clamp(cur*(1+0.05*err),0.90,1.10),4)
         save_json(LEARN_FILE,data)
     return data.get(key,cur)
-
-def grade_rows_and_learn(rows_to_grade, actual_values, grade_note="bulk_grade"):
-    """Grade many saved props at once and update the learning file for each graded row."""
-    results=load_json(RESULT_LOG,[])
-    graded=[]
-    for r, actual in zip(rows_to_grade, actual_values):
-        actual=safe_float(actual)
-        if actual is None:
-            continue
-        line=safe_float(r.get("line")); pick=str(r.get("pick") or "").upper(); win=None
-        if line is not None:
-            if pick == "OVER": win = actual > line
-            elif pick == "UNDER": win = actual < line
-        scale=update_learning_from_result(r.get("player"), r.get("prop"), r.get("projection"), actual)
-        out=_clean_snapshot_row(r)
-        out.update({
-            "actual":actual,
-            "win":win,
-            "graded_at":now_iso(),
-            "new_learning_scale":scale,
-            "grade_note":grade_note,
-            "projection_error":None if safe_float(r.get("projection")) is None else round(actual - safe_float(r.get("projection")), 3),
-            "line_result_margin":None if line is None else round(actual - line, 3),
-        })
-        results.append(out); graded.append(out)
-    save_json(RESULT_LOG, results[-12000:])
-    return graded
-
-def build_learning_summary_df(results):
-    if not results:
-        return pd.DataFrame()
-    rdf=pd.DataFrame(results)
-    if rdf.empty:
-        return pd.DataFrame()
-    for c in ["projection","actual","line"]:
-        if c in rdf.columns:
-            rdf[c]=pd.to_numeric(rdf[c], errors="coerce")
-    if "win" in rdf.columns:
-        rdf["win_num"] = rdf["win"].apply(lambda x: 1 if x is True else 0 if x is False else np.nan)
-    else:
-        rdf["win_num"] = np.nan
-    if "projection_error" not in rdf.columns:
-        rdf["projection_error"] = rdf.get("actual", np.nan) - rdf.get("projection", np.nan)
-    grp_cols=[c for c in ["prop","player"] if c in rdf.columns]
-    if not grp_cols:
-        return pd.DataFrame()
-    summ=rdf.groupby(grp_cols, dropna=False).agg(
-        graded=("actual","count"),
-        hit_rate=("win_num","mean"),
-        avg_projection_error=("projection_error","mean"),
-        avg_abs_error=("projection_error", lambda x: float(np.nanmean(np.abs(x))) if len(x) else np.nan),
-    ).reset_index()
-    summ["hit_rate"]=(summ["hit_rate"]*100).round(1)
-    summ["avg_projection_error"]=summ["avg_projection_error"].round(3)
-    summ["avg_abs_error"]=summ["avg_abs_error"].round(3)
-    return summ.sort_values(["graded","avg_abs_error"], ascending=[False, True])
 
 # ---------- UI ----------
 POSITION_TAB_PROPS = {
@@ -2896,7 +2051,7 @@ def _render_prop_table(rows, title="Board"):
         st.warning("No props available for this view.")
         return
     view = pd.DataFrame(rows)
-    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","opportunity_score","xgb_status","advanced_factor","game_script_factor","matchup_factor","blowout_prob","pure_upside","volatility","stability_score","data_score","line_delta","source"]
+    show_cols=["player","position","team","matchup","prop","line","projection","edge","pick","fair_prob","ev","kelly","signal","action_tier","pure_upside","volatility","stability_score","data_score","line_delta","source"]
     st.dataframe(view[[c for c in show_cols if c in view.columns]], use_container_width=True, hide_index=True)
 
 
@@ -2934,14 +2089,6 @@ def _render_player_cards(rows, limit=None, header=None):
                 st.write(f"Target Share: **{role.get('target','')}%**")
                 st.write(f"Carry Share: **{role.get('carry','')}%**")
                 st.write(f"Red-Zone Usage: **{role.get('rz','')}%**")
-                opp_ctx=p.get("expected_opportunity", {}) or {}
-                if opp_ctx:
-                    st.write("---")
-                    st.write(f"Expected Plays: **{opp_ctx.get('plays_pg','')}**")
-                    st.write(f"Dropbacks: **{opp_ctx.get('dropbacks_pg','')}**")
-                    st.write(f"Routes: **{opp_ctx.get('routes_pg','')}**")
-                    st.write(f"Targets Est: **{opp_ctx.get('targets_pg_est','')}**")
-                    st.write(f"Carries Est: **{opp_ctx.get('carries_pg_est','')}**")
             with c2:
                 st.subheader("Environment")
                 env=p.get("env", {})
@@ -2954,22 +2101,8 @@ def _render_player_cards(rows, limit=None, header=None):
                 st.subheader("Risk Notes")
                 for n in p.get("notes",[]): st.write("- "+str(n))
                 st.write(f"Data Score: **{p.get('data_score')}/99**")
-                st.write(f"Opportunity Score: **{p.get('opportunity_score')}**")
-                st.write(f"Matchup Factor: **{p.get('matchup_factor')}**")
-                st.write(f"Game Script Factor: **{p.get('game_script_factor')}**")
-                st.write(f"Blowout Prob: **{p.get('blowout_prob')}**")
-                st.write(f"Advanced Factor: **{p.get('advanced_factor')}**")
-                if p.get('xgb_assist'):
-                    st.write(f"XGBoost Assist: **{(p.get('xgb_assist') or {}).get('status','OFF')}**")
-                    st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
-                    st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
-                    with st.expander("XGBoost / Bayesian / advanced context", expanded=False):
-                        st.json({"xgb_assist": p.get('xgb_assist'), "advanced_context": p.get('advanced_context')})
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
-                if p.get('game_script_branches'):
-                    st.write("Game Script Branches:")
-                    st.json(p.get('game_script_branches'))
                 rejects=p.get('official_rejections') or []
                 if rejects:
                     st.write("Official Filter Rejections:")
@@ -3054,37 +2187,9 @@ st.markdown(f"""
 with st.sidebar:
     st.header("Controls")
     source_mode=st.radio("Prop Source", ["Live Underdog only", "Live Underdog first, demo fallback", "Demo board only"], index=0)
-
-    if "board_pull_id" not in st.session_state:
-        st.session_state["board_pull_id"] = 0
-    last_board_meta = load_last_pulled_board()
-    if st.button("🔄 Refresh / Pull Underdog Board Lines", use_container_width=True):
-        st.session_state["board_pull_id"] = int(st.session_state.get("board_pull_id", 0)) + 1
-        try:
-            fetch_underdog_nfl_props.clear()
-            fetch_underdog_nfl_moneylines.clear()
-            safe_get_json.clear()
-        except Exception:
-            pass
-        request_log("MANUAL_PULL_BOARD", "REQUESTED", f"pull_id={st.session_state['board_pull_id']}")
-        st.rerun()
-    st.caption(f"Last saved board pull: {last_board_meta.get('pulled_at') or 'None'} · Rows: {last_board_meta.get('row_count', 0)}")
-    use_saved_board_if_blank = st.checkbox("Use last pulled board if live pull is blank", value=False, help="Useful if Underdog temporarily fails after you already pulled a board. Demo mode is still separate.")
-
     # Prop filtering is now handled by the main QBs / RBs / Receivers tabs.
     # Keep every supported market active in the engine and hide the old sidebar multiselect.
     prop_filter=list(PROP_CONFIG.keys())
-    st.session_state["xgb_assist_enabled"] = st.toggle("XGBoost Assist after grading", value=bool(st.session_state.get("xgb_assist_enabled", False)), help="Uses your graded results to assist the main projection before Monte Carlo. Stays neutral until enough grades exist.")
-    if st.session_state.get("xgb_assist_enabled", False):
-        st.session_state["xgb_min_rows"] = st.slider("XGB min graded rows", 25, 250, int(st.session_state.get("xgb_min_rows", 50)), 5)
-        st.session_state["xgb_blend_weight"] = st.slider("XGB max blend", 0.05, 0.40, float(st.session_state.get("xgb_blend_weight", 0.22)), 0.01)
-    st.session_state["advanced_sim_assist_enabled"] = st.toggle("Bayesian / Markov / Poisson Assist", value=bool(st.session_state.get("advanced_sim_assist_enabled", True)), help="Adds bounded Bayesian historical-log updating, Markov game-state volume, Poisson event-rate nudges, and Elo/efficiency matchup context before Monte Carlo.")
-    if st.session_state.get("advanced_sim_assist_enabled", True):
-        st.session_state["bayes_min_games"] = st.slider("Bayesian min player games", 3, 12, int(st.session_state.get("bayes_min_games", 5)), 1)
-    st.session_state["ensemble_ml_assist_enabled"] = st.toggle("Random Forest / Tree Ensemble Assist after grading", value=bool(st.session_state.get("ensemble_ml_assist_enabled", False)), help="Optional ML assist from graded results. Stays neutral until enough graded props exist.")
-    if st.session_state.get("ensemble_ml_assist_enabled", False):
-        st.session_state["ensemble_min_rows"] = st.slider("Ensemble min graded rows", 50, 400, int(st.session_state.get("ensemble_min_rows", 75)), 5)
-        st.session_state["ensemble_blend_weight"] = st.slider("Ensemble max blend", 0.04, 0.30, float(st.session_state.get("ensemble_blend_weight", 0.16)), 0.01)
     min_score=st.slider("Minimum Data Score",0,99,0)
     show_all=st.checkbox("Show all player cards", True)
     st.divider()
@@ -3094,23 +2199,10 @@ with st.sidebar:
         _render_phase6_admin()
     st.code("STORAGE_DIR=nfl_engine", language="bash")
 
-pull_id = int(st.session_state.get("board_pull_id", 0))
-live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props(pull_id)
-moneylines=[] if source_mode=="Demo board only" else fetch_underdog_nfl_moneylines(pull_id)
-if live:
-    save_last_pulled_board(live, moneylines)
-elif source_mode != "Demo board only" and use_saved_board_if_blank:
-    cached_board = load_last_pulled_board()
-    cached_money = load_last_pulled_moneylines()
-    live = cached_board.get("rows", []) or []
-    moneylines = cached_money.get("rows", []) or []
-    if live:
-        request_log("UNDERDOG_BOARD_CACHE", "USING_LAST_PULLED", f"rows={len(live)} pulled_at={cached_board.get('pulled_at')}")
+live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props()
+moneylines=[] if source_mode=="Demo board only" else fetch_underdog_nfl_moneylines()
 raw = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
 projected=[project_row(r) for r in raw if r.get("prop") in prop_filter]
-for _p in projected:
-    _x=_p.get("xgb_assist") or {}
-    _p["xgb_status"] = _x.get("status", "OFF")
 projected=[p for p in projected if p.get("data_score",0)>=min_score]
 
 df=pd.DataFrame(projected)
@@ -3127,10 +2219,9 @@ st.markdown("<div class='kpi-strip'>"+
     "</div>", unsafe_allow_html=True)
 
 if live:
-    cached_meta = load_last_pulled_board()
-    st.success(f"🟢 Live/loaded Underdog NFL props detected: {len(live)} rows. Last board pull: {cached_meta.get('pulled_at') or 'current refresh'}.")
+    st.success(f"🟢 Live Underdog NFL props detected: {len(live)} rows. Demo mode is OFF for this refresh.")
 elif source_mode == "Live Underdog only":
-    st.warning("No live Underdog NFL rows were detected. Click 🔄 Refresh / Pull Underdog Board Lines in the sidebar when props are posted.")
+    st.warning("No live Underdog NFL rows were detected. Live-only mode is showing an empty board instead of demo lines.")
 else:
     st.info("Demo/testing mode is active. These rows are for UI testing only and should not be treated as real plays.")
 
@@ -3217,141 +2308,37 @@ with tabs[7]:
         st.success(f"Correlation Read: {corr}")
 
 with tabs[8]:
-    st.markdown("<div class='section-title-pro'>Save Full Board / After / Bulk Grade</div>", unsafe_allow_html=True)
-    st.write("This now works like the MLB workflow: save the whole pulled board/slate in one click, then bulk-grade it later.")
-
-    source_warning = any(p.get("source") == "DEMO" for p in projected)
-    if source_warning:
-        st.warning("Demo rows are currently on the board. Use Live Underdog only for real official saves once NFL props are posted.")
-
+    st.markdown("<div class='section-title-pro'>Save Before / After / Final Grade</div>", unsafe_allow_html=True)
     c1,c2,c3=st.columns(3)
     with c1:
-        before_scope=st.selectbox("Before save scope", ["ALL", "LIVE_ONLY", "OFFICIAL_ONLY"], index=0, help="ALL saves the full visible board. LIVE_ONLY excludes demo rows. OFFICIAL_ONLY saves only bettable rows.")
-        if st.button("💾 Save OFFICIAL BEFORE — Full Board", use_container_width=True):
-            n, slate_id = save_snapshot(PICK_LOG, projected, "BEFORE", scope=before_scope, source_note="full_board_before")
-            st.success(f"Saved {n} BEFORE rows · Slate ID: {slate_id}")
+        if st.button("Save BEFORE Snapshot", use_container_width=True): st.success(f"Saved {save_snapshot(PICK_LOG, projected, 'BEFORE')} before rows")
     with c2:
-        after_scope=st.selectbox("After save scope", ["ALL", "LIVE_ONLY", "OFFICIAL_ONLY"], index=0, help="Use this before grading if you want a closing snapshot of the same board.")
-        if st.button("📌 Save AFTER / Closing — Full Board", use_container_width=True):
-            n, slate_id = save_snapshot(AFTER_LOG, projected, "AFTER", scope=after_scope, source_note="full_board_after")
-            st.success(f"Saved {n} AFTER rows · Slate ID: {slate_id}")
+        if st.button("Save AFTER Snapshot", use_container_width=True): st.success(f"Saved {save_snapshot(AFTER_LOG, projected, 'AFTER')} after rows")
     with c3:
-        st.metric("Current Board Rows", len(projected))
-        st.metric("Bettable Rows", sum(1 for p in projected if p.get("bettable")))
-        st.metric("Live Rows", sum(1 for p in projected if p.get("source") != "DEMO"))
-
+        st.write("Final grading below")
     st.divider()
-    st.subheader("Clear Board Logs")
-    st.caption("Use this when you saved demo/test slates and want a clean board. This does NOT delete the Phase 6 historical database.")
-    clear_col1, clear_col2, clear_col3 = st.columns([1.2, 1.2, 2])
-    with clear_col1:
-        clear_learning_flag = st.checkbox("Also clear learning/calibration", value=False, help="Leave off unless you want to reset learned prop calibration too.")
-    with clear_col2:
-        clear_line_flag = st.checkbox("Also clear CLV/line history", value=False, help="Leave off unless you want to reset saved line movement history.")
-    with clear_col3:
-        confirm_clear = st.text_input("Type CLEAR to confirm", value="", placeholder="CLEAR")
-        if st.button("🧹 Clear Board Logs", use_container_width=True):
-            if confirm_clear.strip().upper() != "CLEAR":
-                st.warning("Type CLEAR first so logs are not wiped by accident.")
-            else:
-                cleared = clear_board_logs(clear_learning=clear_learning_flag, clear_line_history=clear_line_flag)
-                st.success("Cleared: " + ", ".join(cleared) if cleared else "Nothing cleared")
-                st.info("Phase 6 database was preserved.")
-
-    st.divider()
-    st.subheader("Bulk Grade Saved BEFORE Slate")
-    before_groups=_snapshot_groups(PICK_LOG, "BEFORE")
-    if not before_groups:
-        st.info("No BEFORE slates saved yet. Save the full board first, then come back here to grade it.")
-    else:
-        choice=st.selectbox("Choose saved BEFORE slate", before_groups, format_func=lambda x: x["label"])
-        saved_rows=choice["rows"]
-        grade_rows=[]
-        for idx,r in enumerate(saved_rows):
-            grade_rows.append({
-                "idx": idx,
-                "Player": r.get("player"),
-                "Team": r.get("team"),
-                "Prop": r.get("prop"),
-                "Line": r.get("line"),
-                "Pick": r.get("pick"),
-                "Signal": r.get("signal"),
-                "Projection": r.get("projection"),
-                "Actual": None,
-            })
-        gdf=pd.DataFrame(grade_rows)
-        st.caption("Enter actual results for as many rows as you want. Blank Actual rows will be skipped.")
-        edited=st.data_editor(
-            gdf,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            column_config={"Actual": st.column_config.NumberColumn("Actual", step=0.5)},
-            disabled=["idx","Player","Team","Prop","Line","Pick","Signal","Projection"],
-            key="bulk_grade_editor",
-        )
-        col_a,col_b=st.columns([1,2])
-        with col_a:
-            if st.button("✅ Grade Entered Rows + Learn", use_container_width=True):
-                actuals=[]; rows_for_grade=[]
-                for _,er in edited.iterrows():
-                    actual=safe_float(er.get("Actual"))
-                    if actual is not None:
-                        rows_for_grade.append(saved_rows[int(er.get("idx"))])
-                        actuals.append(actual)
-                graded=grade_rows_and_learn(rows_for_grade, actuals, grade_note=f"bulk_grade_{choice['key']}")
-                if graded:
-                    wins=[g.get("win") for g in graded if g.get("win") is not None]
-                    hit = round(100*np.mean(wins),1) if wins else "N/A"
-                    st.success(f"Graded {len(graded)} rows · Hit Rate: {hit}% · Learning updated")
-                else:
-                    st.warning("No Actual values entered.")
-        with col_b:
-            st.info("You can still grade one or two props manually, but the main workflow is now full-board save → bulk grade → learning update, like MLB.")
-
-    st.divider()
-    st.subheader("Single Prop Quick Grade")
     if projected:
         g_choice=st.selectbox("Prop to grade", [f"{p['player']} — {p['prop']}" for p in projected])
         g=projected[[f"{p['player']} — {p['prop']}" for p in projected].index(g_choice)]
         actual=st.number_input("Actual result", min_value=0.0, step=0.5)
-        if st.button("Submit Single Grade + Learn"):
-            graded=grade_rows_and_learn([g], [actual], grade_note="single_quick_grade")
-            win=graded[0].get("win") if graded else None
-            scale=graded[0].get("new_learning_scale") if graded else None
+        if st.button("Submit Final Grade + Learn"):
+            line=safe_float(g.get("line")); pick=g.get("pick"); win=None
+            if line is not None:
+                win = actual > line if pick=="OVER" else actual < line if pick=="UNDER" else None
+            scale=update_learning_from_result(g["player"],g["prop"],g["projection"],actual)
+            rows=load_json(RESULT_LOG,[]); rows.append({**g,"actual":actual,"win":win,"graded_at":now_iso(),"new_learning_scale":scale}); save_json(RESULT_LOG,rows[-5000:])
             st.success(f"Graded. Result: {'WIN' if win else 'LOSS' if win is False else 'NO LINE'} · New learning scale: {scale}")
 
 with tabs[9]:
-    st.markdown("<div class='section-title-pro'>Learning Dashboard + Calibration</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title-pro'>Learning Dashboard</div>", unsafe_allow_html=True)
     results=load_json(RESULT_LOG,[]); learn=load_json(LEARN_FILE,{})
     if results:
         rdf=pd.DataFrame(results)
-        total=len(rdf)
-        graded_actual = rdf["actual"].notna().sum() if "actual" in rdf.columns else total
-        win_series = rdf["win"].dropna() if "win" in rdf.columns else pd.Series(dtype=float)
-        hit_rate = f"{round(win_series.mean()*100,1)}%" if len(win_series) else "N/A"
-        avg_err = "N/A"
-        if "projection_error" in rdf.columns:
-            err=pd.to_numeric(rdf["projection_error"], errors="coerce").dropna()
-            if len(err): avg_err=round(float(err.mean()),3)
-        k1,k2,k3,k4=st.columns(4)
-        k1.metric("Graded Props", graded_actual)
-        k2.metric("Hit Rate", hit_rate)
-        k3.metric("Avg Projection Bias", avg_err)
-        k4.metric("Learning Keys", len(learn))
-
-        st.subheader("Calibration by Prop + Player")
-        summ=build_learning_summary_df(results)
-        if not summ.empty:
-            st.dataframe(summ.head(200), use_container_width=True, hide_index=True)
-        st.subheader("Recent Graded Rows")
-        show_cols=[c for c in ["graded_at","player","team","prop","line","pick","projection","actual","projection_error","win","new_learning_scale","slate_id","grade_note"] if c in rdf.columns]
-        st.dataframe(rdf[show_cols].tail(200), use_container_width=True, hide_index=True)
-    else:
-        st.info("No graded NFL props yet. Once you bulk-grade a saved slate, calibration and learning will populate here.")
-    if learn:
-        with st.expander("Raw Learning Scale JSON"):
-            st.json(learn)
+        st.metric("Graded Props",len(rdf))
+        if "win" in rdf.columns: st.metric("Hit Rate", f"{round(rdf['win'].dropna().mean()*100,1)}%" if len(rdf['win'].dropna()) else "N/A")
+        st.dataframe(rdf.tail(100), use_container_width=True)
+    else: st.info("No graded NFL props yet. Once you grade results, this dashboard will populate.")
+    if learn: st.json(learn)
 
 with tabs[10]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
