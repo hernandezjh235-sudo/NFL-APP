@@ -724,6 +724,17 @@ def load_last_pulled_board():
         return data
     return {"pulled_at": None, "row_count": 0, "rows": []}
 
+def load_last_pulled_moneylines():
+    """Load the saved Underdog moneyline board cache safely.
+
+    This prevents startup crashes when the moneyline cache has not been created yet
+    or was cleared. It mirrors load_last_pulled_board().
+    """
+    data = load_json(MONEYLINE_CACHE_FILE, {})
+    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+        return data
+    return {"pulled_at": None, "source": "NONE", "row_count": 0, "rows": []}
+
 
 def _canon_prop_label(value):
     """Normalize Underdog/manual market labels into the app's canonical prop names."""
