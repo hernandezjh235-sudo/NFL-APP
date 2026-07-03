@@ -895,6 +895,7 @@ def fetch_underdog_nfl_props(cache_bust=0):
         key2=(norm(r.get("player")),r.get("prop"),safe_float(r.get("line")),r.get("matchup",""))
         if key not in seen and key2 not in seen:
             seen.add(key); seen.add(key2); clean.append(r)
+    clean = _filter_live_board_to_phase6_model(clean)
     request_log("UNDERDOG_NFL_LIVE_PULL", "FOUND" if clean else "NO_NFL_ROWS", endpoint_debug)
     return clean[:1000]
 
@@ -1126,6 +1127,136 @@ def _infer_position_from_prop_player(prop, player=None, team=None, position=None
     if prop in ["Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions"]:
         return "QB"
     return ""
+
+
+
+
+def _resolve_model_player_strict(player, team=None, position=None):
+    """Return a Phase-6/model player match or None.
+
+    This is stricter than the manual resolver: live Underdog rows must match a
+    player already in our saved NFL model database. This prevents MLB/tennis/etc.
+    rows from slipping into the NFL prop board just because the market label
+    looked similar.
+    """
+    lookup = _phase6_player_lookup()
+    if not lookup.get("exact") and not lookup.get("by_last"):
+        # If the saved model database is not present, do not hard-block startup.
+        return {"player": str(player or "").strip(), "team": team or "NFL", "position": position or "", "model_match": False, "model_filter_disabled": True}
+
+    raw = str(player or "").strip()
+    if not raw:
+        return None
+    n = norm(raw)
+    team_u = str(team or "").upper().strip()
+    pos_u = str(position or "").upper().strip()
+
+    meta = lookup["exact"].get(n)
+
+    if not meta:
+        parts = n.split()
+        # Handle initials from Underdog like J. Goff, P Mahomes, C McCaffrey.
+        if len(parts) >= 2 and (len(parts[0]) <= 2 or parts[0].endswith(".")):
+            last = parts[-1]
+            candidates = list(lookup["by_last"].get(last, []))
+            if team_u:
+                tm = [m for m in candidates if str(m.get("team", "")).upper() == team_u]
+                if tm:
+                    candidates = tm
+            if pos_u:
+                pm = [m for m in candidates if str(m.get("position", "")).upper() == pos_u]
+                if pm:
+                    candidates = pm
+            if len(candidates) == 1:
+                meta = candidates[0]
+            elif candidates:
+                meta = candidates[0]
+
+    if not meta:
+        # Conservative fuzzy match only for near-exact full names.
+        names = list(lookup["exact"].keys())
+        close = difflib.get_close_matches(n, names, n=1, cutoff=0.94)
+        if close:
+            meta = lookup["exact"].get(close[0])
+
+    if not meta:
+        return None
+
+    return {
+        "player": meta.get("player") or raw,
+        "team": meta.get("team") or team or "NFL",
+        "position": meta.get("position") or position or "",
+        "model_match": True,
+        "model_filter_disabled": False,
+    }
+
+
+def _prop_allowed_for_model_position(prop, position):
+    """Only keep market/position combinations our NFL model can project correctly."""
+    prop = str(prop or "")
+    pos = str(position or "").upper().strip()
+    if not pos:
+        return False
+    if prop in ["Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions"]:
+        return pos == "QB"
+    if prop in ["Receiving Yards", "Receptions", "Longest Reception"]:
+        return pos in ["RB", "WR", "TE"]
+    if prop in ["Rushing Yards", "Rush Attempts", "Longest Rush"]:
+        return pos in ["QB", "RB", "WR"]
+    if prop in ["Anytime TD", "Fantasy Points"]:
+        return pos in ["QB", "RB", "WR", "TE"]
+    if prop in ["Kicking Points", "Field Goals Made"]:
+        return pos == "K"
+    return pos in ["QB", "RB", "WR", "TE", "K"]
+
+
+def _filter_live_board_to_phase6_model(rows):
+    """Normalize live/manual board rows to the saved NFL model and drop non-model players.
+
+    Fixes the issue where Underdog "all boards" can include non-NFL players or
+    football markets attached to defensive/unsupported positions. The board now
+    keeps only players present in Phase 6/player usage and only market-position
+    combinations the projection model supports.
+    """
+    if not rows:
+        return []
+    lookup = _phase6_player_lookup()
+    if not lookup.get("exact") and not lookup.get("by_last"):
+        return list(rows)
+
+    clean = []
+    dropped = {"not_in_model": 0, "bad_position_market": 0}
+    seen = set()
+    for r in rows:
+        row = dict(r or {})
+        prop = _canon_prop_label(row.get("prop")) or row.get("prop")
+        if prop not in PROP_CONFIG:
+            dropped["bad_position_market"] += 1
+            continue
+        meta = _resolve_model_player_strict(row.get("player"), row.get("team"), row.get("position"))
+        if not meta:
+            dropped["not_in_model"] += 1
+            continue
+        pos = str(meta.get("position") or row.get("position") or "").upper().strip()
+        if not _prop_allowed_for_model_position(prop, pos):
+            dropped["bad_position_market"] += 1
+            continue
+        row["player"] = meta.get("player")
+        row["team"] = meta.get("team") or row.get("team") or "NFL"
+        row["position"] = pos
+        row["prop"] = prop
+        # Infer opponent if matchup contains team abbreviations.
+        if not row.get("opp"):
+            _, opp = _infer_team_from_matchup(row.get("matchup"), row.get("team"))
+            row["opp"] = opp
+        key = (norm(row.get("player")), row.get("prop"), safe_float(row.get("line")), str(row.get("matchup") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        clean.append(row)
+
+    request_log("NFL_MODEL_BOARD_FILTER", "FILTERED", f"kept={len(clean)} dropped_not_model={dropped['not_in_model']} dropped_bad_market={dropped['bad_position_market']}")
+    return clean
 
 
 def _manual_row_to_board_row(row, default_prop=None):
@@ -3594,6 +3725,7 @@ with st.sidebar:
         manual_text = st.text_area("Paste Underdog board text", height=150, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG", key="manual_board_text")
         if st.button("📥 Load Manual Board Into App", use_container_width=True, key="load_manual_board_btn"):
             manual_rows = parse_manual_underdog_board(manual_text, manual_upload)
+            manual_rows = _filter_live_board_to_phase6_model(manual_rows)
             if manual_rows:
                 save_last_pulled_board(manual_rows, [])
                 request_log("MANUAL_BOARD_IMPORT", "SAVED", f"rows={len(manual_rows)}")
@@ -3685,7 +3817,7 @@ if 'show_feed_debug' in globals() and show_feed_debug:
     st.caption("Latest Underdog/API request log")
     st.dataframe(pd.DataFrame(req_log[-25:]), use_container_width=True, hide_index=True)
 
-tabs=st.tabs(["Today / Weekly Board", "QBs", "RBs", "Receivers", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
+tabs=st.tabs(["Today / Weekly Board", "QBs", "RBs", "Receivers", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line", "Pass Yards", "Pass TDs", "INTs", "Rush Yards", "Rec Yards", "Receptions"])
 
 with tabs[0]:
     st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
@@ -3908,3 +4040,40 @@ with tabs[10]:
     else:
         st.warning("No Underdog NFL moneyline rows detected right now. Player props can still load normally; this tab will populate automatically if Underdog posts moneyline/winner markets in the scanned feed.")
         st.caption("Tip: most DFS-style Underdog feeds focus on player props. If moneylines are not offered there, keep this tab as a monitor and use sportsbook odds APIs later for true moneyline pricing.")
+
+
+with tabs[11]:
+    st.markdown("<div class='section-title-pro'>Passing Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Passing Yards"]
+    _render_prop_table(rows, "Passing Yards")
+    _render_player_cards(rows, header=None)
+
+with tabs[12]:
+    st.markdown("<div class='section-title-pro'>Passing TDs Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Passing TDs"]
+    _render_prop_table(rows, "Passing TDs")
+    _render_player_cards(rows, header=None)
+
+with tabs[13]:
+    st.markdown("<div class='section-title-pro'>Interceptions Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Interceptions"]
+    _render_prop_table(rows, "Interceptions")
+    _render_player_cards(rows, header=None)
+
+with tabs[14]:
+    st.markdown("<div class='section-title-pro'>Rushing Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Rushing Yards"]
+    _render_prop_table(rows, "Rushing Yards")
+    _render_player_cards(rows, header=None)
+
+with tabs[15]:
+    st.markdown("<div class='section-title-pro'>Receiving Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Receiving Yards"]
+    _render_prop_table(rows, "Receiving Yards")
+    _render_player_cards(rows, header=None)
+
+with tabs[16]:
+    st.markdown("<div class='section-title-pro'>Receptions Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Receptions"]
+    _render_prop_table(rows, "Receptions")
+    _render_player_cards(rows, header=None)
