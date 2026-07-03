@@ -1,3 +1,4 @@
+
 # -*- coding: utf-8 -*-
 """
 NFL PROP ENGINE — Railway / Streamlit ready
@@ -9,7 +10,7 @@ when no NFL prop feed is available, it shows clearly labeled preseason/demo exam
 the UI and workflow can be tested without confusing them as real bets.
 """
 
-import os, json, math, time, difflib, unicodedata, hashlib
+import os, json, math, time, difflib, unicodedata, hashlib, re, io
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -18,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v2.8 — BAYESIAN MARKOV + ADVANCED SIM ASSIST + XGB"
+APP_VERSION = "NFL v3.0 — MANUAL BOARD FALLBACK + STARTUP SAFE + BAYESIAN MARKOV + XGB"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -66,14 +67,14 @@ UNDERDOG_URLS = [
 
 # Underdog labels vary by season/API version. Keep aliases broad, then hard-filter to NFL.
 NFL_PROP_ALIASES = {
-    "Passing Yards": ["passing yards", "pass yards", "pass yds", "qb passing yards"],
-    "Passing TDs": ["passing tds", "passing touchdowns", "pass tds", "pass touchdowns"],
-    "Interceptions": ["interceptions", "passing interceptions", "ints", "qb interceptions"],
+    "Passing Yards": ["passing yards", "pass yards", "pass yds", "qb passing yards", "pass yard", "passing yard"],
+    "Passing TDs": ["passing tds", "passing touchdowns", "pass tds", "pass touchdowns", "pass td", "passing td"],
+    "Interceptions": ["interceptions", "passing interceptions", "ints", "qb interceptions", "interception", "int"],
     "Rushing Yards": ["rushing yards", "rush yards", "rush yds"],
     "Receiving Yards": ["receiving yards", "rec yards", "receiving yds"],
     "Receptions": ["receptions", "rec", "catches"],
     "Fantasy Points": ["fantasy points", "fantasy score"],
-    "Anytime TD": ["anytime td", "anytime touchdown", "td scorer", "touchdown scorer"],
+    "Anytime TD": ["anytime td", "anytime touchdown", "td scorer", "touchdown scorer", "rush + rec tds", "rush rec tds", "rush + receiving tds", "rush receiving touchdowns", "rush + rec touchdowns", "rushing + receiving tds"],
     "Pass Attempts": ["pass attempts", "passing attempts", "attempted passes", "qb attempts"],
     "Completions": ["completions", "passing completions", "completed passes"],
     "Rush Attempts": ["rush attempts", "rushing attempts", "carries", "rushing attempts +"],
@@ -723,11 +724,261 @@ def load_last_pulled_board():
         return data
     return {"pulled_at": None, "row_count": 0, "rows": []}
 
-def load_last_pulled_moneylines():
-    data = load_json(MONEYLINE_CACHE_FILE, {})
-    if isinstance(data, dict) and isinstance(data.get("rows"), list):
-        return data
-    return {"pulled_at": None, "row_count": 0, "rows": []}
+
+def _canon_prop_label(value):
+    """Normalize Underdog/manual market labels into the app's canonical prop names."""
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    b = norm(raw)
+    # Highest-confidence direct mappings first. Underdog uses labels like Pass Yards,
+    # Rush + Rec TDs, Rec Yards, INT, etc. These must match the app markets exactly.
+    manual_map = {
+        "pass yards": "Passing Yards", "passing yards": "Passing Yards", "pass yds": "Passing Yards", "qb pass yards": "Passing Yards",
+        "pass tds": "Passing TDs", "passing tds": "Passing TDs", "pass td": "Passing TDs", "passing touchdowns": "Passing TDs",
+        "interceptions": "Interceptions", "interception": "Interceptions", "ints": "Interceptions", "int": "Interceptions",
+        "pass attempts": "Pass Attempts", "passing attempts": "Pass Attempts", "attempts": "Pass Attempts",
+        "completions": "Completions", "passing completions": "Completions",
+        "rush yards": "Rushing Yards", "rushing yards": "Rushing Yards", "rush yds": "Rushing Yards",
+        "rush attempts": "Rush Attempts", "rushing attempts": "Rush Attempts", "carries": "Rush Attempts",
+        "rec yards": "Receiving Yards", "receiving yards": "Receiving Yards", "receiving yds": "Receiving Yards",
+        "receptions": "Receptions", "rec": "Receptions", "catches": "Receptions",
+        "longest reception": "Longest Reception", "long reception": "Longest Reception",
+        "longest rush": "Longest Rush", "long rush": "Longest Rush",
+        "rush rec tds": "Anytime TD", "rush receiving tds": "Anytime TD", "rush rec touchdowns": "Anytime TD",
+        "rush + rec tds": "Anytime TD", "rush + receiving tds": "Anytime TD", "anytime td": "Anytime TD",
+        "fantasy points": "Fantasy Points", "fantasy score": "Fantasy Points",
+    }
+    if b in manual_map:
+        return manual_map[b]
+    # Some labels include extra symbols/words.
+    if "rush" in b and "rec" in b and ("td" in b or "touchdown" in b):
+        return "Anytime TD"
+    if "pass" in b and "yard" in b:
+        return "Passing Yards"
+    if "pass" in b and ("td" in b or "touchdown" in b):
+        return "Passing TDs"
+    if "interception" in b or b == "int" or b == "ints":
+        return "Interceptions"
+    if "completion" in b:
+        return "Completions"
+    if "attempt" in b and "pass" in b:
+        return "Pass Attempts"
+    if "attempt" in b and ("rush" in b or "rushing" in b):
+        return "Rush Attempts"
+    if "rush" in b and "yard" in b:
+        return "Rushing Yards"
+    if ("rec" in b or "receiving" in b) and "yard" in b:
+        return "Receiving Yards"
+    if "reception" in b or b == "rec" or "catch" in b:
+        return "Receptions"
+    return prop_name_from_blob(b)
+
+
+def _phase6_player_lookup():
+    """Build a fuzzy player lookup from saved Phase 6/player usage files for manual imports.
+
+    This lets pasted Underdog shorthand like 'J. Goff' resolve to 'Jared Goff' using
+    team + last name where possible, so the projection engine can match historical stats.
+    """
+    rows = []
+    for path in [USAGE_FILE, PHASE6_PLAYER_SUMMARY_FILE, PHASE6_PLAYER_LOG_FILE]:
+        try:
+            if Path(path).exists():
+                df = pd.read_csv(path, usecols=lambda c: str(c).lower() in ["player", "team", "position", "recent_team", "player_display_name"])
+                df.columns = [str(c).strip() for c in df.columns]
+                if "player_display_name" in df.columns and "player" not in df.columns:
+                    df["player"] = df["player_display_name"]
+                if "recent_team" in df.columns and "team" not in df.columns:
+                    df["team"] = df["recent_team"]
+                rows.extend(df[[c for c in ["player", "team", "position"] if c in df.columns]].dropna(subset=["player"]).to_dict("records"))
+        except Exception:
+            continue
+    exact, by_last = {}, {}
+    for r in rows:
+        player = str(r.get("player") or "").strip()
+        if not player:
+            continue
+        team = str(r.get("team") or "").upper().strip()
+        pos = str(r.get("position") or "").upper().strip()
+        meta = {"player": player, "team": team, "position": pos}
+        exact[norm(player)] = meta
+        parts = norm(player).split()
+        if parts:
+            last = parts[-1]
+            by_last.setdefault(last, []).append(meta)
+    return {"exact": exact, "by_last": by_last}
+
+
+def _infer_team_from_matchup(matchup, player_team=None):
+    txt = str(matchup or "").upper()
+    teams = re.findall(r"\b[A-Z]{2,3}\b", txt)
+    known = set(TEAM_STADIUM_COORDS.keys())
+    teams = [t for t in teams if t in known]
+    team = str(player_team or "").upper().strip()
+    opp = ""
+    if team and team in teams:
+        opps = [t for t in teams if t != team]
+        opp = opps[0] if opps else ""
+    return team, opp
+
+
+def _resolve_manual_player(player, team=None, position=None):
+    lookup = _phase6_player_lookup()
+    raw = str(player or "").strip()
+    if not raw:
+        return raw, team or "NFL", position or ""
+    n = norm(raw)
+    meta = lookup["exact"].get(n)
+    if not meta:
+        parts = n.split()
+        # Handle Underdog shorthand like J. Goff, P Mahomes, C McCaffrey.
+        if len(parts) >= 2 and (len(parts[0]) <= 2 or parts[0].endswith(".")):
+            last = parts[-1]
+            candidates = lookup["by_last"].get(last, [])
+            team_u = str(team or "").upper().strip()
+            pos_u = str(position or "").upper().strip()
+            if team_u:
+                team_matches = [m for m in candidates if str(m.get("team", "")).upper() == team_u]
+                if team_matches:
+                    candidates = team_matches
+            if pos_u:
+                pos_matches = [m for m in candidates if str(m.get("position", "")).upper() == pos_u]
+                if pos_matches:
+                    candidates = pos_matches
+            if candidates:
+                meta = candidates[0]
+    if meta:
+        return meta.get("player") or raw, (team or meta.get("team") or "NFL"), (position or meta.get("position") or "")
+    return raw, team or "NFL", position or ""
+
+
+def _infer_position_from_prop_player(prop, player=None, team=None, position=None):
+    pos = str(position or "").upper().strip()
+    if pos:
+        return pos
+    _, _, pos = _resolve_manual_player(player, team, position)
+    if pos:
+        return pos
+    if prop in ["Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions"]:
+        return "QB"
+    return ""
+
+
+def _manual_row_to_board_row(row, default_prop=None):
+    # Flexible column names from CSV upload or pasted tables.
+    get = lambda *keys: next((row.get(k) for k in keys if k in row and row.get(k) not in [None, "", np.nan]), None)
+    player = get("player", "Player", "name", "Name", "athlete", "Athlete")
+    prop = _canon_prop_label(get("prop", "Prop", "market", "Market", "stat", "Stat", "category", "Category") or default_prop)
+    line = safe_float(get("line", "Line", "value", "Value", "projection", "Projection", "total", "Total"))
+    matchup = str(get("matchup", "Matchup", "game", "Game") or "")
+    team = str(get("team", "Team", "team_abbr", "Team Abbr") or "").upper().strip()
+    opp = str(get("opp", "opponent", "Opponent") or "").upper().strip()
+    pos = str(get("position", "Position", "pos", "Pos") or "").upper().strip()
+    if not prop or prop not in PROP_CONFIG or not player or line is None:
+        return None
+    player, team, pos = _resolve_manual_player(player, team, pos)
+    if not opp:
+        _, opp = _infer_team_from_matchup(matchup, team)
+    if not pos:
+        pos = _infer_position_from_prop_player(prop, player, team, pos)
+    home_away = ""
+    if matchup and team:
+        mu = matchup.upper()
+        if f"@ {team}" in mu or mu.endswith(f"@{team}"):
+            home_away = "HOME"
+        elif f"{team} @" in mu:
+            home_away = "AWAY"
+    return {
+        "player": str(player),
+        "team": team or "NFL",
+        "opp": opp,
+        "home_away": home_away,
+        "position": pos,
+        "prop": prop,
+        "line": float(line),
+        "price": None,
+        "source": "Manual Underdog",
+        "source_url": "manual_import",
+        "matchup": matchup,
+        "underdog_id": "manual",
+    }
+
+
+def parse_manual_underdog_board(text="", uploaded_file=None):
+    """Parse manual Underdog board input into app-ready rows.
+
+    Accepted CSV columns: player, prop, line, team, opp, matchup, position.
+    Also accepts copied/pasted board text grouped by market, e.g.:
+    Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG.
+    """
+    rows = []
+    raw_text = text or ""
+    if uploaded_file is not None:
+        try:
+            data = uploaded_file.read()
+            if hasattr(uploaded_file, "seek"):
+                uploaded_file.seek(0)
+            raw_text = data.decode("utf-8", errors="ignore")
+        except Exception:
+            raw_text = str(text or "")
+    # Try CSV/table first.
+    if raw_text.strip():
+        try:
+            if "," in raw_text.splitlines()[0] or "\t" in raw_text.splitlines()[0]:
+                sep = "\t" if "\t" in raw_text.splitlines()[0] and "," not in raw_text.splitlines()[0] else ","
+                df = pd.read_csv(io.StringIO(raw_text), sep=sep)
+                df.columns = [str(c).strip() for c in df.columns]
+                for _, rr in df.iterrows():
+                    out = _manual_row_to_board_row(rr.to_dict())
+                    if out:
+                        rows.append(out)
+        except Exception as e:
+            request_log("MANUAL_BOARD_IMPORT", "CSV_PARSE_ERROR", e)
+    if rows:
+        return _dedupe_board_rows(rows)
+
+    # Flexible pasted text parser.
+    current_prop = None
+    lines = [ln.strip() for ln in str(raw_text or "").splitlines() if ln.strip()]
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        prop_guess = _canon_prop_label(ln)
+        if prop_guess:
+            current_prop = prop_guess
+            i += 1
+            continue
+        # One-line format: J. Goff 271.5 DET vs NO
+        m = re.match(r"^([A-Za-z]\.?\s*[A-Za-z'\-\.]+(?:\s+(?:Jr\.?|Sr\.?|II|III|IV))?|[A-Za-z'\-\.]+\s+[A-Za-z'\-\.]+)\s+([0-9]+(?:\.[0-9]+)?)\s*(.*)$", ln)
+        if m and current_prop:
+            player, line, rest = m.group(1).strip(), m.group(2), m.group(3).strip()
+            out = _manual_row_to_board_row({"player": player, "line": line, "matchup": rest}, current_prop)
+            if out:
+                rows.append(out)
+            i += 1
+            continue
+        # Multi-line format: player / line / matchup.
+        if current_prop and i + 1 < len(lines) and safe_float(lines[i+1]) is not None:
+            player = ln
+            line = lines[i+1]
+            matchup = lines[i+2] if i + 2 < len(lines) and _canon_prop_label(lines[i+2]) is None and safe_float(lines[i+2]) is None else ""
+            out = _manual_row_to_board_row({"player": player, "line": line, "matchup": matchup}, current_prop)
+            if out:
+                rows.append(out)
+            i += 3 if matchup else 2
+            continue
+        i += 1
+    return _dedupe_board_rows(rows)
+
+
+def _dedupe_board_rows(rows):
+    seen, clean = set(), []
+    for r in rows or []:
+        key = (norm(r.get("player")), r.get("prop"), safe_float(r.get("line")), norm(r.get("matchup")))
+        if key not in seen:
+            seen.add(key); clean.append(r)
+    return clean
 
 
 # ---------- MLB-style stable seeds + Phase 6 NFL database ----------
@@ -3056,9 +3307,12 @@ with st.sidebar:
 
     if "board_pull_id" not in st.session_state:
         st.session_state["board_pull_id"] = 0
+    if "manual_board_pull_requested" not in st.session_state:
+        st.session_state["manual_board_pull_requested"] = False
     last_board_meta = load_last_pulled_board()
     if st.button("🔄 Refresh / Pull Underdog Board Lines", use_container_width=True):
         st.session_state["board_pull_id"] = int(st.session_state.get("board_pull_id", 0)) + 1
+        st.session_state["manual_board_pull_requested"] = True
         try:
             fetch_underdog_nfl_props.clear()
             fetch_underdog_nfl_moneylines.clear()
@@ -3068,7 +3322,27 @@ with st.sidebar:
         request_log("MANUAL_PULL_BOARD", "REQUESTED", f"pull_id={st.session_state['board_pull_id']}")
         st.rerun()
     st.caption(f"Last saved board pull: {last_board_meta.get('pulled_at') or 'None'} · Rows: {last_board_meta.get('row_count', 0)}")
-    use_saved_board_if_blank = st.checkbox("Use last pulled board if live pull is blank", value=False, help="Useful if Underdog temporarily fails after you already pulled a board. Demo mode is still separate.")
+    use_saved_board_if_blank = st.checkbox("Use last pulled/manual board if live pull is blank", value=True, help="Loads your last saved Underdog/manual board instantly and only hits Underdog when you press Refresh/Pull. This prevents slow startup.")
+    auto_pull_on_load = st.checkbox("Auto-pull live board on app load", value=False, help="Leave OFF for Streamlit Cloud speed. Turn ON only if you want the app to call Underdog every page load.")
+
+    with st.expander("Manual Underdog Board Import", expanded=False):
+        st.caption("Use this when Underdog live endpoint returns 404/NO_NFL_ROWS. Upload CSV or paste copied lines. Markets like Pass Yards, Pass TDs, INT, Receptions, Rec Yards, Rush Yards are normalized automatically.")
+        manual_upload = st.file_uploader("Upload CSV/TXT board", type=["csv", "txt"], key="manual_board_upload")
+        manual_text = st.text_area("Paste Underdog board text", height=150, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG", key="manual_board_text")
+        if st.button("📥 Load Manual Board Into App", use_container_width=True, key="load_manual_board_btn"):
+            manual_rows = parse_manual_underdog_board(manual_text, manual_upload)
+            if manual_rows:
+                save_last_pulled_board(manual_rows, [])
+                request_log("MANUAL_BOARD_IMPORT", "SAVED", f"rows={len(manual_rows)}")
+                st.success(f"Loaded {len(manual_rows)} manual Underdog rows into the board cache.")
+                st.rerun()
+            else:
+                st.warning("No valid manual rows found. Use columns player, prop, line, team, opp, matchup, position — or paste market/player/line/matchup groups.")
+        if st.button("🧹 Clear Saved Board Cache", use_container_width=True, key="clear_saved_board_cache_btn"):
+            save_json(BOARD_CACHE_FILE, {"pulled_at": None, "source": "CLEARED", "row_count": 0, "rows": []})
+            save_json(MONEYLINE_CACHE_FILE, {"pulled_at": None, "source": "CLEARED", "row_count": 0, "rows": []})
+            st.success("Saved board cache cleared.")
+            st.rerun()
 
     # Prop filtering is now handled by the main QBs / RBs / Receivers tabs.
     # Keep every supported market active in the engine and hide the old sidebar multiselect.
@@ -3094,17 +3368,27 @@ with st.sidebar:
     st.code("STORAGE_DIR=nfl_engine", language="bash")
 
 pull_id = int(st.session_state.get("board_pull_id", 0))
-live=[] if source_mode=="Demo board only" else fetch_underdog_nfl_props(pull_id)
-moneylines=[] if source_mode=="Demo board only" else fetch_underdog_nfl_moneylines(pull_id)
-if live:
-    save_last_pulled_board(live, moneylines)
-elif source_mode != "Demo board only" and use_saved_board_if_blank:
+should_pull_live = (source_mode != "Demo board only") and (bool(st.session_state.get("manual_board_pull_requested", False)) or bool(st.session_state.get("auto_pull_on_load", False)) or bool(locals().get("auto_pull_on_load", False)))
+live=[]
+moneylines=[]
+if source_mode != "Demo board only" and use_saved_board_if_blank:
     cached_board = load_last_pulled_board()
     cached_money = load_last_pulled_moneylines()
     live = cached_board.get("rows", []) or []
     moneylines = cached_money.get("rows", []) or []
     if live:
         request_log("UNDERDOG_BOARD_CACHE", "USING_LAST_PULLED", f"rows={len(live)} pulled_at={cached_board.get('pulled_at')}")
+if should_pull_live:
+    with st.spinner("Pulling Underdog NFL board lines..."):
+        pulled_live = fetch_underdog_nfl_props(pull_id)
+        pulled_moneylines = fetch_underdog_nfl_moneylines(pull_id)
+    st.session_state["manual_board_pull_requested"] = False
+    if pulled_live:
+        live = pulled_live
+        moneylines = pulled_moneylines
+        save_last_pulled_board(live, moneylines)
+    elif not live:
+        request_log("UNDERDOG_BOARD_PULL", "NO_ROWS_AND_NO_CACHE", "Manual/auto pull found no rows and no saved board was loaded.")
 raw = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
 projected=[project_row(r) for r in raw if r.get("prop") in prop_filter]
 for _p in projected:
