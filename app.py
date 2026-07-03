@@ -67,17 +67,17 @@ UNDERDOG_URLS = [
 
 # Underdog labels vary by season/API version. Keep aliases broad, then hard-filter to NFL.
 NFL_PROP_ALIASES = {
-    "Passing Yards": ["passing yards", "pass yards", "pass yds", "qb passing yards", "pass yard", "passing yard"],
-    "Passing TDs": ["passing tds", "passing touchdowns", "pass tds", "pass touchdowns", "pass td", "passing td"],
+    "Passing Yards": ["passing yards", "pass yards", "pass yds", "qb passing yards", "pass yard", "passing yard", "passyards"],
+    "Passing TDs": ["passing tds", "passing touchdowns", "pass tds", "pass touchdowns", "pass td", "passing td", "pass touchdowns", "passing touchdowns", "td passes"],
     "Interceptions": ["interceptions", "passing interceptions", "ints", "qb interceptions", "interception", "int"],
-    "Rushing Yards": ["rushing yards", "rush yards", "rush yds"],
-    "Receiving Yards": ["receiving yards", "rec yards", "receiving yds"],
+    "Rushing Yards": ["rushing yards", "rush yards", "rush yds", "rush yard", "rushing yard"],
+    "Receiving Yards": ["receiving yards", "rec yards", "receiving yds", "rec yds", "receiving yard", "rec yard"],
     "Receptions": ["receptions", "rec", "catches"],
     "Fantasy Points": ["fantasy points", "fantasy score"],
     "Anytime TD": ["anytime td", "anytime touchdown", "td scorer", "touchdown scorer", "rush + rec tds", "rush rec tds", "rush + receiving tds", "rush receiving touchdowns", "rush + rec touchdowns", "rushing + receiving tds"],
     "Pass Attempts": ["pass attempts", "passing attempts", "attempted passes", "qb attempts"],
     "Completions": ["completions", "passing completions", "completed passes"],
-    "Rush Attempts": ["rush attempts", "rushing attempts", "carries", "rushing attempts +"],
+    "Rush Attempts": ["rush attempts", "rushing attempts", "carries", "rushing attempts +", "rush att", "rushing att", "carrie"],
     "Longest Reception": ["longest reception", "longest catch", "long reception"],
     "Longest Rush": ["longest rush", "longest carry", "long rush"],
     "Kicking Points": ["kicking points", "kicker points"],
@@ -582,15 +582,253 @@ def flatten(obj):
         for x in obj: out.extend(flatten(x))
     return out
 
+# ---------- Underdog JSON:API / app-board parser v10.2 ----------
+def _as_list(x):
+    if x is None:
+        return []
+    if isinstance(x, list):
+        return x
+    if isinstance(x, dict):
+        return list(x.values()) if all(isinstance(v, dict) for v in x.values()) else [x]
+    return []
+
+def _rel_ids(o, *names):
+    ids=[]
+    if not isinstance(o, dict):
+        return ids
+    rel=o.get("relationships") or {}
+    for name in names:
+        # direct fields first
+        for k in [name, f"{name}_id"]:
+            v=o.get(k)
+            if isinstance(v, (str,int)):
+                ids.append(str(v))
+            elif isinstance(v, dict):
+                vv=v.get("id") or _deep_get(v,["data","id"])
+                if vv is not None: ids.append(str(vv))
+        r=rel.get(name) or rel.get(name.replace("_","-"))
+        d=r.get("data") if isinstance(r, dict) else r
+        if isinstance(d, list):
+            for item in d:
+                if isinstance(item, dict) and item.get("id") is not None:
+                    ids.append(str(item.get("id")))
+        elif isinstance(d, dict) and d.get("id") is not None:
+            ids.append(str(d.get("id")))
+    return [x for i,x in enumerate(ids) if x and x not in ids[:i]]
+
+def _entity_maps_from_underdog(data):
+    objects=flatten(data)
+    by_id={}
+    by_type={}
+    for o in objects:
+        if not isinstance(o, dict):
+            continue
+        oid=o.get("id")
+        typ=str(o.get("type") or o.get("kind") or o.get("object") or "").lower()
+        if oid is not None:
+            by_id[str(oid)] = o
+            if typ:
+                by_type.setdefault(typ, {})[str(oid)] = o
+    return objects, by_id, by_type
+
+def _get_related(o, by_id, by_type, *names):
+    for rid in _rel_ids(o, *names):
+        if rid in by_id:
+            return by_id[rid]
+        for mp in by_type.values():
+            if rid in mp:
+                return mp[rid]
+    return {}
+
+def _pick_first_string(objs, keys):
+    for obj in objs:
+        if not isinstance(obj, dict):
+            continue
+        for k in keys:
+            v=obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+def _underdog_player_meta(o):
+    if not isinstance(o, dict):
+        return {}
+    first=o.get("first_name") or _deep_get(o,["player","first_name"]) or ""
+    last=o.get("last_name") or _deep_get(o,["player","last_name"]) or ""
+    full=o.get("player_name") or o.get("display_name") or o.get("full_name") or o.get("name") or o.get("title") or ""
+    if first and last:
+        full=f"{first} {last}"
+    return {
+        "player": str(full).strip(),
+        "team": o.get("team_abbr") or o.get("team") or o.get("team_code") or _deep_get(o,["team","abbr"]) or _deep_get(o,["team","abbreviation"]) or "",
+        "position": o.get("position") or o.get("position_abbr") or o.get("pos") or _deep_get(o,["player","position"]) or "",
+    }
+
+def _build_player_bank_v2(objects):
+    bank={}
+    for o in objects:
+        if not isinstance(o, dict):
+            continue
+        typ=str(o.get("type") or "").lower()
+        blob=_blob(o)
+        if "player" not in typ and not any(k in o for k in ["first_name","last_name","player_name","display_name","full_name"]):
+            continue
+        meta=_underdog_player_meta(o)
+        full=meta.get("player")
+        oid=o.get("id") or o.get("player_id") or o.get("appearance_id")
+        if full and oid:
+            bank[str(oid)] = meta
+    return bank
+
+def _expand_initial_player_name(short_name, player_bank):
+    short=str(short_name or "").strip()
+    if not short:
+        return short
+    # J. Goff -> Jared Goff if player exists in bank
+    parts=short.replace(".", ". ").split()
+    if len(parts) >= 2 and parts[0].endswith("."):
+        init=parts[0][0].lower()
+        last=parts[-1].lower()
+        matches=[]
+        for meta in player_bank.values():
+            full=str(meta.get("player") or "")
+            fp=full.split()
+            if len(fp)>=2 and fp[0].lower().startswith(init) and fp[-1].lower()==last:
+                matches.append(full)
+        if len(matches)==1:
+            return matches[0]
+    return short
+
+def _player_from_title(title, prop, player_bank):
+    title=str(title or "").strip()
+    if not title:
+        return ""
+    low=title.lower()
+    cut=len(title)
+    aliases=NFL_PROP_ALIASES.get(prop, []) if prop else []
+    for a in aliases:
+        idx=low.find(str(a).lower())
+        if idx > 0:
+            cut=min(cut, idx)
+    candidate=title[:cut].strip(" -–—•|:")
+    if not candidate or len(candidate.split()) < 2:
+        # Last fallback: remove common prop words from the right side.
+        candidate=title
+        for words in NFL_PROP_ALIASES.values():
+            for w in sorted(words, key=len, reverse=True):
+                candidate=candidate.replace(w, "").replace(w.title(), "")
+        candidate=" ".join(candidate.split()).strip(" -–—•|:")
+    return _expand_initial_player_name(candidate, player_bank)
+
+def _extract_line_value_v2(*objs):
+    for o in objs:
+        v=_extract_line_value(o) if isinstance(o, dict) else None
+        if v is not None:
+            return v
+    return None
+
+def _prop_from_objs(*objs):
+    # Prefer explicit stat/display labels over whole blob so TD promos do not hijack markets.
+    keys=["stat", "stat_type", "stat_type_name", "display_stat", "appearance_stat", "label", "title", "name", "description"]
+    for o in objs:
+        if not isinstance(o, dict):
+            continue
+        text=" ".join([str(o.get(k) or "") for k in keys])
+        prop=prop_name_from_blob(text)
+        if prop:
+            return prop
+    return prop_name_from_blob(" ".join(_blob(o) for o in objs if isinstance(o, dict)))
+
+def _is_probably_nfl_underdog(*objs):
+    b=" ".join(_blob(o) for o in objs if isinstance(o, dict))
+    if any(x in b for x in ["nfl", "football", "national football", "nfl_player"]):
+        return True
+    # If the market is football-specific and the related player has football-ish position/team, accept it.
+    if prop_name_from_blob(b):
+        for o in objs:
+            pos=str((o or {}).get("position") or (o or {}).get("pos") or "").upper() if isinstance(o, dict) else ""
+            if pos in ["QB","RB","WR","TE","K"]:
+                return True
+        return True
+    return False
+
+def _extract_matchup_v2(*objs):
+    for o in objs:
+        m=_extract_matchup(o) if isinstance(o, dict) else ""
+        if m:
+            return m
+    home=_pick_first_string(objs,["home_team","home_team_abbr","home_team_code"])
+    away=_pick_first_string(objs,["away_team","away_team_abbr","away_team_code"])
+    if away and home:
+        return f"{away} @ {home}"
+    return ""
+
+def _extract_underdog_jsonapi_rows(data, source_url):
+    objects, by_id, by_type = _entity_maps_from_underdog(data)
+    player_bank = _build_player_bank_v2(objects)
+
+    # Candidate line objects are the rows with a numeric stat_value/line and a relationship to over_under.
+    candidates=[]
+    for o in objects:
+        if not isinstance(o, dict):
+            continue
+        typ=str(o.get("type") or "").lower()
+        has_line=_extract_line_value(o) is not None
+        has_ou=bool(_rel_ids(o,"over_under","over-under","overUnder")) or bool(o.get("over_under_id"))
+        if has_line and (has_ou or "over_under_line" in typ or "over-under-line" in typ):
+            candidates.append(o)
+
+    rows=[]
+    for line_obj in candidates:
+        ou=_get_related(line_obj, by_id, by_type, "over_under", "over-under", "overUnder")
+        app_stat=_get_related(ou, by_id, by_type, "appearance_stat", "appearance-stat", "appearanceStat") or _get_related(line_obj, by_id, by_type, "appearance_stat", "appearance-stat", "appearanceStat")
+        appearance=_get_related(app_stat, by_id, by_type, "appearance") or _get_related(ou, by_id, by_type, "appearance") or _get_related(line_obj, by_id, by_type, "appearance")
+        player=_get_related(appearance, by_id, by_type, "player") or _get_related(app_stat, by_id, by_type, "player") or _get_related(ou, by_id, by_type, "player")
+        game=_get_related(appearance, by_id, by_type, "game", "match", "event") or _get_related(ou, by_id, by_type, "game", "match", "event")
+        combo=[line_obj, ou, app_stat, appearance, player, game]
+        prop=_prop_from_objs(*combo)
+        if not prop or prop not in PROP_CONFIG:
+            continue
+        line=_extract_line_value_v2(line_obj, ou, app_stat)
+        if line is None:
+            continue
+        if not _is_probably_nfl_underdog(*combo):
+            continue
+
+        pmeta=_underdog_player_meta(player)
+        player_name=pmeta.get("player")
+        if not player_name:
+            title=_pick_first_string(combo,["title", "display_title", "label", "name", "description"])
+            player_name=_player_from_title(title, prop, player_bank)
+        if not player_name or player_name.lower() in ["unknown player", "over", "under"]:
+            continue
+
+        team=pmeta.get("team") or _pick_first_string(combo,["team_abbr", "team", "team_code", "abbr"]) or "NFL"
+        position=pmeta.get("position") or _pick_first_string(combo,["position", "position_abbr", "pos"])
+        matchup=_extract_matchup_v2(*combo)
+        rows.append({
+            "player": str(player_name),
+            "team": team or "NFL",
+            "opp": _pick_first_string(combo,["opponent", "opp", "opponent_team"]),
+            "home_away": _pick_first_string(combo,["home_away", "home_or_away"]),
+            "position": position or "",
+            "prop": prop,
+            "line": line,
+            "price": _extract_price(line_obj) or _extract_price(ou),
+            "source":"Underdog",
+            "source_url":source_url,
+            "matchup":matchup,
+            "underdog_id":str(line_obj.get("id") or ou.get("id") or ""),
+        })
+    return rows, {"objects": len(objects), "line_candidates": len(candidates), "player_bank": len(player_bank)}
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_nfl_props(cache_bust=0):
     """Pull live Underdog NFL props when available.
 
-    Safety behavior:
-    - Tries multiple Underdog endpoint versions.
-    - Hard-filters to recognized NFL player prop markets.
-    - Returns [] when NFL props are not live, so the UI falls back to DEMO/manual mode.
-    - Logs endpoint status to request_log.json for debugging in Railway/Streamlit.
+    v10.2: Uses both the old flat parser and a JSON:API relationship parser.
+    This matters because current Underdog endpoints can return 20k+ objects where
+    the line, player, market name, and game are split across related objects.
     """
     rows=[]
     endpoint_debug=[]
@@ -599,9 +837,20 @@ def fetch_underdog_nfl_props(cache_bust=0):
         if not data:
             endpoint_debug.append({"url":url,"status":"NO_DATA","rows":0})
             continue
+
+        # New relationship-aware parser first.
+        rel_rows=[]; rel_diag={}
+        try:
+            rel_rows, rel_diag = _extract_underdog_jsonapi_rows(data, url)
+        except Exception as e:
+            rel_diag={"relationship_parser_error": str(e)[:220]}
+            rel_rows=[]
+        rows.extend(rel_rows)
+
+        # Old flat fallback catches endpoints where line/player/prop are nested together.
         objects=flatten(data)
         player_bank=_collect_player_bank(objects)
-        url_rows=0
+        flat_rows=[]
         for o in objects:
             if not isinstance(o, dict):
                 continue
@@ -618,7 +867,7 @@ def fetch_underdog_nfl_props(cache_bust=0):
             if not player or player.lower() in ["unknown player", "over", "under"]:
                 continue
             team, position = _extract_team_pos(o, player, player_bank)
-            rows.append({
+            flat_rows.append({
                 "player":str(player),
                 "team":team,
                 "opp":o.get("opponent") or o.get("opp") or "",
@@ -632,19 +881,22 @@ def fetch_underdog_nfl_props(cache_bust=0):
                 "matchup":_extract_matchup(o),
                 "underdog_id":str(o.get("id") or o.get("over_under_line_id") or ""),
             })
-            url_rows += 1
-        endpoint_debug.append({"url":url,"status":"OK","rows":url_rows,"objects":len(objects)})
-        # Prefer newest successful endpoint. If v6/v5 has rows, don't mix duplicate older endpoints.
+        rows.extend(flat_rows)
+
+        url_rows=len(rel_rows)+len(flat_rows)
+        endpoint_debug.append({"url":url,"status":"OK","rows":url_rows,"relationship_rows":len(rel_rows),"flat_rows":len(flat_rows),**rel_diag})
         if url_rows > 0:
             break
-    # dedupe: keep first/newest endpoint version.
+
+    # Dedupe: keep first/newest endpoint version.
     seen=set(); clean=[]
     for r in rows:
-        key=(norm(r["player"]),r["prop"],safe_float(r["line"]),r.get("matchup",""))
-        if key not in seen:
-            seen.add(key); clean.append(r)
+        key=(norm(r.get("player")),r.get("prop"),safe_float(r.get("line")),r.get("matchup",""),str(r.get("underdog_id","")))
+        key2=(norm(r.get("player")),r.get("prop"),safe_float(r.get("line")),r.get("matchup",""))
+        if key not in seen and key2 not in seen:
+            seen.add(key); seen.add(key2); clean.append(r)
     request_log("UNDERDOG_NFL_LIVE_PULL", "FOUND" if clean else "NO_NFL_ROWS", endpoint_debug)
-    return clean[:500]
+    return clean[:1000]
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fetch_underdog_nfl_moneylines(cache_bust=0):
