@@ -88,6 +88,13 @@ NFL_PROP_ALIASES = {
 NFL_SPORT_TERMS = ["nfl", "football", "national football", "nfl_", "american football"]
 NON_NFL_BLOCK_TERMS = ["mlb", "baseball", "nba", "wnba", "basketball", "nhl", "hockey", "soccer", "tennis", "golf", "mma", "ufc"]
 
+# Current live Underdog NFL board support. Keep extraction tight until we validate more markets.
+ACTIVE_NFL_MARKETS = {"Passing Yards", "Rushing Yards", "Receiving Yards"}
+ACTIVE_NFL_MARKET_ORDER = ["Passing Yards", "Rushing Yards", "Receiving Yards"]
+ACTIVE_NFL_MARKET_LABELS = {"Passing Yards": "Pass Yards", "Rushing Yards": "Rush Yards", "Receiving Yards": "Receiving Yards"}
+PROJECTION_EDGE_CAPS = {"Passing Yards": 34.0, "Rushing Yards": 24.0, "Receiving Yards": 26.0}
+
+
 PROP_CONFIG = {
     "Passing Yards": {"stat": "pass_yds", "sigma": 42, "base": 235, "volume_key": "pass_attempts"},
     "Passing TDs": {"stat": "pass_tds", "sigma": 0.85, "base": 1.55, "volume_key": "pass_attempts"},
@@ -107,6 +114,12 @@ PROP_CONFIG = {
     "Tackles + Assists": {"stat": "tackles_ast", "sigma": 2.4, "base": 6.6, "volume_key": "def_snaps"},
     "Sacks": {"stat": "sacks", "sigma": 0.55, "base": 0.45, "volume_key": "pass_rush"},
 }
+
+# Tighten the active engine to the three currently validated Underdog markets.
+# Unsupported markets can be re-enabled later after the live parser is tested.
+NFL_PROP_ALIASES = {k: v for k, v in NFL_PROP_ALIASES.items() if k in ACTIVE_NFL_MARKETS}
+PROP_CONFIG = {k: v for k, v in PROP_CONFIG.items() if k in ACTIVE_NFL_MARKETS}
+
 
 # ---------- MLB-style strictness gates ported to NFL ----------
 # These do not change the raw projection. They decide what becomes an official/watch play.
@@ -1230,22 +1243,18 @@ def _resolve_model_player_strict(player, team=None, position=None):
 
 
 def _prop_allowed_for_model_position(prop, position):
-    """Only keep market/position combinations our NFL model can project correctly."""
+    """Only keep the three validated live markets and their valid NFL positions."""
     prop = str(prop or "")
     pos = str(position or "").upper().strip()
-    if not pos:
+    if prop not in ACTIVE_NFL_MARKETS or not pos:
         return False
-    if prop in ["Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions"]:
+    if prop == "Passing Yards":
         return pos == "QB"
-    if prop in ["Receiving Yards", "Receptions", "Longest Reception"]:
+    if prop == "Receiving Yards":
         return pos in ["RB", "WR", "TE"]
-    if prop in ["Rushing Yards", "Rush Attempts", "Longest Rush"]:
+    if prop == "Rushing Yards":
         return pos in ["QB", "RB", "WR"]
-    if prop in ["Anytime TD", "Fantasy Points"]:
-        return pos in ["QB", "RB", "WR", "TE"]
-    if prop in ["Kicking Points", "Field Goals Made"]:
-        return pos == "K"
-    return pos in ["QB", "RB", "WR", "TE", "K"]
+    return False
 
 
 def _filter_live_board_to_phase6_model(rows):
@@ -1268,7 +1277,7 @@ def _filter_live_board_to_phase6_model(rows):
     for r in rows:
         row = dict(r or {})
         prop = _canon_prop_label(row.get("prop")) or row.get("prop")
-        if prop not in PROP_CONFIG:
+        if prop not in ACTIVE_NFL_MARKETS or prop not in PROP_CONFIG:
             dropped["bad_position_market"] += 1
             continue
         meta = _resolve_model_player_strict(row.get("player"), row.get("team"), row.get("position"))
@@ -3265,6 +3274,30 @@ def ensemble_ml_assist_projection(row, rule_projection):
     except Exception as e:
         return float(rule_projection), {"enabled": True, "status": f"ERROR: {str(e)[:90]}", "blend": 0.0, "sample_count": len(train_rows)}
 
+def _market_line_sanity_projection(base, line, prop, source=None):
+    """Prevent early/live NFL markets from producing unrealistic high edges.
+
+    The model still uses opportunity, matchup, weather, game script, Bayesian/ML, and
+    Monte Carlo, but after those layers it is re-anchored to the actual Underdog line
+    and capped by market-specific realistic edge bands. This is important before we
+    have enough graded NFL prop samples.
+    """
+    line = safe_float(line)
+    base = safe_float(base, 0.0) or 0.0
+    if line is None or prop not in ACTIVE_NFL_MARKETS or line <= 0:
+        return base, {"active": False, "note": "No active market line cap"}
+    # Stronger anchor for live/manual lines while NFL learning is still warming up.
+    anchored = (base * 0.48) + (float(line) * 0.52)
+    cap = PROJECTION_EDGE_CAPS.get(prop, max(8.0, float(line) * 0.18))
+    capped = clamp(anchored, float(line) - cap, float(line) + cap)
+    return float(capped), {
+        "active": abs(capped - base) >= 0.01,
+        "raw_before_cap": round(base, 3),
+        "anchored": round(anchored, 3),
+        "cap": cap,
+        "note": f"{prop} line sanity anchor/cap active"
+    }
+
 def project_row(row, sims=12000):
     row=merge_nfl_context(row)
     prop=row.get("prop","Receiving Yards")
@@ -3292,9 +3325,9 @@ def project_row(row, sims=12000):
     base*=learn*cal_scale
     line=safe_float(row.get("line"))
 
-    # Real line anchoring stays, but demo rows cannot become official plays.
-    if line is not None and row.get("source")!="DEMO":
-        base=base*0.62 + line*0.38
+    # Early anchor to the actual Underdog line for the three live markets.
+    if line is not None and row.get("source")!="DEMO" and prop in ACTIVE_NFL_MARKETS:
+        base=base*0.55 + line*0.45
 
     xgb_info = {"enabled": bool(st.session_state.get("xgb_assist_enabled", False)), "status": "OFF"}
     if st.session_state.get("xgb_assist_enabled", False):
@@ -3307,6 +3340,8 @@ def project_row(row, sims=12000):
     ensemble_info = {"enabled": bool(st.session_state.get("ensemble_ml_assist_enabled", False)), "status": "OFF"}
     if st.session_state.get("ensemble_ml_assist_enabled", False):
         base, ensemble_info = ensemble_ml_assist_projection({**row, "projection": base, "line": line, "edge": None if line is None else base-line, "opportunity_score": opportunity.get("factor",1.0)*100, "pace_factor": pace_factor, "vegas_factor": vegas_factor, "game_script_factor": script_factor, "matchup_factor": defense_factor, "blowout_prob": blowout_prob, "collapse_prob": 0.0, "ceiling_prob": 0.0, "usage_quality": usage_quality, "data_score": 70}, base)
+
+    base, line_sanity_info = _market_line_sanity_projection(base, line, prop, row.get("source"))
 
     sigma=cfg["sigma"]
     if injury_risk in ["HIGH","EXTREME"]: sigma*=1.12
@@ -3367,9 +3402,11 @@ def project_row(row, sims=12000):
         notes.extend((bayes_markov_info.get("notes") or [])[:3])
     if ensemble_info.get("enabled"):
         notes.append(f"Ensemble ML Assist: {ensemble_info.get('status')}" + (f" · blend {ensemble_info.get('blend')}" if ensemble_info.get('blend') else ""))
+    if line_sanity_info.get("active"):
+        notes.append(line_sanity_info.get("note"))
     if row.get("source")=="DEMO": notes.append("Demo row until live NFL props are available")
 
-    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"advanced_context":advanced_context,"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"advanced_context":advanced_context,"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     signal, action_tier, rejections = build_signal(out)
     out["signal"]=signal; out["action_tier"]=action_tier; out["official_rejections"]=rejections; out["bettable"]=action_tier=="BET"
     return out
@@ -3662,7 +3699,7 @@ def _render_player_cards(rows, limit=None, header=None):
                     st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
                     st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
                     st.write("Advanced context:")
-                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "advanced_context": p.get('advanced_context')})
+                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "line_sanity": p.get('line_sanity'), "advanced_context": p.get('advanced_context')})
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
                 if p.get('game_script_branches'):
@@ -3795,7 +3832,7 @@ with st.sidebar:
 
     # Prop filtering is now handled by the main QBs / RBs / Receivers tabs.
     # Keep every supported market active in the engine and hide the old sidebar multiselect.
-    prop_filter=list(PROP_CONFIG.keys())
+    prop_filter=list(ACTIVE_NFL_MARKET_ORDER)
     st.session_state["xgb_assist_enabled"] = st.toggle("XGBoost Assist after grading", value=bool(st.session_state.get("xgb_assist_enabled", False)), help="Uses your graded results to assist the main projection before Monte Carlo. Stays neutral until enough grades exist.")
     if st.session_state.get("xgb_assist_enabled", False):
         st.session_state["xgb_min_rows"] = st.slider("XGB min graded rows", 25, 250, int(st.session_state.get("xgb_min_rows", 50)), 5)
@@ -3839,7 +3876,7 @@ if should_pull_live:
     elif not live:
         request_log("UNDERDOG_BOARD_PULL", "NO_ROWS_AND_NO_CACHE", "Manual/auto pull found no rows and no saved board was loaded.")
 raw = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
-projected=[project_row(r) for r in raw if r.get("prop") in prop_filter]
+projected=[project_row(r) for r in raw if (_canon_prop_label(r.get("prop")) or r.get("prop")) in ACTIVE_NFL_MARKETS and r.get("prop") in prop_filter]
 for _p in projected:
     _x=_p.get("xgb_assist") or {}
     _p["xgb_status"] = _x.get("status", "OFF")
@@ -3871,22 +3908,40 @@ if 'show_feed_debug' in globals() and show_feed_debug:
     st.caption("Latest Underdog/API request log")
     st.dataframe(pd.DataFrame(req_log[-25:]), use_container_width=True, hide_index=True)
 
-tabs=st.tabs(["Today / Weekly Board", "QBs", "RBs", "Receivers", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line", "Pass Yards", "Pass TDs", "INTs", "Rush Yards", "Rec Yards", "Receptions"])
+tabs=st.tabs(["Today / Weekly Board", "Pass Yards", "Rush Yards", "Receiving Yards", "QBs", "RBs", "Receivers", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
 
 with tabs[0]:
     st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
     _render_prop_table(projected, "NFL Board")
 
 with tabs[1]:
-    _render_position_board(projected, "QBs")
+    st.markdown("<div class='section-title-pro'>Passing Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Passing Yards"]
+    _render_prop_table(rows, "Passing Yards")
+    _render_player_cards(rows, header=None)
 
 with tabs[2]:
-    _render_position_board(projected, "RBs")
+    st.markdown("<div class='section-title-pro'>Rushing Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Rushing Yards"]
+    _render_prop_table(rows, "Rushing Yards")
+    _render_player_cards(rows, header=None)
 
 with tabs[3]:
-    _render_position_board(projected, "Receivers")
+    st.markdown("<div class='section-title-pro'>Receiving Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Receiving Yards"]
+    _render_prop_table(rows, "Receiving Yards")
+    _render_player_cards(rows, header=None)
 
 with tabs[4]:
+    _render_position_board(projected, "QBs")
+
+with tabs[5]:
+    _render_position_board(projected, "RBs")
+
+with tabs[6]:
+    _render_position_board(projected, "Receivers")
+
+with tabs[7]:
     st.markdown("<div class='section-title-pro'>Best Edges + Official Filter</div>", unsafe_allow_html=True)
     filt_rows=[]
     for p in projected:
@@ -3919,10 +3974,10 @@ with tabs[4]:
         <div class='metric-card'><div class='kpi-label'>Stability</div><div class='kpi-value'>{p.get('stability_score')}</div></div>
         </div></div>""", unsafe_allow_html=True)
 
-with tabs[5]:
+with tabs[8]:
     _render_player_cards(projected, header="Clickable Player Cards")
 
-with tabs[6]:
+with tabs[9]:
     st.markdown("<div class='section-title-pro'>Alt-Line Ladder</div>", unsafe_allow_html=True)
     names=[f"{p['player']} — {p['prop']}" for p in projected]
     if names:
@@ -3931,7 +3986,7 @@ with tabs[6]:
         st.dataframe(alt_ladder(p), use_container_width=True, hide_index=True)
     else: st.warning("No props to ladder.")
 
-with tabs[7]:
+with tabs[10]:
     st.markdown("<div class='section-title-pro'>Correlation Builder</div>", unsafe_allow_html=True)
     st.write("Use this to avoid bad parlays and find positive stacks.")
     if df.empty: st.warning("No player cards loaded.")
@@ -3948,7 +4003,7 @@ with tabs[7]:
             elif p1["team"]!=p2["team"] and any(x in p1["prop"] for x in ["Passing","Receiving"]) and any(x in p2["prop"] for x in ["Passing","Receiving"]): corr="Positive game-script shootout"
         st.success(f"Correlation Read: {corr}")
 
-with tabs[8]:
+with tabs[11]:
     st.markdown("<div class='section-title-pro'>Save Full Board / After / Bulk Grade</div>", unsafe_allow_html=True)
     st.write("This now works like the MLB workflow: save the whole pulled board/slate in one click, then bulk-grade it later.")
 
@@ -4053,7 +4108,7 @@ with tabs[8]:
             scale=graded[0].get("new_learning_scale") if graded else None
             st.success(f"Graded. Result: {'WIN' if win else 'LOSS' if win is False else 'NO LINE'} · New learning scale: {scale}")
 
-with tabs[9]:
+with tabs[12]:
     st.markdown("<div class='section-title-pro'>Learning Dashboard + Calibration</div>", unsafe_allow_html=True)
     results=load_json(RESULT_LOG,[]); learn=load_json(LEARN_FILE,{})
     if results:
@@ -4085,7 +4140,7 @@ with tabs[9]:
         with st.expander("Raw Learning Scale JSON"):
             st.json(learn)
 
-with tabs[10]:
+with tabs[13]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
     st.write("This tab scans Underdog for NFL moneyline/winner markets when they are posted. It will not create fake moneylines if Underdog does not expose them yet.")
     if moneylines:
@@ -4094,40 +4149,3 @@ with tabs[10]:
     else:
         st.warning("No Underdog NFL moneyline rows detected right now. Player props can still load normally; this tab will populate automatically if Underdog posts moneyline/winner markets in the scanned feed.")
         st.caption("Tip: most DFS-style Underdog feeds focus on player props. If moneylines are not offered there, keep this tab as a monitor and use sportsbook odds APIs later for true moneyline pricing.")
-
-
-with tabs[11]:
-    st.markdown("<div class='section-title-pro'>Passing Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Passing Yards"]
-    _render_prop_table(rows, "Passing Yards")
-    _render_player_cards(rows, header=None)
-
-with tabs[12]:
-    st.markdown("<div class='section-title-pro'>Passing TDs Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Passing TDs"]
-    _render_prop_table(rows, "Passing TDs")
-    _render_player_cards(rows, header=None)
-
-with tabs[13]:
-    st.markdown("<div class='section-title-pro'>Interceptions Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Interceptions"]
-    _render_prop_table(rows, "Interceptions")
-    _render_player_cards(rows, header=None)
-
-with tabs[14]:
-    st.markdown("<div class='section-title-pro'>Rushing Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Rushing Yards"]
-    _render_prop_table(rows, "Rushing Yards")
-    _render_player_cards(rows, header=None)
-
-with tabs[15]:
-    st.markdown("<div class='section-title-pro'>Receiving Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Receiving Yards"]
-    _render_prop_table(rows, "Receiving Yards")
-    _render_player_cards(rows, header=None)
-
-with tabs[16]:
-    st.markdown("<div class='section-title-pro'>Receptions Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Receptions"]
-    _render_prop_table(rows, "Receptions")
-    _render_player_cards(rows, header=None)
