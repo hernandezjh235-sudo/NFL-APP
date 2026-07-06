@@ -534,6 +534,57 @@ def prop_name_from_blob(blob):
             return prop
     return None
 
+# v10.9 live-board safety: only accept realistic single-game NFL prop lines.
+# This blocks season-long totals like 3249.5 passing yards from being treated as a game prop line.
+MARKET_LINE_RANGES = {
+    "Passing Yards": (70.0, 430.0),
+    "Rushing Yards": (2.5, 175.0),
+    "Receiving Yards": (2.5, 190.0),
+}
+
+def _valid_market_line(prop, line):
+    v = safe_float(line)
+    if v is None:
+        return False
+    lo, hi = MARKET_LINE_RANGES.get(str(prop or ""), (0.01, 999.0))
+    return lo <= float(v) <= hi
+
+def _extract_line_value_for_prop(prop, *objs):
+    """Extract the actual over/under line for a prop, not season/player stat totals.
+
+    Underdog JSON can include both the betting line and related player stat values
+    inside linked objects. For Passing Yards, values like 3249.5 are season totals
+    and must be rejected; a valid game prop line should be around 70-430 yards.
+    """
+    preferred_keys = ["stat_value", "line", "over_under", "threshold", "target"]
+    nested_paths = [
+        ["over_under", "stat_value"], ["over_under", "line"], ["over_under", "value"],
+        ["over_under_line", "stat_value"], ["over_under_line", "line"],
+        ["option", "line"], ["projection", "line"],
+    ]
+    candidates = []
+    for obj_index, o in enumerate(objs):
+        if not isinstance(o, dict):
+            continue
+        typ = str(o.get("type") or "").lower()
+        # Do not take appearance/player stat_value first; those are often season/stat totals.
+        type_penalty = 10 if ("appearance_stat" in typ or "appearance-stat" in typ or typ == "stat") else 0
+        for k in preferred_keys:
+            if k in o and not isinstance(o.get(k), dict):
+                fv = safe_float(o.get(k))
+                if fv is not None:
+                    candidates.append((type_penalty + obj_index, k, fv))
+        for path in nested_paths:
+            fv = safe_float(_deep_get(o, path))
+            if fv is not None:
+                candidates.append((type_penalty + obj_index, "/".join(path), fv))
+    # Prefer valid market-range candidates.
+    valid = [(rank, key, val) for rank, key, val in candidates if _valid_market_line(prop, val)]
+    if valid:
+        valid.sort(key=lambda x: (x[0], 0 if "stat_value" in x[1] or "line" in x[1] else 1))
+        return float(valid[0][2])
+    return None
+
 def _extract_line_value(o):
     direct_keys = ["stat_value", "line", "value", "over_under", "threshold", "target", "total"]
     for k in direct_keys:
@@ -772,12 +823,8 @@ def _player_from_title(title, prop, player_bank):
         candidate=" ".join(candidate.split()).strip(" -–—•|:")
     return _expand_initial_player_name(candidate, player_bank)
 
-def _extract_line_value_v2(*objs):
-    for o in objs:
-        v=_extract_line_value(o) if isinstance(o, dict) else None
-        if v is not None:
-            return v
-    return None
+def _extract_line_value_v2(prop, *objs):
+    return _extract_line_value_for_prop(prop, *objs)
 
 def _prop_from_objs(*objs):
     # Prefer explicit stat/display labels over whole blob so TD promos do not hijack markets.
@@ -819,15 +866,20 @@ def _extract_underdog_jsonapi_rows(data, source_url):
     objects, by_id, by_type = _entity_maps_from_underdog(data)
     player_bank = _build_player_bank_v2(objects)
 
-    # Candidate line objects are the rows with a numeric stat_value/line and a relationship to over_under.
+    # Candidate line objects are betting-line objects only.
+    # Do NOT treat appearance_stat/player stat rows as line candidates; those can hold
+    # season totals such as 3249.5 passing yards.
     candidates=[]
     for o in objects:
         if not isinstance(o, dict):
             continue
         typ=str(o.get("type") or "").lower()
+        if "appearance_stat" in typ or "appearance-stat" in typ:
+            continue
         has_line=_extract_line_value(o) is not None
         has_ou=bool(_rel_ids(o,"over_under","over-under","overUnder")) or bool(o.get("over_under_id"))
-        if has_line and (has_ou or "over_under_line" in typ or "over-under-line" in typ):
+        is_line_type=("over_under_line" in typ or "over-under-line" in typ or "overunderline" in typ)
+        if has_line and (is_line_type or has_ou):
             candidates.append(o)
 
     rows=[]
@@ -841,8 +893,8 @@ def _extract_underdog_jsonapi_rows(data, source_url):
         prop=_prop_from_objs(*combo)
         if not prop or prop not in PROP_CONFIG:
             continue
-        line=_extract_line_value_v2(line_obj, ou, app_stat)
-        if line is None:
+        line=_extract_line_value_v2(prop, line_obj, ou, app_stat)
+        if line is None or not _valid_market_line(prop, line):
             continue
         if not _is_probably_nfl_underdog(*combo):
             continue
@@ -912,8 +964,8 @@ def fetch_underdog_nfl_props(cache_bust=0):
             prop=prop_name_from_blob(blob)
             if not prop or prop not in PROP_CONFIG:
                 continue
-            line=_extract_line_value(o)
-            if line is None:
+            line=_extract_line_value_for_prop(prop, o)
+            if line is None or not _valid_market_line(prop, line):
                 continue
             player=_extract_player_from_obj(o, player_bank)
             if not player or player.lower() in ["unknown player", "over", "under"]:
@@ -1281,6 +1333,11 @@ def _filter_live_board_to_phase6_model(rows):
         if prop not in ACTIVE_NFL_MARKETS or prop not in PROP_CONFIG:
             dropped["bad_position_market"] += 1
             continue
+        line = safe_float(row.get("line"))
+        if line is None or not _valid_market_line(prop, line):
+            dropped["bad_position_market"] += 1
+            continue
+        row["line"] = float(line)
         meta = _resolve_model_player_strict(row.get("player"), row.get("team"), row.get("position"))
         if not meta:
             dropped["not_in_model"] += 1
@@ -1317,7 +1374,7 @@ def _manual_row_to_board_row(row, default_prop=None):
     team = str(get("team", "Team", "team_abbr", "Team Abbr") or "").upper().strip()
     opp = str(get("opp", "opponent", "Opponent") or "").upper().strip()
     pos = str(get("position", "Position", "pos", "Pos") or "").upper().strip()
-    if not prop or prop not in PROP_CONFIG or not player or line is None:
+    if not prop or prop not in PROP_CONFIG or not player or line is None or not _valid_market_line(prop, line):
         return None
     player, team, pos = _resolve_manual_player(player, team, pos)
     if not opp:
@@ -3325,8 +3382,13 @@ def project_row(row, sims=12000):
     cal_scale, cal_note=calibration_scale(row.get("player"),prop)
     base*=learn*cal_scale
     line=safe_float(row.get("line"))
+    if line is not None and prop in ACTIVE_NFL_MARKETS and not _valid_market_line(prop, line):
+        # Never project off a corrupted/season-long line. This row should normally
+        # be filtered earlier, but this final guard prevents 3000+ yard cards.
+        line = None
+        row["line"] = None
 
-    # Early anchor to the actual Underdog line for the three live markets.
+    # Early anchor to the actual Underdog line for the active live markets.
     if line is not None and row.get("source")!="DEMO" and prop in ACTIVE_NFL_MARKETS:
         base=base*0.55 + line*0.45
 
