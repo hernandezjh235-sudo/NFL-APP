@@ -3607,8 +3607,8 @@ def _render_player_cards(rows, limit=None, header=None):
                     st.write(f"XGBoost Assist: **{(p.get('xgb_assist') or {}).get('status','OFF')}**")
                     st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
                     st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
-                    with st.expander("XGBoost / Bayesian / advanced context", expanded=False):
-                        st.json({"xgb_assist": p.get('xgb_assist'), "advanced_context": p.get('advanced_context')})
+                    st.write("Advanced context:")
+                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "advanced_context": p.get('advanced_context')})
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
                 if p.get('game_script_branches'):
