@@ -19,7 +19,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v3.0 — MANUAL BOARD FALLBACK + STARTUP SAFE + BAYESIAN MARKOV + XGB"
+APP_VERSION = "NFL v3.1 — PASSING YARDS ONLY + STARTUP SAFE + BAYESIAN MARKOV + XGB"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,10 +89,10 @@ NFL_SPORT_TERMS = ["nfl", "football", "national football", "nfl_", "american foo
 NON_NFL_BLOCK_TERMS = ["mlb", "baseball", "nba", "wnba", "basketball", "nhl", "hockey", "soccer", "tennis", "golf", "mma", "ufc"]
 
 # Current live Underdog NFL board support. Keep extraction tight until we validate more markets.
-ACTIVE_NFL_MARKETS = {"Passing Yards", "Rushing Yards", "Receiving Yards"}
-ACTIVE_NFL_MARKET_ORDER = ["Passing Yards", "Rushing Yards", "Receiving Yards"]
-ACTIVE_NFL_MARKET_LABELS = {"Passing Yards": "Pass Yards", "Rushing Yards": "Rush Yards", "Receiving Yards": "Receiving Yards"}
-PROJECTION_EDGE_CAPS = {"Passing Yards": 34.0, "Rushing Yards": 24.0, "Receiving Yards": 26.0}
+ACTIVE_NFL_MARKETS = {"Passing Yards"}
+ACTIVE_NFL_MARKET_ORDER = ["Passing Yards"]
+ACTIVE_NFL_MARKET_LABELS = {"Passing Yards": "Pass Yards"}
+PROJECTION_EDGE_CAPS = {"Passing Yards": 34.0}
 
 
 PROP_CONFIG = {
@@ -237,6 +237,7 @@ DEMO_BOARD = [
     {"player":"Brandon Aubrey", "team":"DAL", "opp":"PHI", "home_away":"HOME", "position":"K", "prop":"Field Goals Made", "line":1.5, "source":"DEMO", "matchup":"PHI @ DAL", "spread":1.5, "game_total":46.5},
     {"player":"Micah Parsons", "team":"DAL", "opp":"PHI", "home_away":"HOME", "position":"EDGE", "prop":"Sacks", "line":0.5, "source":"DEMO", "matchup":"PHI @ DAL", "snap_share":82, "pressure_rate":16, "spread":1.5, "game_total":46.5},
 ]
+DEMO_BOARD = [r for r in DEMO_BOARD if r.get("prop") == "Passing Yards"]
 
 st.set_page_config(page_title="NFL Prop Engine", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
@@ -3300,8 +3301,8 @@ def _market_line_sanity_projection(base, line, prop, source=None):
 
 def project_row(row, sims=12000):
     row=merge_nfl_context(row)
-    prop=row.get("prop","Receiving Yards")
-    cfg=PROP_CONFIG.get(prop, PROP_CONFIG["Receiving Yards"])
+    prop=row.get("prop","Passing Yards")
+    cfg=PROP_CONFIG.get(prop, PROP_CONFIG["Passing Yards"])
     role=player_role_defaults(row.get("position"),prop)
     role=apply_real_usage_to_role(row, role)
     usage_quality, usage_flags = usage_data_quality(row, prop)
@@ -3811,9 +3812,9 @@ with st.sidebar:
     auto_pull_on_load = st.checkbox("Auto-pull live board on app load", value=False, help="Leave OFF for Streamlit Cloud speed. Turn ON only if you want the app to call Underdog every page load.")
 
     with st.expander("Manual Underdog Board Import", expanded=False):
-        st.caption("Use this when Underdog live endpoint returns 404/NO_NFL_ROWS. Upload CSV or paste copied lines. Markets like Pass Yards, Pass TDs, INT, Receptions, Rec Yards, Rush Yards are normalized automatically.")
+        st.caption("Use this when Underdog live endpoint returns 404/NO_NFL_ROWS. For now, this build only accepts Pass Yards / Passing Yards lines.")
         manual_upload = st.file_uploader("Upload CSV/TXT board", type=["csv", "txt"], key="manual_board_upload")
-        manual_text = st.text_area("Paste Underdog board text", height=150, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG", key="manual_board_text")
+        manual_text = st.text_area("Paste Underdog Pass Yards board text", height=150, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG", key="manual_board_text")
         if st.button("📥 Load Manual Board Into App", use_container_width=True, key="load_manual_board_btn"):
             manual_rows = parse_manual_underdog_board(manual_text, manual_upload)
             manual_rows = _filter_live_board_to_phase6_model(manual_rows)
@@ -3876,7 +3877,12 @@ if should_pull_live:
     elif not live:
         request_log("UNDERDOG_BOARD_PULL", "NO_ROWS_AND_NO_CACHE", "Manual/auto pull found no rows and no saved board was loaded.")
 raw = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
-projected=[project_row(r) for r in raw if (_canon_prop_label(r.get("prop")) or r.get("prop")) in ACTIVE_NFL_MARKETS and r.get("prop") in prop_filter]
+projected=[]
+for _r in raw:
+    _canon = _canon_prop_label(_r.get("prop")) or _r.get("prop")
+    if _canon in ACTIVE_NFL_MARKETS and _canon in prop_filter:
+        _rr=dict(_r); _rr["prop"]=_canon
+        projected.append(project_row(_rr))
 for _p in projected:
     _x=_p.get("xgb_assist") or {}
     _p["xgb_status"] = _x.get("status", "OFF")
@@ -3908,7 +3914,7 @@ if 'show_feed_debug' in globals() and show_feed_debug:
     st.caption("Latest Underdog/API request log")
     st.dataframe(pd.DataFrame(req_log[-25:]), use_container_width=True, hide_index=True)
 
-tabs=st.tabs(["Today / Weekly Board", "Pass Yards", "Rush Yards", "Receiving Yards", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
+tabs=st.tabs(["Today / Weekly Board", "Pass Yards", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
 
 with tabs[0]:
     st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
@@ -3921,18 +3927,6 @@ with tabs[1]:
     _render_player_cards(rows, header=None)
 
 with tabs[2]:
-    st.markdown("<div class='section-title-pro'>Rushing Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Rushing Yards"]
-    _render_prop_table(rows, "Rushing Yards")
-    _render_player_cards(rows, header=None)
-
-with tabs[3]:
-    st.markdown("<div class='section-title-pro'>Receiving Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Receiving Yards"]
-    _render_prop_table(rows, "Receiving Yards")
-    _render_player_cards(rows, header=None)
-
-with tabs[4]:
     st.markdown("<div class='section-title-pro'>Best Edges + Official Filter</div>", unsafe_allow_html=True)
     filt_rows=[]
     for p in projected:
@@ -3965,10 +3959,10 @@ with tabs[4]:
         <div class='metric-card'><div class='kpi-label'>Stability</div><div class='kpi-value'>{p.get('stability_score')}</div></div>
         </div></div>""", unsafe_allow_html=True)
 
-with tabs[5]:
+with tabs[3]:
     _render_player_cards(projected, header="Clickable Player Cards")
 
-with tabs[6]:
+with tabs[4]:
     st.markdown("<div class='section-title-pro'>Alt-Line Ladder</div>", unsafe_allow_html=True)
     names=[f"{p['player']} — {p['prop']}" for p in projected]
     if names:
@@ -3977,7 +3971,7 @@ with tabs[6]:
         st.dataframe(alt_ladder(p), use_container_width=True, hide_index=True)
     else: st.warning("No props to ladder.")
 
-with tabs[7]:
+with tabs[5]:
     st.markdown("<div class='section-title-pro'>Correlation Builder</div>", unsafe_allow_html=True)
     st.write("Use this to avoid bad parlays and find positive stacks.")
     if df.empty: st.warning("No player cards loaded.")
@@ -3994,7 +3988,7 @@ with tabs[7]:
             elif p1["team"]!=p2["team"] and any(x in p1["prop"] for x in ["Passing","Receiving"]) and any(x in p2["prop"] for x in ["Passing","Receiving"]): corr="Positive game-script shootout"
         st.success(f"Correlation Read: {corr}")
 
-with tabs[8]:
+with tabs[6]:
     st.markdown("<div class='section-title-pro'>Save Full Board / After / Bulk Grade</div>", unsafe_allow_html=True)
     st.write("This now works like the MLB workflow: save the whole pulled board/slate in one click, then bulk-grade it later.")
 
@@ -4099,7 +4093,7 @@ with tabs[8]:
             scale=graded[0].get("new_learning_scale") if graded else None
             st.success(f"Graded. Result: {'WIN' if win else 'LOSS' if win is False else 'NO LINE'} · New learning scale: {scale}")
 
-with tabs[9]:
+with tabs[7]:
     st.markdown("<div class='section-title-pro'>Learning Dashboard + Calibration</div>", unsafe_allow_html=True)
     results=load_json(RESULT_LOG,[]); learn=load_json(LEARN_FILE,{})
     if results:
@@ -4131,7 +4125,7 @@ with tabs[9]:
         with st.expander("Raw Learning Scale JSON"):
             st.json(learn)
 
-with tabs[10]:
+with tabs[8]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
     st.write("This tab scans Underdog for NFL moneyline/winner markets when they are posted. It will not create fake moneylines if Underdog does not expose them yet.")
     if moneylines:
