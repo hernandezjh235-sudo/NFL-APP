@@ -228,9 +228,10 @@ DEMO_BOARD = [
 st.set_page_config(page_title="NFL Prop Engine", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
 <style>
-.stApp{background:radial-gradient(circle at top,#081a2e 0%,#071014 42%,#020407 100%);color:#fff;}
+/* OneWayPickz NFL Premium Theme — MLB UI DNA, different colorway */
+.stApp{background:radial-gradient(circle at top,#2b124c 0%,#090712 42%,#020204 100%);color:#fff;}
 .block-container{padding-top:1.0rem;max-width:1600px;}
-h1,h2,h3{color:#fff}.small-muted{color:#aeb7c2;font-size:13px}.big-title{font-size:42px;font-weight:950;letter-spacing:-1px}.sub-title{color:#c4ced8;margin-top:-8px}.hero-panel{background:linear-gradient(135deg,rgba(0,50,100,.86),rgba(4,8,14,.96));border:1px solid rgba(80,170,255,.38);border-radius:26px;padding:22px;box-shadow:0 0 34px rgba(0,128,255,.18);margin-bottom:18px}.pick-card{background:linear-gradient(145deg,#08121c,#071015);border:1px solid rgba(80,170,255,.28);border-radius:22px;padding:18px;box-shadow:0 0 24px rgba(0,128,255,.12);margin-bottom:14px}.green-card{background:linear-gradient(145deg,#002016,#06130d);border:1px solid rgba(0,255,150,.42);border-radius:22px;padding:18px}.warn-card{background:linear-gradient(145deg,#251a00,#100c00);border:1px solid rgba(255,190,70,.45);border-radius:22px;padding:18px}.player-name{font-size:22px;font-weight:950}.badge{display:inline-block;padding:5px 10px;border-radius:999px;background:#09243a;border:1px solid rgba(80,170,255,.45);color:#d4ecff;font-weight:800;margin:3px 4px 3px 0}.good-badge{background:#002916;border-color:rgba(0,255,135,.55);color:#b5ffd9}.yellow-badge{background:#2b1d00;border-color:rgba(255,210,70,.55);color:#ffe2a1}.red-badge{background:#2b0000;border-color:rgba(255,75,75,.55);color:#ffc0c0}.kpi-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 18px 0}.kpi-box{background:linear-gradient(145deg,#08121c,#071015);border:1px solid rgba(80,170,255,.25);border-radius:18px;padding:14px;min-height:92px}.kpi-label{font-size:12px;color:#aeb7c2;font-weight:850;text-transform:uppercase;letter-spacing:.04em}.kpi-value{font-size:26px;font-weight:950;margin-top:5px}.kpi-sub{font-size:12px;color:#cfd6df;margin-top:4px}.progress-wrap{width:100%;height:12px;border-radius:99px;background:#020407;overflow:hidden;border:1px solid rgba(255,255,255,.08)}.progress-green{height:100%;border-radius:99px;background:linear-gradient(90deg,#00d66b,#46ff9a)}.progress-orange{height:100%;border-radius:99px;background:linear-gradient(90deg,#ff8c00,#ffbf30)}.progress-red{height:100%;border-radius:99px;background:linear-gradient(90deg,#ff2d2d,#ff7272)}.section-title-pro{margin-top:20px;margin-bottom:10px;font-size:24px;font-weight:950;border-left:5px solid #48a7ff;padding-left:12px}.stTabs [data-baseweb="tab"]{color:#b8c3cf;font-weight:850}.stTabs [aria-selected="true"]{color:#58ff9a!important;border-bottom:3px solid #58ff9a}.metric-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:12px}.click-more{border-top:1px solid rgba(255,255,255,.12);padding-top:8px;margin-top:8px}@media(max-width:1100px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));}}
+h1,h2,h3{color:#fff}.small-muted{color:#c7bddb;font-size:13px}.big-title{font-size:42px;font-weight:950;letter-spacing:-1px;color:#fff}.sub-title{color:#d9d0ea;margin-top:-8px}.hero-panel{background:linear-gradient(135deg,rgba(56,18,98,.92),rgba(7,7,14,.98));border:1px solid rgba(239,199,89,.45);border-radius:26px;padding:22px;box-shadow:0 0 34px rgba(166,91,255,.20);margin-bottom:18px}.pick-card{background:linear-gradient(145deg,#100b1f,#08070d);border:1px solid rgba(239,199,89,.34);border-radius:22px;padding:18px;box-shadow:0 0 26px rgba(166,91,255,.16);margin-bottom:14px}.green-card{background:linear-gradient(145deg,#002016,#06130d);border:1px solid rgba(0,255,150,.42);border-radius:22px;padding:18px}.warn-card{background:linear-gradient(145deg,#2c2105,#100c00);border:1px solid rgba(239,199,89,.55);border-radius:22px;padding:18px}.player-name{font-size:22px;font-weight:950}.big-number{font-size:42px;font-weight:950;line-height:1.05}.badge{display:inline-block;padding:5px 10px;border-radius:999px;background:#20143a;border:1px solid rgba(239,199,89,.45);color:#fff0bc;font-weight:800;margin:3px 4px 3px 0}.good-badge{background:#002916;border-color:rgba(0,255,135,.55);color:#b5ffd9}.yellow-badge{background:#2b1d00;border-color:rgba(255,210,70,.60);color:#ffe2a1}.red-badge{background:#2b0000;border-color:rgba(255,75,75,.55);color:#ffc0c0}.kpi-strip{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:12px;margin:12px 0 18px 0}.kpi-box{background:linear-gradient(145deg,#100b1f,#08070d);border:1px solid rgba(239,199,89,.28);border-radius:18px;padding:14px;min-height:92px}.kpi-label{font-size:12px;color:#c7bddb;font-weight:850;text-transform:uppercase;letter-spacing:.04em}.kpi-value{font-size:26px;font-weight:950;margin-top:5px;color:#fff}.kpi-sub{font-size:12px;color:#d9d0ea;margin-top:4px}.metric-card{background:rgba(255,255,255,.045);border:1px solid rgba(239,199,89,.18);border-radius:16px;padding:12px}.trust-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:12px 0}.trust-box{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.10);border-radius:14px;padding:10px}.trust-label{font-size:11px;color:#c7bddb;text-transform:uppercase;font-weight:850;letter-spacing:.04em}.trust-value{font-size:18px;color:#fff;font-weight:950;margin-top:3px}.progress-wrap{width:100%;height:12px;border-radius:99px;background:#030206;overflow:hidden;border:1px solid rgba(255,255,255,.09)}.progress-green{height:100%;border-radius:99px;background:linear-gradient(90deg,#00d66b,#46ff9a)}.progress-orange{height:100%;border-radius:99px;background:linear-gradient(90deg,#c47dff,#efc759)}.progress-red{height:100%;border-radius:99px;background:linear-gradient(90deg,#ff2d2d,#ff7272)}.section-title-pro{margin-top:20px;margin-bottom:10px;font-size:24px;font-weight:950;border-left:5px solid #efc759;padding-left:12px}.stTabs [data-baseweb="tab"]{color:#c7bddb;font-weight:850}.stTabs [aria-selected="true"]{color:#efc759!important;border-bottom:3px solid #efc759}.click-more{border-top:1px solid rgba(255,255,255,.12);padding-top:8px;margin-top:8px}.hr-soft{border-top:1px solid rgba(255,255,255,.12);margin:14px 0}.mobile-decision-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin:10px 0}.mobile-info-card{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.12);border-radius:16px;padding:12px;min-height:78px}.mini-k-bars{display:flex;align-items:flex-end;gap:10px;min-height:76px;margin-top:4px;overflow-x:auto}.mini-k-bar-wrap{display:inline-flex;flex-direction:column;align-items:center;justify-content:flex-end;min-width:18px}.mini-k-bar{display:block;width:17px;background:#efc759;border-radius:3px;box-shadow:0 0 10px rgba(239,199,89,.20)}.mini-k-label{font-size:12px;color:#c7bddb;margin-top:3px}@media(max-width:1100px){.kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));}.trust-strip{grid-template-columns:repeat(2,minmax(0,1fr));}}@media(max-width:900px){.big-title{font-size:28px}.big-number{font-size:30px}.player-name{font-size:20px}.pick-card{padding:14px;border-radius:18px}.mobile-decision-grid{grid-template-columns:repeat(2,minmax(0,1fr));}.mobile-info-card{min-height:72px;}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -281,6 +282,43 @@ def clear_board_logs(clear_learning=False, clear_line_history=False):
         if clear_json_file(LINE_HISTORY_FILE, {}):
             cleared.append("Line history")
     return cleared
+
+
+def _meter_class(score):
+    score = safe_float(score, 0) or 0
+    if score >= 80:
+        return "progress-green"
+    if score >= 60:
+        return "progress-orange"
+    return "progress-red"
+
+def _score_width(score):
+    return int(clamp(safe_float(score, 0) or 0, 0, 100))
+
+def _mini_recent_bars_from_player(p):
+    """MLB-card inspired mini bars. Uses any recent/game-log arrays if the NFL file has them."""
+    vals = []
+    for key in ["recent_results", "last_5", "game_log_values", "last_games", "recent_yards"]:
+        raw = p.get(key) if isinstance(p, dict) else None
+        if isinstance(raw, list):
+            for x in raw[-5:]:
+                if isinstance(x, dict):
+                    v = safe_float(x.get("value") or x.get("yards") or x.get("actual") or x.get("result"))
+                else:
+                    v = safe_float(x)
+                if v is not None:
+                    vals.append(v)
+            if vals:
+                break
+    if not vals:
+        return ""
+    mx = max(max(vals), 1)
+    pieces = []
+    for v in vals[-5:]:
+        h = int(clamp((v / mx) * 58, 8, 62))
+        pieces.append(f"<div class='mini-k-bar-wrap'><span class='mini-k-bar' style='height:{h}px'></span><span class='mini-k-label'>{v:g}</span></div>")
+    return "<div class='mini-k-bars'>" + "".join(pieces) + "</div>"
+
 def strip_accents(text):
     try: return "".join(ch for ch in unicodedata.normalize("NFKD", str(text or "")) if not unicodedata.combining(ch))
     except Exception: return str(text or "")
@@ -3554,10 +3592,26 @@ def _render_player_cards(rows, limit=None, header=None):
     for i,p in enumerate(shown):
         badge_class="good-badge" if p.get("pick")=="OVER" else "red-badge" if p.get("pick")=="UNDER" else "yellow-badge"
         fair = '' if p.get('fair_prob') is None else str(round(p.get('fair_prob')*100,1))+'%'
+        data_w = _score_width(p.get('data_score'))
+        stab_w = _score_width(p.get('stability_score'))
+        opp_w = _score_width(p.get('opportunity_score'))
+        val_w = _score_width((p.get('fair_prob') or 0) * 100)
+        data_cls = _meter_class(p.get('data_score'))
+        stab_cls = _meter_class(p.get('stability_score'))
+        opp_cls = _meter_class(p.get('opportunity_score'))
+        val_cls = _meter_class((p.get('fair_prob') or 0) * 100)
+        mini_bars = _mini_recent_bars_from_player(p)
         st.markdown(f"""
         <div class='pick-card'>
           <div class='player-name'>{p['player']} <span class='small-muted'>({p.get('position','')} · {p.get('team','')})</span></div>
           <span class='badge'>{p.get('prop')}</span><span class='badge'>{p.get('matchup','')}</span><span class='badge {badge_class}'>{p.get('signal')}</span><span class='badge yellow-badge'>Upside {p.get('pure_upside')}</span><span class='badge'>Vol {p.get('volatility')}</span>
+          <div class='trust-strip'>
+            <div class='trust-box'><div class='trust-label'>Data IQ</div><div class='trust-value'>{p.get('data_score')}</div><div class='progress-wrap'><div class='{data_cls}' style='width:{data_w}%'></div></div></div>
+            <div class='trust-box'><div class='trust-label'>Stability</div><div class='trust-value'>{p.get('stability_score')}</div><div class='progress-wrap'><div class='{stab_cls}' style='width:{stab_w}%'></div></div></div>
+            <div class='trust-box'><div class='trust-label'>Opportunity</div><div class='trust-value'>{p.get('opportunity_score')}</div><div class='progress-wrap'><div class='{opp_cls}' style='width:{opp_w}%'></div></div></div>
+            <div class='trust-box'><div class='trust-label'>Fair Prob</div><div class='trust-value'>{fair or '—'}</div><div class='progress-wrap'><div class='{val_cls}' style='width:{val_w}%'></div></div></div>
+          </div>
+          {mini_bars}
           <div class='kpi-strip'>
             <div class='metric-card'><div class='kpi-label'>Line</div><div class='kpi-value'>{p.get('line')}</div></div>
             <div class='metric-card'><div class='kpi-label'>Projection</div><div class='kpi-value'>{p.get('projection')}</div></div>
@@ -3690,7 +3744,7 @@ def _render_phase6_admin():
 st.markdown(f"""
 <div class='hero-panel'>
   <div class='big-title'>NFL Prop Engine</div>
-  <div class='sub-title'>Clean player cards · projections · pure upside · stadium/noise · weather-ready · CLV · save before/after · grading</div>
+  <div class='sub-title'>Clean player cards · MLB-style IQ cards · projections · pure upside · stadium/noise · weather-ready · CLV · full-board save/grade</div>
   <span class='badge'>{APP_VERSION}</span><span class='badge good-badge'>MLB framework converted to NFL structure</span>
 </div>
 """, unsafe_allow_html=True)
