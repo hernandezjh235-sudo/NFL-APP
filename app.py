@@ -89,10 +89,10 @@ NFL_SPORT_TERMS = ["nfl", "football", "national football", "nfl_", "american foo
 NON_NFL_BLOCK_TERMS = ["mlb", "baseball", "nba", "wnba", "basketball", "nhl", "hockey", "soccer", "tennis", "golf", "mma", "ufc"]
 
 # Current live Underdog NFL board support. Keep extraction tight until we validate more markets.
-ACTIVE_NFL_MARKETS = {"Passing Yards"}
-ACTIVE_NFL_MARKET_ORDER = ["Passing Yards"]
-ACTIVE_NFL_MARKET_LABELS = {"Passing Yards": "Pass Yards"}
-PROJECTION_EDGE_CAPS = {"Passing Yards": 34.0}
+ACTIVE_NFL_MARKETS = {"Passing Yards", "Receiving Yards"}
+ACTIVE_NFL_MARKET_ORDER = ["Passing Yards", "Receiving Yards"]
+ACTIVE_NFL_MARKET_LABELS = {"Passing Yards": "Pass Yards", "Receiving Yards": "Receiving Yards"}
+PROJECTION_EDGE_CAPS = {"Passing Yards": 34.0, "Receiving Yards": 24.0}
 
 
 PROP_CONFIG = {
@@ -237,7 +237,35 @@ DEMO_BOARD = [
     {"player":"Brandon Aubrey", "team":"DAL", "opp":"PHI", "home_away":"HOME", "position":"K", "prop":"Field Goals Made", "line":1.5, "source":"DEMO", "matchup":"PHI @ DAL", "spread":1.5, "game_total":46.5},
     {"player":"Micah Parsons", "team":"DAL", "opp":"PHI", "home_away":"HOME", "position":"EDGE", "prop":"Sacks", "line":0.5, "source":"DEMO", "matchup":"PHI @ DAL", "snap_share":82, "pressure_rate":16, "spread":1.5, "game_total":46.5},
 ]
-DEMO_BOARD = [r for r in DEMO_BOARD if r.get("prop") == "Passing Yards"]
+DEMO_BOARD = [r for r in DEMO_BOARD if r.get("prop") in ACTIVE_NFL_MARKETS]
+
+# Veteran / elite QB stability layer for Passing Yards.
+# This does not create fake yards. It only adjusts stability/volatility and lightly
+# protects proven QBs from extreme game-script penalties.
+ELITE_QB_TIERS = {
+    "patrick mahomes": "ELITE_VETERAN", "josh allen": "ELITE_VETERAN", "joe burrow": "ELITE_VETERAN",
+    "lamar jackson": "ELITE_VETERAN", "justin herbert": "ELITE_VETERAN", "dak prescott": "ELITE_VETERAN",
+    "matthew stafford": "ELITE_VETERAN", "jalen hurts": "ELITE_VETERAN", "cj stroud": "GREAT_STABLE",
+    "tua tagovailoa": "GREAT_STABLE", "jared goff": "GREAT_STABLE", "brock purdy": "GREAT_STABLE",
+    "kirk cousins": "VETERAN_STABLE", "aaron rodgers": "VETERAN_STABLE", "geno smith": "VETERAN_STABLE",
+    "jayden daniels": "YOUNG_UPSIDE", "caleb williams": "YOUNG_UPSIDE", "drake maye": "YOUNG_UPSIDE",
+    "bo nix": "YOUNG_UPSIDE", "anthony richardson": "VOLATILE_UPSIDE",
+}
+
+def qb_tier_context(player, position=""):
+    if str(position or "").upper() != "QB":
+        return {"tier": "NON_QB", "factor": 1.0, "sigma_factor": 1.0, "confidence_boost": 0, "note": ""}
+    tier = ELITE_QB_TIERS.get(norm(player), "STANDARD_STARTER")
+    cfg = {
+        "ELITE_VETERAN": (1.012, 0.92, 8, "Elite/veteran QB stability boost"),
+        "GREAT_STABLE": (1.006, 0.95, 5, "Great/stable QB profile"),
+        "VETERAN_STABLE": (1.000, 0.96, 4, "Veteran QB stability"),
+        "YOUNG_UPSIDE": (1.004, 1.04, 2, "Young/upside QB volatility"),
+        "VOLATILE_UPSIDE": (1.000, 1.10, -2, "Volatile QB profile"),
+        "STANDARD_STARTER": (1.000, 1.00, 0, "Standard QB profile"),
+    }.get(tier, (1.0, 1.0, 0, "Standard QB profile"))
+    return {"tier": tier, "factor": cfg[0], "sigma_factor": cfg[1], "confidence_boost": cfg[2], "note": cfg[3]}
+
 
 st.set_page_config(page_title="NFL Prop Engine", layout="wide", initial_sidebar_state="expanded")
 st.markdown("""
@@ -2639,6 +2667,142 @@ def enrich_passing_yards_context(row):
     row["passing_context_players"] = len(bank.get("players",{}))
     return row
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _online_receiving_yards_context_bank(season=NFL_LAST_SEASON):
+    """Build online/saved context for Receiving Yards (WR/TE/RB receiving).
+
+    Uses Phase 6/nflverse saved data first, then online nflverse weekly stats.
+    Inputs: receiving yards/game, targets/game, receptions/game, yards/target,
+    team pass rate/plays, opponent receiving/pass-defense ranks, stadium/weather.
+    """
+    ctx = {"players": {}, "teams": {}, "defenses": {}, "source": "none", "rows": 0}
+    try:
+        df = pd.DataFrame()
+        if Path(PHASE6_PLAYER_SUMMARY_FILE).exists():
+            try:
+                df = pd.read_csv(PHASE6_PLAYER_SUMMARY_FILE)
+                ctx["source"] = "saved_phase6_player_summary"
+            except Exception:
+                df = pd.DataFrame()
+        if df.empty:
+            weekly = fetch_nflverse_player_weekly_stats(int(season), force_refresh=False)
+            if not weekly.empty:
+                logs = weekly.copy()
+                if "player_display_name" in logs.columns and "player" not in logs.columns:
+                    logs["player"] = logs["player_display_name"]
+                if "recent_team" in logs.columns and "team" not in logs.columns:
+                    logs["team"] = logs["recent_team"]
+                if "position" not in logs.columns:
+                    logs["position"] = ""
+                for c in ["targets","receptions","receiving_yards","air_yards"]:
+                    if c not in logs.columns:
+                        logs[c] = 0
+                    logs[c] = pd.to_numeric(logs[c], errors="coerce").fillna(0)
+                gcols=["player","team","position"]
+                df = logs.groupby(gcols, dropna=False)[["targets","receptions","receiving_yards","air_yards"]].sum().reset_index()
+                games = logs.groupby(gcols, dropna=False)["week"].nunique().reset_index(name="games_played") if "week" in logs.columns else df[gcols].assign(games_played=17)
+                df = df.merge(games, on=gcols, how="left")
+                gp=df["games_played"].replace(0, np.nan)
+                df["targets_pg"]=(df["targets"]/gp).round(3)
+                df["receptions_pg"]=(df["receptions"]/gp).round(3)
+                df["receiving_yards_pg"]=(df["receiving_yards"]/gp).round(3)
+                df["air_yards_pg"]=(df["air_yards"]/gp).round(3)
+                ctx["source"] = "online_nflverse_player_weekly"
+        if not df.empty:
+            ctx["rows"] = int(len(df))
+            for _, r in df.iterrows():
+                pos=str(r.get("position") or "").upper()
+                if pos not in ["WR","TE","RB"]:
+                    continue
+                player=str(r.get("player") or r.get("player_display_name") or "").strip()
+                if not player:
+                    continue
+                team=str(r.get("team") or r.get("recent_team") or "").strip()
+                games=safe_float(r.get("games_played"), 17) or 17
+                targets=safe_float(r.get("targets"), None)
+                rec_yards=safe_float(r.get("receiving_yards"), None)
+                targets_pg=safe_float(r.get("targets_pg"), None)
+                if targets_pg is None and targets is not None:
+                    targets_pg=targets/max(1,games)
+                yards_pg=safe_float(r.get("receiving_yards_pg"), None)
+                if yards_pg is None and rec_yards is not None:
+                    yards_pg=rec_yards/max(1,games)
+                receptions_pg=safe_float(r.get("receptions_pg"), None)
+                air_pg=safe_float(r.get("air_yards_pg"), None)
+                ypt=(rec_yards or 0)/max(1.0, targets or 0)
+                if targets_pg is None or targets_pg < 1.0:
+                    continue
+                ctx["players"][norm(player)] = {
+                    "player": player, "team": team, "position": pos,
+                    "receiving_yards_pg": round(float(yards_pg or 0),3),
+                    "targets_pg": round(float(targets_pg or 0),3),
+                    "receptions_pg": None if receptions_pg is None else round(float(receptions_pg),3),
+                    "air_yards_pg": None if air_pg is None else round(float(air_pg),3),
+                    "yards_per_target": round(float(clamp(ypt if ypt else (yards_pg or 0)/max(1, targets_pg or 1), 3.0, 14.5)),3),
+                    "games_played": int(games),
+                    "receiving_context_source": ctx["source"],
+                }
+        teams = load_json(TEAM_CONTEXT_FILE,{})
+        if isinstance(teams, dict):
+            for team, data in teams.items():
+                if not isinstance(data, dict):
+                    continue
+                ctx["teams"].setdefault(str(team), {}).update({k:v for k,v in data.items() if k in ["pass_rate","pbp_pass_rate","plays_pg","pbp_plays_pg","game_total","spread","team_total"] and v not in [None,""]})
+                ctx["defenses"].setdefault(str(team), {}).update({k:v for k,v in data.items() if k in ["def_pass_rank","def_role_rank","def_te_rank","def_slot_rank","def_rb_rec_rank","coverage_grade","pressure_rate","def_pressure_rate"] and v not in [None,""]})
+        if Path(PHASE6_DEFENSE_RANK_FILE).exists():
+            try:
+                ddf=pd.read_csv(PHASE6_DEFENSE_RANK_FILE)
+                for _, r in ddf.iterrows():
+                    team=str(r.get("team") or "").strip()
+                    if not team:
+                        continue
+                    ctx["defenses"].setdefault(team,{})
+                    for k in ["def_pass_rank","pass_yards_allowed_pg","rec_yards_allowed_pg","receptions_allowed_pg","def_role_rank"]:
+                        if k in ddf.columns and r.get(k) not in [None,""]:
+                            ctx["defenses"][team][k]=r.get(k)
+            except Exception as e:
+                request_log("REC_YARDS_CONTEXT", "DEF_RANK_READ_ERROR", str(e)[:180])
+        request_log("REC_YARDS_CONTEXT", "READY", f"players={len(ctx['players'])} teams={len(ctx['teams'])} defenses={len(ctx['defenses'])} source={ctx['source']}")
+    except Exception as e:
+        request_log("REC_YARDS_CONTEXT", "ERROR", str(e)[:240])
+    return ctx
+
+def enrich_receiving_yards_context(row):
+    """Attach receiving-yards context for WR/TE/RB lines."""
+    row=dict(row or {})
+    if row.get("prop") != "Receiving Yards":
+        return row
+    bank=_online_receiving_yards_context_bank(int(NFL_LAST_SEASON))
+    pctx=_fuzzy_player_context(row.get("player"), bank.get("players",{}), team=row.get("team"), min_score=0.86)
+    if pctx:
+        for k,v in pctx.items():
+            if row.get(k) in [None,"", "NFL"]:
+                row[k]=v
+        if row.get("team") in [None,"", "NFL"] and pctx.get("team"):
+            row["team"]=pctx.get("team")
+        if row.get("position") in [None,""] and pctx.get("position"):
+            row["position"]=pctx.get("position")
+        row["model_player_match"] = pctx.get("player")
+        row["model_match_status"] = "MATCHED"
+    else:
+        row["model_match_status"] = "NO_MODEL_MATCH"
+    team=str(row.get("team") or "")
+    opp=str(row.get("opp") or "")
+    if team and team in bank.get("teams",{}):
+        for k,v in bank["teams"][team].items():
+            if row.get(k) in [None,""]:
+                row[k]=v
+    if opp and opp in bank.get("defenses",{}):
+        for k,v in bank["defenses"][opp].items():
+            if row.get(k) in [None,""]:
+                row[k]=v
+            if row.get("opp_"+k) in [None,""]:
+                row["opp_"+k]=v
+    row["receiving_context_bank_source"] = bank.get("source")
+    row["receiving_context_players"] = len(bank.get("players",{}))
+    return row
+
 def load_team_context():
     data=load_json(TEAM_CONTEXT_FILE,{})
     return data if isinstance(data,dict) else {}
@@ -2652,9 +2816,12 @@ def merge_nfl_context(row):
     row=dict(row or {})
     usage_bank = load_usage_bank()
     usage=usage_bank.get(norm(row.get("player")), {})
-    # Passing Yards needs QB context even when the live Underdog object only has player+line.
+    # Passing/Receiving yards need model context even when live Underdog object only has player+line.
     if row.get("prop") == "Passing Yards":
         row = enrich_passing_yards_context(row)
+        usage=usage or usage_bank.get(norm(row.get("model_player_match") or row.get("player")), {})
+    elif row.get("prop") == "Receiving Yards":
+        row = enrich_receiving_yards_context(row)
         usage=usage or usage_bank.get(norm(row.get("model_player_match") or row.get("player")), {})
     for k,v in usage.items():
         if not k:
@@ -3655,6 +3822,117 @@ def passing_yards_stat_projection(row, role, cfg):
     }
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
 
+
+def receiving_yards_stat_projection(row, role, cfg):
+    """Receiving Yards projection from receiver history + targets × yards/target.
+
+    Works for WR + TE and RB receiving-yard markets. Uses last-season receiving
+    yards/game, targets/game, yards/target, team pass rate/plays, opponent pass/role
+    defense, spread/total, stadium/weather, then Monte Carlo runs downstream.
+    """
+    row = enrich_receiving_yards_context(dict(row or {}))
+    notes=[]; breakdown={}
+    line=safe_float(row.get("line"))
+    rec_ypg=safe_float(row.get("receiving_yards_pg"))
+    targets_pg=safe_float(row.get("targets_pg"))
+    receptions_pg=safe_float(row.get("receptions_pg"))
+    air_pg=safe_float(row.get("air_yards_pg"))
+    ypt=safe_float(row.get("yards_per_target"))
+    pos=str(row.get("position") or "").upper()
+    team_plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
+    pass_rate=safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"), 56)) or 56
+    spread=safe_float(row.get("spread"), 0) or 0
+    total=safe_float(row.get("game_total"), 44) or 44
+    target_share=safe_float(row.get("target_share"), None)
+    route_part=safe_float(row.get("route_participation"), None)
+    if row.get("model_match_status") == "NO_MODEL_MATCH":
+        notes.append("NO MODEL MATCH: using capped receiving fallback until player exists in Phase 6/context bank")
+    elif row.get("model_player_match"):
+        notes.append(f"Model match: {row.get('model_player_match')} ({row.get('receiving_context_bank_source')})")
+    if targets_pg is None or targets_pg <= 0:
+        # Estimate from team pass volume and role when target data is missing.
+        implied_team_attempts=team_plays * pass_rate/100.0
+        if target_share is not None and target_share > 0:
+            targets_pg = implied_team_attempts * (target_share/100.0)
+            notes.append("Targets estimated from target share")
+        else:
+            targets_pg = 7.2 if pos=="WR" else 5.4 if pos=="TE" else 3.8
+            notes.append("Targets fallback used")
+    if rec_ypg is None or rec_ypg <= 0:
+        rec_ypg = (line * 0.96) if line and _valid_market_line("Receiving Yards", line) else cfg.get("base", 52)
+        notes.append("Receiving yards fallback used")
+    if ypt is None or ypt <= 0:
+        ypt = rec_ypg/max(1.0, targets_pg)
+    ypt = clamp(ypt, 4.0 if pos=="RB" else 5.0, 12.8 if pos!="RB" else 10.5)
+    implied_team_attempts=team_plays * pass_rate/100.0
+    expected_targets=(targets_pg*0.68)
+    if target_share is not None and target_share > 0:
+        expected_targets += (implied_team_attempts * target_share/100.0)*0.32
+    else:
+        expected_targets += targets_pg*0.32
+    if route_part is not None:
+        expected_targets *= clamp(0.90 + (route_part/100.0)*0.14, 0.90, 1.04)
+    # Game script and totals.
+    script_factor=1.0
+    if spread >= 6:
+        script_factor += 0.050; notes.append("Receiving volume boost: projected trailing script")
+    elif spread >= 3:
+        script_factor += 0.025
+    elif spread <= -9:
+        script_factor -= 0.050; notes.append("Receiving volume tax: blowout/favorite script")
+    elif spread <= -5.5:
+        script_factor -= 0.022
+    total_factor=clamp(1 + (total-44)*0.006, 0.94, 1.07)
+    pass_rate_factor=clamp(1 + (pass_rate-56)*0.004, 0.94, 1.07)
+    env=environment_for(row)
+    stadium_factor=1.0
+    if env.get("roof") in ["Dome","Retractable"]:
+        stadium_factor*=1.014; notes.append("Dome/retractable roof receiving nudge")
+    if str(row.get("weather_risk") or "").upper() in ["HIGH","SEVERE","WIND","RAIN","SNOW"]:
+        stadium_factor*=0.93; notes.append("Weather receiving tax")
+    # Opponent role/pass defense: higher rank = easier.
+    role_rank=safe_float(row.get("def_role_rank"), safe_float(row.get("opp_def_role_rank")))
+    pass_rank=safe_float(row.get("def_pass_rank"), safe_float(row.get("opp_def_pass_rank")))
+    opp_rank=role_rank if role_rank is not None else pass_rank
+    if opp_rank is None:
+        matchup_factor=1.0; notes.append("Opponent receiving/pass defense rank missing")
+    else:
+        matchup_factor=clamp(1 + (opp_rank-16.5)*0.0058, 0.90, 1.10)
+        if opp_rank <= 8: notes.append("Top receiving/pass defense tax")
+        elif opp_rank >= 25: notes.append("Weak receiving/pass defense boost")
+    coverage=safe_float(row.get("coverage_grade"), safe_float(row.get("opp_coverage_grade")))
+    coverage_factor=1.0
+    if coverage is not None:
+        coverage_factor=clamp(1 - (coverage-60)*0.0025, 0.94, 1.04)
+    target_model=expected_targets * ypt * script_factor * pass_rate_factor * total_factor * stadium_factor * matchup_factor * coverage_factor
+    history_model=rec_ypg * script_factor * total_factor * stadium_factor * matchup_factor * coverage_factor
+    projection=(history_model*0.58)+(target_model*0.42)
+    if line is not None and _valid_market_line("Receiving Yards", line):
+        projection=clamp(projection, line-32, line+32)
+    projection=clamp(projection, 4, 185)
+    breakdown={
+        "player_rec_ypg": round(rec_ypg,2),
+        "targets_pg": round(targets_pg,2),
+        "projected_targets": round(expected_targets,2),
+        "yards_per_target": round(ypt,3),
+        "target_model": round(target_model,2),
+        "history_model": round(history_model,2),
+        "team_pass_rate": round(pass_rate,2),
+        "team_plays_pg": round(team_plays,2),
+        "opponent_receiving_def_rank": None if opp_rank is None else int(round(opp_rank)),
+        "game_total": round(total,2),
+        "spread": round(spread,2),
+        "matchup_factor": round(matchup_factor,3),
+        "stadium_factor": round(stadium_factor,3),
+        "total_factor": round(total_factor,3),
+        "coverage_factor": round(coverage_factor,3),
+        "final_pre_market": round(projection,2),
+        "context_source": row.get("receiving_context_bank_source"),
+        "model_match_status": row.get("model_match_status"),
+        "model_player_match": row.get("model_player_match"),
+    }
+    return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
+
 def _market_line_sanity_projection(base, line, prop, source=None):
     """Prevent early/live NFL markets from producing unrealistic high edges.
 
@@ -3671,6 +3949,8 @@ def _market_line_sanity_projection(base, line, prop, source=None):
     # Passing Yards has its own stat model, so keep it less market-forced.
     if prop == "Passing Yards":
         anchored = (base * 0.70) + (float(line) * 0.30)
+    elif prop == "Receiving Yards":
+        anchored = (base * 0.62) + (float(line) * 0.38)
     else:
         anchored = (base * 0.48) + (float(line) * 0.52)
     cap = PROJECTION_EDGE_CAPS.get(prop, max(8.0, float(line) * 0.18))
@@ -3693,9 +3973,17 @@ def project_row(row, sims=12000):
     base=cfg["base"]*usage_adjustment(role,prop)
     base, env_notes, env=apply_environment(base,row,prop)
     pass_yards_model_info = {"active": False}
+    receiving_yards_model_info = {"active": False}
+    qb_tier_info = qb_tier_context(row.get("player"), row.get("position")) if prop == "Passing Yards" else {"tier":"N/A","factor":1.0,"sigma_factor":1.0,"confidence_boost":0,"note":""}
     if prop == "Passing Yards":
         base, pass_yards_model_info = passing_yards_stat_projection(row, role, cfg)
+        base *= qb_tier_info.get("factor", 1.0)
         env_notes = env_notes + (pass_yards_model_info.get("notes") or [])
+        if qb_tier_info.get("note"):
+            env_notes.append(qb_tier_info.get("note"))
+    elif prop == "Receiving Yards":
+        base, receiving_yards_model_info = receiving_yards_stat_projection(row, role, cfg)
+        env_notes = env_notes + (receiving_yards_model_info.get("notes") or [])
 
     opportunity = opportunity_engine(row, role, prop)
     pace_factor, pace_risk, pace_notes = pace_engine(row, prop)
@@ -3712,6 +4000,10 @@ def project_row(row, sims=12000):
         # Passing yards model already includes QB history, attempts, pass rate, matchup,
         # spread/total, and stadium/weather. Keep only small generic risk modifiers.
         base*=clamp(role_factor,0.92,1.04)*clamp(game_factor,0.96,1.04)*clamp(blowout_factor,0.94,1.03)*clamp(advanced_factor,0.96,1.04)
+    elif prop == "Receiving Yards":
+        # Receiving yards model already includes player receiving history, targets, team pass rate, matchup,
+        # spread/total, and stadium/weather. Keep generic modifiers small to avoid double counting.
+        base*=clamp(role_factor,0.90,1.05)*clamp(game_factor,0.95,1.05)*clamp(blowout_factor,0.93,1.04)*clamp(advanced_factor,0.96,1.04)
     else:
         base*=role_factor*defense_factor*game_factor*opportunity["factor"]*pace_factor*vegas_factor*script_factor*blowout_factor*advanced_factor
     learn=learning_scale(row.get("player"),prop)
@@ -3729,6 +4021,8 @@ def project_row(row, sims=12000):
     if line is not None and row.get("source")!="DEMO" and prop in ACTIVE_NFL_MARKETS:
         if prop == "Passing Yards":
             base=base*0.78 + line*0.22
+        elif prop == "Receiving Yards":
+            base=base*0.72 + line*0.28
         else:
             base=base*0.55 + line*0.45
 
@@ -3747,6 +4041,8 @@ def project_row(row, sims=12000):
     base, line_sanity_info = _market_line_sanity_projection(base, line, prop, row.get("source"))
 
     sigma=cfg["sigma"]
+    if prop == "Passing Yards":
+        sigma *= safe_float(qb_tier_info.get("sigma_factor"), 1.0) or 1.0
     if injury_risk in ["HIGH","EXTREME"]: sigma*=1.12
     if game_script_risk=="HIGH": sigma*=1.08
     if usage_quality < 72: sigma*=1.07
@@ -3788,6 +4084,8 @@ def project_row(row, sims=12000):
     if injury_risk=="HIGH": score-=14
     if injury_risk=="EXTREME": score-=32
     if game_script_risk=="HIGH": score-=5
+    if prop == "Passing Yards":
+        score += int(qb_tier_info.get("confidence_boost", 0) or 0)
     score=int(clamp(score,0,99))
 
     line_delta=update_clv_snapshot(row.get("player"), prop, row.get("source"), line) if line is not None else None
@@ -3805,14 +4103,21 @@ def project_row(row, sims=12000):
         notes.extend((bayes_markov_info.get("notes") or [])[:3])
     if ensemble_info.get("enabled"):
         notes.append(f"Ensemble ML Assist: {ensemble_info.get('status')}" + (f" · blend {ensemble_info.get('blend')}" if ensemble_info.get('blend') else ""))
+    active_breakdown = {}
     if pass_yards_model_info.get("active"):
         b = pass_yards_model_info.get("breakdown", {})
+        active_breakdown = b
         notes.append(f"Passing Yards model: {b.get('projected_attempts')} att × {b.get('yards_per_attempt')} YPA | base {b.get('player_pass_ypg')} YPG")
+        notes.append(f"QB tier: {qb_tier_info.get('tier')}")
+    if receiving_yards_model_info.get("active"):
+        b = receiving_yards_model_info.get("breakdown", {})
+        active_breakdown = b
+        notes.append(f"Receiving Yards model: {b.get('projected_targets')} targets × {b.get('yards_per_target')} YPT | base {b.get('player_rec_ypg')} YPG")
     if line_sanity_info.get("active"):
         notes.append(line_sanity_info.get("note"))
     if row.get("source")=="DEMO": notes.append("Demo row until live NFL props are available")
 
-    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"advanced_context":advanced_context,"passing_yards_model":pass_yards_model_info,"projection_breakdown":pass_yards_model_info.get("breakdown",{}),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"advanced_context":advanced_context,"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     signal, action_tier, rejections = build_signal(out)
     out["signal"]=signal; out["action_tier"]=action_tier; out["official_rejections"]=rejections; out["bettable"]=action_tier=="BET"
     return out
@@ -4105,7 +4410,7 @@ def _render_player_cards(rows, limit=None, header=None):
                     st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
                     st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
                     st.write("Advanced context:")
-                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "line_sanity": p.get('line_sanity'), "advanced_context": p.get('advanced_context')})
+                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "line_sanity": p.get('line_sanity'), "projection_breakdown": p.get('projection_breakdown'), "qb_tier": p.get('qb_tier'), "advanced_context": p.get('advanced_context')})
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
                 if p.get('game_script_branches'):
@@ -4217,7 +4522,7 @@ with st.sidebar:
     auto_pull_on_load = st.checkbox("Auto-pull live board on app load", value=False, help="Leave OFF for Streamlit Cloud speed. Turn ON only if you want the app to call Underdog every page load.")
 
     with st.expander("Manual Underdog Board Import", expanded=False):
-        st.caption("Use this when Underdog live endpoint returns 404/NO_NFL_ROWS. For now, this build only accepts Pass Yards / Passing Yards lines.")
+        st.caption("Use this when Underdog live endpoint returns 404/NO_NFL_ROWS. For now, this build accepts Pass Yards and Receiving Yards lines only.")
         manual_upload = st.file_uploader("Upload CSV/TXT board", type=["csv", "txt"], key="manual_board_upload")
         manual_text = st.text_area("Paste Underdog Pass Yards board text", height=150, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG", key="manual_board_text")
         if st.button("📥 Load Manual Board Into App", use_container_width=True, key="load_manual_board_btn"):
@@ -4319,7 +4624,7 @@ if 'show_feed_debug' in globals() and show_feed_debug:
     st.caption("Latest Underdog/API request log")
     st.dataframe(pd.DataFrame(req_log[-25:]), use_container_width=True, hide_index=True)
 
-tabs=st.tabs(["Today / Weekly Board", "Pass Yards", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
+tabs=st.tabs(["Today / Weekly Board", "Pass Yards", "Receiving Yards", "Best Edges", "Player Cards", "Alt-Line Ladder", "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line"])
 
 with tabs[0]:
     st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
@@ -4332,6 +4637,12 @@ with tabs[1]:
     _render_player_cards(rows, header=None)
 
 with tabs[2]:
+    st.markdown("<div class='section-title-pro'>Receiving Yards Board</div>", unsafe_allow_html=True)
+    rows=[p for p in projected if p.get("prop") == "Receiving Yards"]
+    _render_prop_table(rows, "Receiving Yards")
+    _render_player_cards(rows, header=None)
+
+with tabs[3]:
     st.markdown("<div class='section-title-pro'>Best Edges + Official Filter</div>", unsafe_allow_html=True)
     filt_rows=[]
     for p in projected:
@@ -4364,10 +4675,10 @@ with tabs[2]:
         <div class='metric-card'><div class='kpi-label'>Stability</div><div class='kpi-value'>{p.get('stability_score')}</div></div>
         </div></div>""", unsafe_allow_html=True)
 
-with tabs[3]:
+with tabs[4]:
     _render_player_cards(projected, header="Clickable Player Cards")
 
-with tabs[4]:
+with tabs[5]:
     st.markdown("<div class='section-title-pro'>Alt-Line Ladder</div>", unsafe_allow_html=True)
     names=[f"{p['player']} — {p['prop']}" for p in projected]
     if names:
@@ -4376,7 +4687,7 @@ with tabs[4]:
         st.dataframe(alt_ladder(p), use_container_width=True, hide_index=True)
     else: st.warning("No props to ladder.")
 
-with tabs[5]:
+with tabs[6]:
     st.markdown("<div class='section-title-pro'>Correlation Builder</div>", unsafe_allow_html=True)
     st.write("Use this to avoid bad parlays and find positive stacks.")
     if df.empty: st.warning("No player cards loaded.")
@@ -4393,7 +4704,7 @@ with tabs[5]:
             elif p1["team"]!=p2["team"] and any(x in p1["prop"] for x in ["Passing","Receiving"]) and any(x in p2["prop"] for x in ["Passing","Receiving"]): corr="Positive game-script shootout"
         st.success(f"Correlation Read: {corr}")
 
-with tabs[6]:
+with tabs[7]:
     st.markdown("<div class='section-title-pro'>Save Full Board / After / Bulk Grade</div>", unsafe_allow_html=True)
     st.write("This now works like the MLB workflow: save the whole pulled board/slate in one click, then bulk-grade it later.")
 
@@ -4498,7 +4809,7 @@ with tabs[6]:
             scale=graded[0].get("new_learning_scale") if graded else None
             st.success(f"Graded. Result: {'WIN' if win else 'LOSS' if win is False else 'NO LINE'} · New learning scale: {scale}")
 
-with tabs[7]:
+with tabs[8]:
     st.markdown("<div class='section-title-pro'>Learning Dashboard + Calibration</div>", unsafe_allow_html=True)
     results=load_json(RESULT_LOG,[]); learn=load_json(LEARN_FILE,{})
     if results:
@@ -4530,7 +4841,7 @@ with tabs[7]:
         with st.expander("Raw Learning Scale JSON"):
             st.json(learn)
 
-with tabs[8]:
+with tabs[9]:
     st.markdown("<div class='section-title-pro'>Underdog Money Line</div>", unsafe_allow_html=True)
     st.write("This tab scans Underdog for NFL moneyline/winner markets when they are posted. It will not create fake moneylines if Underdog does not expose them yet.")
     if moneylines:
