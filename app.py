@@ -10,7 +10,7 @@ when no NFL prop feed is available, it shows clearly labeled preseason/demo exam
 the UI and workflow can be tested without confusing them as real bets.
 """
 
-import os, json, math, time, difflib, unicodedata, hashlib, re, io
+import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,8 +19,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v3.7 — OFFENSE VS DEFENSE RANK MATCHUPS"
-MODEL_VERSION = "nfl-prop-engine-v3.7.0"
+APP_VERSION = "NFL v3.8 — AUTO-ROUTE DATA UPLOADS"
+MODEL_VERSION = "nfl-prop-engine-v3.8.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -6166,6 +6166,65 @@ def _render_projection_data_admin():
         ("Manual news overrides", MANUAL_OVERRIDE_FILE, ["json"]),
         ("API config", API_CONFIG_FILE, ["json"]),
     ]
+    target_by_filename={Path(target).name: (label, Path(target), types) for label, target, types in upload_targets}
+
+    def _save_context_upload_bytes(filename, data):
+        clean_name=Path(str(filename or "")).name
+        if clean_name not in target_by_filename:
+            return {"file": clean_name, "status": "SKIPPED", "detail": "filename not recognized"}
+        label, target, types=target_by_filename[clean_name]
+        try:
+            suffix=target.suffix.lower()
+            if suffix == ".json":
+                json.loads(data.decode("utf-8"))
+                rows="json ok"
+            else:
+                preview=pd.read_csv(io.BytesIO(data), nrows=5)
+                rows=f"csv ok ({len(preview)} preview rows)"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            return {"file": clean_name, "status": "SAVED", "target": target.name, "detail": rows}
+        except Exception as e:
+            return {"file": clean_name, "status": "ERROR", "target": target.name, "detail": str(e)[:120]}
+
+    st.markdown("#### Bulk Auto-Route Upload")
+    st.caption("Upload the ZIP I gave you, or select multiple CSV/JSON files. Files are routed by exact filename.")
+    bulk_uploads=st.file_uploader(
+        "Upload ZIP or multiple context files",
+        type=["zip","csv","json"],
+        accept_multiple_files=True,
+        key="bulk_context_auto_route_upload",
+    )
+    if bulk_uploads and st.button("Save All Recognized Files", use_container_width=True, key="save_bulk_context_auto_route"):
+        results=[]
+        for uploaded in bulk_uploads:
+            name=Path(uploaded.name).name
+            data=uploaded.read()
+            if name.lower().endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(data)) as z:
+                        for member in z.infolist():
+                            if member.is_dir():
+                                continue
+                            member_name=Path(member.filename).name
+                            if not member_name:
+                                continue
+                            results.append(_save_context_upload_bytes(member_name, z.read(member)))
+                except Exception as e:
+                    results.append({"file": name, "status": "ERROR", "detail": f"zip read failed: {str(e)[:100]}"})
+            else:
+                results.append(_save_context_upload_bytes(name, data))
+        rdf=pd.DataFrame(results)
+        saved=int((rdf["status"]=="SAVED").sum()) if not rdf.empty and "status" in rdf.columns else 0
+        if saved:
+            st.success(f"Saved {saved} context files.")
+        else:
+            st.warning("No recognized files were saved. Make sure filenames match the templates.")
+        st.dataframe(rdf, use_container_width=True, hide_index=True)
+        st.rerun()
+
+    st.divider()
+    st.caption("Or upload one file at a time below. Saved files are used on the next rerun.")
     for label, target, types in upload_targets:
         uploaded=st.file_uploader(label, type=types, key=f"context_upload_{Path(target).name}")
         if uploaded is not None and st.button(f"Save {Path(target).name}", use_container_width=True, key=f"context_save_{Path(target).name}"):
