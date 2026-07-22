@@ -19,8 +19,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v3.8 — AUTO-ROUTE DATA UPLOADS"
-MODEL_VERSION = "nfl-prop-engine-v3.8.0"
+APP_VERSION = "NFL v3.9 — PHASE 6 FILE AUTO-ROUTE"
+MODEL_VERSION = "nfl-prop-engine-v3.9.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -6105,6 +6105,7 @@ def _render_projection_data_admin():
     st.markdown("### Projection Data")
     st.caption("Fresh files here override last-season defaults without breaking startup.")
     status=[
+        _context_file_status(USAGE_FILE, "csv"),
         _context_file_status(CURRENT_USAGE_FILE, "csv"),
         _context_file_status(CURRENT_TEAM_CONTEXT_FILE, "json"),
         _context_file_status(INJURY_FILE, "json"),
@@ -6120,6 +6121,11 @@ def _render_projection_data_admin():
         _context_file_status(FINAL_INACTIVES_FILE, "json"),
         _context_file_status(MANUAL_OVERRIDE_FILE, "json"),
         _context_file_status(API_CONFIG_FILE, "json"),
+        _context_file_status(PHASE6_PLAYER_SUMMARY_FILE, "csv"),
+        _context_file_status(PHASE6_DEFENSE_RANK_FILE, "csv"),
+        _context_file_status(PHASE6_TEAM_ADVANCED_FILE, "csv"),
+        _context_file_status(PHASE6_RED_ZONE_FILE, "csv"),
+        _context_file_status(PHASE6_OT_FILE, "csv"),
     ]
     loaded=sum(1 for s in status if s.get("loaded"))
     st.metric("Fresh context files", f"{loaded}/{len(status)}")
@@ -6150,6 +6156,7 @@ def _render_projection_data_admin():
     st.divider()
     st.caption("Upload completed context files here. Saved files are used on the next rerun.")
     upload_targets=[
+        ("Last-season player usage", USAGE_FILE, ["csv"]),
         ("Current player usage", CURRENT_USAGE_FILE, ["csv"]),
         ("Current team context", CURRENT_TEAM_CONTEXT_FILE, ["json"]),
         ("Injuries", INJURY_FILE, ["json"]),
@@ -6165,6 +6172,11 @@ def _render_projection_data_admin():
         ("Final inactives", FINAL_INACTIVES_FILE, ["json"]),
         ("Manual news overrides", MANUAL_OVERRIDE_FILE, ["json"]),
         ("API config", API_CONFIG_FILE, ["json"]),
+        ("Phase 6 player summary", PHASE6_PLAYER_SUMMARY_FILE, ["csv"]),
+        ("Phase 6 defense ranks", PHASE6_DEFENSE_RANK_FILE, ["csv"]),
+        ("Phase 6 team advanced", PHASE6_TEAM_ADVANCED_FILE, ["csv"]),
+        ("Phase 6 red zone usage", PHASE6_RED_ZONE_FILE, ["csv"]),
+        ("Phase 6 overtime context", PHASE6_OT_FILE, ["csv"]),
     ]
     target_by_filename={Path(target).name: (label, Path(target), types) for label, target, types in upload_targets}
 
