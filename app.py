@@ -6181,10 +6181,10 @@ def _render_projection_data_admin():
                 st.rerun()
             except Exception as e:
                 st.error(f"Could not save {Path(target).name}: {e}")
-    with st.expander("API automation config", expanded=False):
-        _render_api_automation_panel()
-    with st.expander("Manual news override", expanded=False):
-        _render_manual_override_panel()
+    st.divider()
+    _render_api_automation_panel()
+    st.divider()
+    _render_manual_override_panel()
 
 
 def _render_phase6_admin():
@@ -6193,9 +6193,8 @@ def _render_phase6_admin():
     season_to_build = st.number_input("Last season to build", min_value=1999, max_value=2030, value=NFL_LAST_SEASON, step=1, key="phase6_admin_season")
     existing_ready = _phase6_existing_database_ready()
     st.metric("Saved database", "READY" if existing_ready else "NOT BUILT")
-    if PHASE6_MANIFEST_FILE.exists():
-        with st.expander("Last saved build", expanded=False):
-            st.json(load_json(PHASE6_MANIFEST_FILE, {}))
+    if PHASE6_MANIFEST_FILE.exists() and st.checkbox("Show last saved Phase 6 build", value=False, key="show_phase6_last_saved_build"):
+        st.json(load_json(PHASE6_MANIFEST_FILE, {}))
     if st.button("Use Saved / Build If Missing", use_container_width=True, key="phase6_use_saved_sidebar"):
         diag = build_phase6_nfl_database(int(season_to_build), force_refresh=False)
         if diag.get("status") in ["BUILT_AND_SAVED", "USING_SAVED_DATABASE", "PULL_FAILED_USING_SAVED_DATABASE", "USING_SAVED_LOCAL_DATABASE", "USING_GITHUB_HARD_INPUT_DATABASE", "BUILT_AND_SAVED_PHASE6_V3"]:
@@ -6609,9 +6608,8 @@ def _render_api_automation_panel():
         st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
         st.rerun()
     last=load_json(LOCAL_DIR / "nfl_auto_refresh_last_run.json", {})
-    if last:
-        with st.expander("Last auto refresh", expanded=False):
-            st.json(last)
+    if last and st.checkbox("Show last auto refresh", value=False, key="show_last_auto_refresh"):
+        st.json(last)
 
 def _render_manual_override_panel():
     st.markdown("### Manual News Override")
@@ -6650,9 +6648,8 @@ def _render_manual_override_panel():
             save_json(MANUAL_OVERRIDE_FILE, data)
             st.success(f"Saved override for {player}.")
             st.rerun()
-    if data:
-        with st.expander("Current manual overrides", expanded=False):
-            st.json(data)
+    if data and st.checkbox("Show current manual overrides", value=False, key="show_current_manual_overrides"):
+        st.json(data)
 
 
 st.markdown(f"""
