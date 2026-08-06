@@ -19,8 +19,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "FULL-MARKETS-NFL v5.0 — ACCURACY + MOBILE + PERFORMANCE"
-MODEL_VERSION = "nfl-prop-engine-v5.0.0"
+APP_VERSION = "FULL-MARKETS-NFL v7.0 — REAL DATA AUTOLOAD + ACCURACY + MOBILE"
+MODEL_VERSION = "nfl-prop-engine-v7.0.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -69,8 +69,106 @@ PHASE6_TRENCH_FILE = PHASE6_DIR / "nfl_trench_context_last_season.csv"
 PHASE6_RED_ZONE_FILE = PHASE6_DIR / "nfl_red_zone_usage_last_season.csv"
 PHASE6_OT_FILE = PHASE6_DIR / "nfl_overtime_context_last_season.csv"
 
+
 NFL_LAST_SEASON = int(os.getenv("NFL_LAST_SEASON", "2025"))
 NFL_CURRENT_SEASON = int(os.getenv("NFL_CURRENT_SEASON", str(max(NFL_LAST_SEASON + 1, datetime.now().year))))
+
+# -----------------------------------------------------------------------------
+# REAL BUNDLED DATA AUTOLOAD
+# -----------------------------------------------------------------------------
+# Railway's persistent STORAGE_DIR is separate from the checked-out GitHub repo.
+# The repository already contains populated 2025 baseline files at its root, but
+# older app builds looked only inside STORAGE_DIR/nfl_engine.  This bootstrap
+# copies verified, non-empty repository data into the active storage folders on
+# startup. It NEVER replaces a valid persistent database with an empty template.
+
+def _fast_csv_data_rows(path):
+    """Return CSV data-row count without loading the full file into memory."""
+    path = Path(path)
+    try:
+        if not path.exists() or path.stat().st_size < 60:
+            return 0
+        with path.open("r", encoding="utf-8-sig", errors="replace") as fh:
+            lines = sum(1 for line in fh if line.strip())
+        return max(0, lines - 1)
+    except Exception:
+        return 0
+
+
+def _fast_json_items(path):
+    path = Path(path)
+    try:
+        if not path.exists() or path.stat().st_size < 20:
+            return 0
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return len(payload) if isinstance(payload, (dict, list)) else 0
+    except Exception:
+        return 0
+
+
+def _bundled_file_is_real(path, minimum_rows, kind="csv"):
+    if kind == "json":
+        return _fast_json_items(path) >= int(minimum_rows)
+    return _fast_csv_data_rows(path) >= int(minimum_rows)
+
+
+def _copy_real_bundled_file(source, target, minimum_rows, kind="csv"):
+    """Copy only validated real data; preserve an already-valid target."""
+    source, target = Path(source), Path(target)
+    source_rows = _fast_json_items(source) if kind == "json" else _fast_csv_data_rows(source)
+    target_rows = _fast_json_items(target) if kind == "json" else _fast_csv_data_rows(target)
+    result = {
+        "source": str(source), "target": str(target), "source_rows": int(source_rows),
+        "target_rows_before": int(target_rows), "status": "SKIPPED",
+    }
+    if source_rows < int(minimum_rows):
+        result["status"] = "SOURCE_MISSING_OR_TEMPLATE"
+        return result
+    if target_rows >= int(minimum_rows):
+        result["status"] = "TARGET_ALREADY_VALID"
+        return result
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
+        installed_rows = _fast_json_items(target) if kind == "json" else _fast_csv_data_rows(target)
+        result["target_rows_after"] = int(installed_rows)
+        result["status"] = "INSTALLED_REAL_DATA" if installed_rows >= int(minimum_rows) else "COPY_VALIDATION_FAILED"
+    except Exception as exc:
+        result["status"] = "COPY_ERROR"
+        result["error"] = str(exc)[:180]
+    return result
+
+
+def install_bundled_real_projection_data():
+    """Install real repository baseline files into Railway's active storage."""
+    repo_root = Path.cwd()
+    tasks = [
+        (repo_root / "nfl_player_usage.csv", USAGE_FILE, 25, "csv"),
+        (repo_root / "nfl_player_logs_last_season.csv", PHASE6_PLAYER_LOG_FILE, 100, "csv"),
+        (repo_root / "nfl_player_summary_last_season.csv", PHASE6_PLAYER_SUMMARY_FILE, 25, "csv"),
+        (repo_root / "nfl_team_context_last_season.json", PHASE6_TEAM_CONTEXT_FILE, 16, "json"),
+        (repo_root / "nfl_defense_ranks_last_season.csv", PHASE6_DEFENSE_RANK_FILE, 28, "csv"),
+        (repo_root / "nfl_travel_stadium_context.csv", PHASE6_TRAVEL_FILE, 100, "csv"),
+        (repo_root / "nfl_team_advanced_last_season.csv", PHASE6_TEAM_ADVANCED_FILE, 28, "csv"),
+        (repo_root / "nfl_trench_context_last_season.csv", PHASE6_TRENCH_FILE, 28, "csv"),
+        (repo_root / "nfl_red_zone_usage_last_season.csv", PHASE6_RED_ZONE_FILE, 25, "csv"),
+        (repo_root / "nfl_overtime_context_last_season.csv", PHASE6_OT_FILE, 28, "csv"),
+        (repo_root / "nfl_team_context.json", TEAM_CONTEXT_FILE, 16, "json"),
+    ]
+    diagnostics = [_copy_real_bundled_file(*task) for task in tasks]
+
+    # Last-season team context is a safe baseline hook when no separate current
+    # context file has been supplied yet.
+    if not _bundled_file_is_real(TEAM_CONTEXT_FILE, 16, "json"):
+        fallback = repo_root / "nfl_team_context_last_season.json"
+        diagnostics.append(_copy_real_bundled_file(fallback, TEAM_CONTEXT_FILE, 16, "json"))
+
+    installed = sum(d.get("status") == "INSTALLED_REAL_DATA" for d in diagnostics)
+    valid = sum(d.get("status") in {"INSTALLED_REAL_DATA", "TARGET_ALREADY_VALID"} for d in diagnostics)
+    return {"installed": int(installed), "valid": int(valid), "files": diagnostics}
+
+
+BUNDLED_REAL_DATA_BOOTSTRAP = install_bundled_real_projection_data()
 
 UNDERDOG_URLS = [
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
@@ -2345,9 +2443,9 @@ def _download_csv_with_persistent_cache(label, urls, cache_name, force_refresh=F
 def fetch_nflverse_player_weekly_stats(season=NFL_LAST_SEASON, force_refresh=False):
     season = int(season)
     urls = [
-        nflverse_url("player_stats", f"stats_player_week_{season}.csv"),
-        nflverse_url("player_stats", f"player_stats_{season}.csv"),
-        nflverse_url("player_stats", f"stats_player_week_{season}.csv.gz"),
+        nflverse_url("stats_player", f"stats_player_week_{season}.csv"),
+        nflverse_url("stats_player", f"stats_player_reg_{season}.csv"),
+        nflverse_url("stats_player", f"stats_player_week_{season}.csv.gz"),
     ]
     df = _download_csv_with_persistent_cache("NFLVERSE_PLAYER_WEEKLY", urls, f"stats_player_week_{season}.csv", force_refresh)
     if not df.empty:
@@ -2368,9 +2466,9 @@ def fetch_nflverse_player_weekly_stats(season=NFL_LAST_SEASON, force_refresh=Fal
 def fetch_nflverse_schedules(season=NFL_LAST_SEASON, force_refresh=False):
     season = int(season)
     urls = [
+        "https://raw.githubusercontent.com/nflverse/nfldata/master/data/games.csv",
         nflverse_url("schedules", "schedules.csv"),
         nflverse_url("schedules", f"schedules_{season}.csv"),
-        nflverse_url("schedules", "schedules.csv.gz"),
     ]
     df = _download_csv_with_persistent_cache("NFLVERSE_SCHEDULES", urls, f"schedules_{season}.csv", force_refresh)
     if not df.empty:
@@ -2401,32 +2499,57 @@ def fetch_nflverse_snap_counts(season=NFL_LAST_SEASON, force_refresh=False):
     return df
 
 def fetch_nflverse_pbp(season=NFL_LAST_SEASON, force_refresh=False):
-    """Optional full play-by-play pull for penalties, fumbles, red zone, EPA, OT, and trench proxies.
+    """Low-memory PBP pull.
 
-    If this file is too large or unavailable in a deployment, the builder still completes from
-    weekly player stats + schedules + snaps. If it succeeds once, it is saved and reused.
+    Only the columns required for team identity, defense, red-zone, overtime, and trench
+    context are loaded. This avoids loading the several-hundred-column full PBP table into
+    Railway memory while still populating the advanced Phase 6 CSV files.
     """
     season = int(season)
+    cache_path = PHASE6_RAW_DIR / f"play_by_play_reduced_{season}.csv"
+    if cache_path.exists() and not force_refresh:
+        cached = _read_csv_cached(cache_path)
+        if not cached.empty:
+            request_log("NFLVERSE_PBP_REDUCED", "LOCAL_CACHE", f"rows={len(cached)}")
+            return cached
+    keep_cols = {
+        "season","season_type","game_type","game_id","week","posteam","defteam",
+        "pass_attempt","rush_attempt","penalty","fumble_lost","fumble","sack","qb_hit",
+        "touchdown","epa","success","yards_gained","air_yards","complete_pass","down",
+        "yardline_100","qtr","rusher_player_name","receiver_player_name","passer_player_name"
+    }
     urls = [
         nflverse_url("pbp", f"play_by_play_{season}.csv.gz"),
-        nflverse_url("play_by_play", f"play_by_play_{season}.csv.gz"),
         nflverse_url("pbp", f"play_by_play_{season}.csv"),
-        nflverse_url("play_by_play", f"play_by_play_{season}.csv"),
     ]
-    df = _download_csv_with_persistent_cache("NFLVERSE_PBP", urls, f"play_by_play_{season}.csv", force_refresh)
-    if not df.empty:
-        if "season" in df.columns:
-            df = df[df["season"].astype(str) == str(season)].copy()
-        if "week" in df.columns:
-            df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
-        for tcol in ["season_type", "game_type"]:
-            if tcol in df.columns:
-                vals = df[tcol].astype(str).str.upper()
-                reg_mask = vals.isin(["REG", "REGULAR", "REGULAR_SEASON", "R"])
-                if reg_mask.any():
-                    df = df[reg_mask].copy()
-                break
-    return df
+    last_error = ""
+    for url in urls:
+        try:
+            df = pd.read_csv(url, usecols=lambda c: c in keep_cols, low_memory=False)
+            if not df.empty:
+                if "season" in df.columns:
+                    df = df[df["season"].astype(str).eq(str(season))].copy()
+                if "week" in df.columns:
+                    df = df[pd.to_numeric(df["week"], errors="coerce").between(1, 18)].copy()
+                for tcol in ["season_type","game_type"]:
+                    if tcol in df.columns:
+                        vals = df[tcol].astype(str).str.upper()
+                        mask = vals.isin(["REG","REGULAR","REGULAR_SEASON","R"])
+                        if mask.any():
+                            df = df[mask].copy()
+                        break
+                df.to_csv(cache_path, index=False)
+                request_log("NFLVERSE_PBP_REDUCED", "DOWNLOADED", f"{url} rows={len(df)}")
+                return df
+        except Exception as e:
+            last_error = str(e)[:400]
+            request_log("NFLVERSE_PBP_REDUCED", "URL_FAILED", f"{url} :: {last_error}")
+    cached = _read_csv_cached(cache_path)
+    if not cached.empty:
+        return cached
+    request_log("NFLVERSE_PBP_REDUCED", "NO_DATA", last_error)
+    return pd.DataFrame()
+
 
 def _phase6_sum_cols(df, cols):
     return [c for c in cols if c in df.columns]
@@ -2749,7 +2872,10 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON, force_refresh=False):
     weekly = fetch_nflverse_player_weekly_stats(season, force_refresh=force_refresh)
     schedules = fetch_nflverse_schedules(season, force_refresh=force_refresh)
     snaps = fetch_nflverse_snap_counts(season, force_refresh=force_refresh)
-    pbp = fetch_nflverse_pbp(season, force_refresh=force_refresh)
+    enable_full_pbp = str(os.getenv("NFL_ENABLE_FULL_PBP_BUILD", "1")).strip().lower() in {"1","true","yes","on"}
+    pbp = fetch_nflverse_pbp(season, force_refresh=force_refresh) if enable_full_pbp else pd.DataFrame()
+    if not enable_full_pbp:
+        request_log("PHASE6_PBP", "SKIPPED", "Low-memory PBP build disabled by NFL_ENABLE_FULL_PBP_BUILD=0.")
 
     weekly_source = "nflverse_player_stats"
     if weekly.empty and not pbp.empty:
@@ -3176,18 +3302,33 @@ def _phase6_try_use_bundled_database():
 
 
 def _phase6_export_database_zip():
-    """Create a zip the user can commit to GitHub or store as backup."""
-    import zipfile
+    """Export the complete app-ready nfl_engine data folder."""
     PHASE6_DIR.mkdir(parents=True, exist_ok=True)
-    zip_path = PHASE6_DIR / "phase6_nfl_database_export.zip"
+    zip_path = PHASE6_DIR / "nfl_full_data_pack_2026.zip"
+    root_files = [
+        USAGE_FILE, TEAM_CONTEXT_FILE, INJURY_FILE, DEPTH_CHART_FILE, WEATHER_FILE,
+        MARKET_CONTEXT_FILE, CURRENT_USAGE_FILE, CURRENT_TEAM_CONTEXT_FILE,
+        TRAVEL_CONTEXT_FILE, MATCHUP_CONTEXT_FILE, QB_CONTEXT_FILE, DEF_INJURY_FILE,
+        SPLITS_CONTEXT_FILE, PERSONNEL_CONTEXT_FILE, API_CONFIG_FILE,
+        FINAL_INACTIVES_FILE, MANUAL_OVERRIDE_FILE,
+    ]
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-        for file in PHASE6_DIR.glob("*"):
-            if file.is_file() and file.name != zip_path.name:
-                z.write(file, arcname=file.name)
-        if USAGE_FILE.exists():
-            z.write(USAGE_FILE, arcname="nfl_player_usage.csv")
-        if TEAM_CONTEXT_FILE.exists():
-            z.write(TEAM_CONTEXT_FILE, arcname="nfl_team_context.json")
+        for file in PHASE6_DIR.rglob("*"):
+            if file.is_file() and file.resolve() != zip_path.resolve():
+                rel = file.relative_to(PHASE6_DIR)
+                z.write(file, arcname=str(Path("nfl_engine") / "phase6_nfl_database" / rel))
+        for file in root_files:
+            if Path(file).exists():
+                z.write(file, arcname=str(Path("nfl_engine") / Path(file).name))
+        readme = (
+            "NFL full data pack\n"
+            f"Created: {now_iso()}\n"
+            f"Historical baseline season: {NFL_LAST_SEASON}\n"
+            f"Current roster/depth season: {NFL_CURRENT_SEASON}\n\n"
+            "Unzip at the repository root so the nfl_engine folder is preserved.\n"
+            "Market, weather, defensive-injury, and final-inactive hooks must update on slate day.\n"
+        )
+        z.writestr("README_DATA_PACK.txt", readme)
     return zip_path
 
 
@@ -3228,6 +3369,459 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON, force_refresh=False):
             return diag2
     diag.update({"status": "PHASE6_BUILD_FAILED_OR_LOW_QUALITY", **quality})
     return diag
+
+
+
+# ---------- Current-season full data-pack builder ----------
+def _first_existing_col(df, names):
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _series_from_candidates(df, names, default=""):
+    col = _first_existing_col(df, names)
+    if col is None:
+        return pd.Series([default] * len(df), index=df.index)
+    return df[col]
+
+
+def fetch_nflverse_rosters(season=NFL_CURRENT_SEASON, force_refresh=False):
+    season = int(season)
+    urls = [
+        nflverse_url("rosters", f"roster_{season}.csv"),
+        nflverse_url("rosters", f"roster_{season}.csv.gz"),
+    ]
+    return _download_csv_with_persistent_cache(
+        "NFLVERSE_ROSTERS", urls, f"roster_{season}.csv", force_refresh
+    )
+
+
+def fetch_nflverse_depth_charts(season=NFL_CURRENT_SEASON, force_refresh=False):
+    season = int(season)
+    urls = [
+        nflverse_url("depth_charts", f"depth_charts_{season}.csv"),
+        nflverse_url("depth_charts", f"depth_charts_{season}.csv.gz"),
+    ]
+    return _download_csv_with_persistent_cache(
+        "NFLVERSE_DEPTH_CHARTS", urls, f"depth_charts_{season}.csv", force_refresh
+    )
+
+
+def _normalize_roster_frame(roster):
+    if roster is None or roster.empty:
+        return pd.DataFrame(columns=[
+            "player","team","position","status","injury_status","practice_status",
+            "years_exp","rookie_flag","player_id"
+        ])
+    out = pd.DataFrame(index=roster.index)
+    out["player"] = _series_from_candidates(
+        roster, ["full_name","player_name","display_name","football_name","name","gsis_name"]
+    ).fillna("").astype(str).str.strip()
+    first = _series_from_candidates(roster, ["first_name"], "").fillna("").astype(str).str.strip()
+    last = _series_from_candidates(roster, ["last_name"], "").fillna("").astype(str).str.strip()
+    missing_name = out["player"].eq("")
+    out.loc[missing_name, "player"] = (first + " " + last).str.strip()[missing_name]
+    out["team"] = _series_from_candidates(
+        roster, ["team","recent_team","club_code","club","team_abbr"]
+    ).fillna("").astype(str).str.upper().str.strip()
+    out["position"] = _series_from_candidates(
+        roster, ["position","position_group","depth_chart_position","pos_abb"]
+    ).fillna("").astype(str).str.upper().str.strip()
+    out["status"] = _series_from_candidates(
+        roster, ["status","roster_status","active_status"]
+    ).fillna("").astype(str).str.upper().str.strip()
+    out["injury_status"] = _series_from_candidates(
+        roster, ["injury_status","injury_designation","injury"]
+    ).fillna("").astype(str).str.upper().str.strip()
+    out["practice_status"] = _series_from_candidates(
+        roster, ["practice_status","practice_participation"]
+    ).fillna("").astype(str).str.upper().str.strip()
+    out["years_exp"] = pd.to_numeric(
+        _series_from_candidates(roster, ["years_exp","years_of_experience","experience"], np.nan),
+        errors="coerce",
+    )
+    out["rookie_flag"] = (out["years_exp"].fillna(1) <= 0).astype(int)
+    out["player_id"] = _series_from_candidates(
+        roster, ["gsis_id","player_id","sleeper_id","espn_id","pfr_id"]
+    ).fillna("").astype(str)
+    out = out[out["player"].ne("") & out["team"].isin(NFL_TEAMS)].copy()
+    out["_name_key"] = out["player"].map(norm)
+    out = out.drop_duplicates(["_name_key","team","position"], keep="last")
+    return out.reset_index(drop=True)
+
+
+def _normalize_depth_frame(depth, roster_norm):
+    if depth is None or depth.empty:
+        base = roster_norm.copy()
+        if base.empty:
+            return pd.DataFrame(columns=[
+                "player","team","position","depth_rank","starter","role","slot_role",
+                "expected_routes","expected_targets","expected_attempts","expected_carries",
+                "qb_change_risk","role_note","updated_at"
+            ])
+        base["depth_rank"] = np.nan
+    else:
+        base = pd.DataFrame(index=depth.index)
+        base["player"] = _series_from_candidates(
+            depth, ["full_name","player_name","display_name","football_name","name","gsis_name"]
+        ).fillna("").astype(str).str.strip()
+        first = _series_from_candidates(depth, ["first_name"], "").fillna("").astype(str).str.strip()
+        last = _series_from_candidates(depth, ["last_name"], "").fillna("").astype(str).str.strip()
+        missing = base["player"].eq("")
+        base.loc[missing, "player"] = (first + " " + last).str.strip()[missing]
+        base["team"] = _series_from_candidates(
+            depth, ["club_code","team","recent_team","club","team_abbr"]
+        ).fillna("").astype(str).str.upper().str.strip()
+        base["position"] = _series_from_candidates(
+            depth, ["position","pos_abb","depth_position","position_group"]
+        ).fillna("").astype(str).str.upper().str.strip()
+        rank_raw = _series_from_candidates(
+            depth, ["depth_team","depth_rank","depth_chart_order","depth_chart_position","rank"], np.nan
+        )
+        base["depth_rank"] = pd.to_numeric(rank_raw, errors="coerce")
+        base = base[base["player"].ne("") & base["team"].isin(NFL_TEAMS)].copy()
+
+    # Fill missing depth ranks within team/position. This is ordering metadata, not a projection.
+    base["_name_key"] = base["player"].map(norm)
+    if not roster_norm.empty:
+        roster_small = roster_norm[["_name_key","team","position"]].drop_duplicates("_name_key")
+        base = base.merge(roster_small, on="_name_key", how="left", suffixes=("","_roster"))
+        base["team"] = base["team"].replace("", np.nan).fillna(base.get("team_roster"))
+        base["position"] = base["position"].replace("", np.nan).fillna(base.get("position_roster"))
+        base = base.drop(columns=[c for c in ["team_roster","position_roster"] if c in base.columns])
+    base["depth_rank"] = base.groupby(["team","position"])["depth_rank"].transform(
+        lambda x: x.fillna(pd.Series(range(1, len(x)+1), index=x.index))
+    )
+    base["depth_rank"] = pd.to_numeric(base["depth_rank"], errors="coerce").fillna(9).astype(int)
+    base["starter"] = (base["depth_rank"] == 1).astype(int)
+    base["role"] = np.where(base["starter"].eq(1), "STARTER", "BACKUP")
+    base["slot_role"] = ""
+    for c in ["expected_routes","expected_targets","expected_attempts","expected_carries"]:
+        base[c] = np.nan
+    base["qb_change_risk"] = np.where(
+        base["position"].eq("QB") & base["depth_rank"].gt(1), "HIGH", "LOW"
+    )
+    base["role_note"] = "Current-season depth chart; verify official game-day inactives."
+    base["updated_at"] = now_iso()
+    cols = [
+        "player","team","position","depth_rank","starter","role","slot_role",
+        "expected_routes","expected_targets","expected_attempts","expected_carries",
+        "qb_change_risk","role_note","updated_at"
+    ]
+    return base[cols].drop_duplicates(["player","team","position"], keep="first").reset_index(drop=True)
+
+
+def _last_n_player_means(logs, n=5):
+    if logs is None or logs.empty or "player" not in logs.columns:
+        return pd.DataFrame()
+    work = logs.copy()
+    work["_name_key"] = work["player"].map(norm)
+    sort_cols = [c for c in ["season","week"] if c in work.columns]
+    if sort_cols:
+        work = work.sort_values(sort_cols)
+    work = work.groupby("_name_key", group_keys=False).tail(n)
+    numeric = work.select_dtypes(include=[np.number]).columns.tolist()
+    numeric = [c for c in numeric if c not in ["season","week"]]
+    if not numeric:
+        return pd.DataFrame()
+    return work.groupby("_name_key")[numeric].mean().reset_index()
+
+
+def _write_csv_template(path, columns):
+    path = Path(path)
+    if path.exists() and path.stat().st_size > 10:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(columns=columns).to_csv(path, index=False)
+
+
+def _write_json_template(path, payload=None):
+    path = Path(path)
+    if path.exists() and path.stat().st_size > 2:
+        return
+    save_json(path, payload if payload is not None else {})
+
+
+def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_refresh=False):
+    """Create every root-level CSV/JSON used by the projection engine.
+
+    Historical performance comes from the completed prior season. Current roster and depth
+    metadata come from the selected current season. Live markets, weather, injuries, and final
+    inactives are created as safe empty hooks because they must be refreshed on slate day.
+    """
+    current_season = int(current_season)
+    roster_raw = fetch_nflverse_rosters(current_season, force_refresh=force_refresh)
+    depth_raw = fetch_nflverse_depth_charts(current_season, force_refresh=force_refresh)
+    schedules = fetch_nflverse_schedules(current_season, force_refresh=force_refresh)
+    roster = _normalize_roster_frame(roster_raw)
+    depth = _normalize_depth_frame(depth_raw, roster)
+    depth.to_csv(DEPTH_CHART_FILE, index=False)
+
+    summary = _read_optional_csv(PHASE6_PLAYER_SUMMARY_FILE)
+    logs = _read_optional_csv(PHASE6_PLAYER_LOG_FILE)
+    if summary.empty and USAGE_FILE.exists():
+        summary = _read_optional_csv(USAGE_FILE)
+    if not summary.empty:
+        summary = summary.copy()
+        summary["_name_key"] = summary["player"].map(norm)
+    last5 = _last_n_player_means(logs, 5)
+
+    offensive_positions = {"QB","RB","WR","TE","FB","K"}
+    player_base = roster[roster["position"].isin(offensive_positions)].copy()
+    if player_base.empty and not summary.empty:
+        player_base = summary[[c for c in ["player","team","position"] if c in summary.columns]].copy()
+        player_base["_name_key"] = player_base["player"].map(norm)
+        player_base["rookie_flag"] = 0
+        player_base["status"] = "LAST_SEASON_BASELINE"
+        player_base["injury_status"] = ""
+        player_base["practice_status"] = ""
+    if not summary.empty and not player_base.empty:
+        keep = [c for c in summary.columns if c != "team" and c != "position"]
+        player_base = player_base.merge(summary[keep], on="_name_key", how="left", suffixes=("","_last"))
+    if not last5.empty and not player_base.empty:
+        player_base = player_base.merge(last5, on="_name_key", how="left", suffixes=("","_last5"))
+
+    current_columns = [
+        "player","team","position","snap_share","route_participation","target_share",
+        "air_yards_share","red_zone_touch_share","targets_pg","receptions_pg",
+        "pass_attempts_pg","completions_pg","receiving_yards_pg","passing_yards_pg",
+        "rush_attempts_pg","rushing_yards_pg","yards_per_carry","current_games",
+        "last5_targets_pg","last5_receptions_pg","last5_pass_attempts_pg",
+        "last5_completions_pg","last5_rush_attempts_pg","source_season","updated_at"
+    ]
+    if player_base.empty:
+        current_usage = pd.DataFrame(columns=current_columns)
+    else:
+        current_usage = pd.DataFrame(index=player_base.index)
+        for c in ["player","team","position"]:
+            current_usage[c] = player_base.get(c, "")
+        for c in [
+            "snap_share","route_participation","target_share","air_yards_share",
+            "red_zone_touch_share","targets_pg","receptions_pg","pass_attempts_pg",
+            "completions_pg","receiving_yards_pg","passing_yards_pg","rush_attempts_pg",
+            "rushing_yards_pg","yards_per_carry"
+        ]:
+            current_usage[c] = pd.to_numeric(player_base.get(c, np.nan), errors="coerce")
+        current_usage["current_games"] = 0
+        for src, dst in [
+            ("targets","last5_targets_pg"),("receptions","last5_receptions_pg"),
+            ("attempts","last5_pass_attempts_pg"),("completions","last5_completions_pg"),
+            ("carries","last5_rush_attempts_pg")
+        ]:
+            candidate = f"{src}_last5" if f"{src}_last5" in player_base.columns else src
+            current_usage[dst] = pd.to_numeric(player_base.get(candidate, np.nan), errors="coerce")
+        current_usage["source_season"] = NFL_LAST_SEASON
+        current_usage["updated_at"] = now_iso()
+        current_usage = current_usage[current_columns].drop_duplicates(["player","team"], keep="first")
+    current_usage.to_csv(CURRENT_USAGE_FILE, index=False)
+
+    # Keep the main usage file as the completed-season baseline created by Phase 6.
+    if not USAGE_FILE.exists() and not summary.empty:
+        app_usage_cols = [c for c in [
+            "player","team","position","snap_share","route_participation","target_share",
+            "air_yards_share","red_zone_touch_share","red_zone_carries","red_zone_targets",
+            "goal_line_touches","targets_pg","receptions_pg","rush_attempts_pg","carries_share",
+            "pass_attempts_pg","passing_yards_pg","rushing_yards_pg","receiving_yards_pg",
+            "fantasy_points_pg"
+        ] if c in summary.columns]
+        if app_usage_cols:
+            summary[app_usage_cols].to_csv(USAGE_FILE, index=False)
+
+    # Current injury hook from roster metadata; live game-week updates may overwrite it.
+    injuries = {}
+    for _, r in roster.iterrows():
+        status = str(r.get("injury_status") or "").strip()
+        practice = str(r.get("practice_status") or "").strip()
+        roster_status = str(r.get("status") or "").strip()
+        if status or practice or (roster_status and roster_status not in {"ACTIVE","ACT"}):
+            injuries[norm(r.get("player"))] = {
+                "player": r.get("player"), "team": r.get("team"),
+                "status": status or roster_status, "practice_status": practice,
+                "updated_at": now_iso(), "source": "current_roster_metadata"
+            }
+    save_json(INJURY_FILE, injuries)
+
+    # Quarterback context.
+    qb_rows = []
+    for _, r in depth[depth["position"].eq("QB")].iterrows():
+        qb_rows.append({
+            "team": r.get("team"), "player": r.get("player"),
+            "qb_status": "STARTER" if int(r.get("depth_rank") or 9) == 1 else "BACKUP",
+            "qb_name": r.get("player"),
+            "qb_change_risk": "LOW" if int(r.get("depth_rank") or 9) == 1 else "HIGH",
+            "qb_injury_status": injuries.get(norm(r.get("player")), {}).get("status", ""),
+            "qb_blitz_grade": np.nan, "qb_pressure_grade": np.nan,
+            "qb_deep_accuracy": np.nan,
+            "qb_receiver_quality_note": "Verify starter and game-day status.",
+            "updated_at": now_iso(),
+        })
+    pd.DataFrame(qb_rows, columns=[
+        "team","player","qb_status","qb_name","qb_change_risk","qb_injury_status",
+        "qb_blitz_grade","qb_pressure_grade","qb_deep_accuracy",
+        "qb_receiver_quality_note","updated_at"
+    ]).to_csv(QB_CONTEXT_FILE, index=False)
+
+    # Player splits start neutral; they can be learned from graded history without inventing effects.
+    split_rows = []
+    for _, r in player_base.iterrows() if not player_base.empty else []:
+        split_rows.append({
+            "player": r.get("player"), "prop": "ALL", "team": r.get("team"),
+            "indoor_factor": 1.0, "dome_factor": 1.0, "turf_factor": 1.0,
+            "grass_factor": 1.0, "home_factor": 1.0, "away_factor": 1.0,
+            "rookie_flag": int(safe_float(r.get("rookie_flag"), 0) or 0),
+            "updated_at": now_iso(), "data_status": "NEUTRAL_UNTIL_GRADED"
+        })
+    pd.DataFrame(split_rows, columns=[
+        "player","prop","team","indoor_factor","dome_factor","turf_factor",
+        "grass_factor","home_factor","away_factor","rookie_flag","updated_at","data_status"
+    ]).to_csv(SPLITS_CONTEXT_FILE, index=False)
+
+    # Current team context starts with the real completed-season team baseline.
+    team_context = load_json(PHASE6_TEAM_CONTEXT_FILE, {}) or load_json(TEAM_CONTEXT_FILE, {})
+    if isinstance(team_context, dict):
+        current_team_context = {}
+        for team, ctx in team_context.items():
+            if team not in NFL_TEAMS:
+                continue
+            item = dict(ctx) if isinstance(ctx, dict) else {}
+            item.update({"team": team, "source_season": NFL_LAST_SEASON, "current_season": current_season, "updated_at": now_iso()})
+            current_team_context[team] = item
+        save_json(CURRENT_TEAM_CONTEXT_FILE, current_team_context)
+        if not TEAM_CONTEXT_FILE.exists() or not load_json(TEAM_CONTEXT_FILE, {}):
+            save_json(TEAM_CONTEXT_FILE, team_context)
+
+    defense = _read_optional_csv(PHASE6_DEFENSE_RANK_FILE)
+    defense_map = {}
+    if not defense.empty and "team" in defense.columns:
+        defense_map = {str(r.get("team")): r.to_dict() for _, r in defense.iterrows()}
+
+    # 2026 schedule-based travel and matchup rows.
+    travel_rows, matchup_rows, personnel_rows = [], [], []
+    if schedules is not None and not schedules.empty:
+        if "season" in schedules.columns:
+            schedules = schedules[schedules["season"].astype(str).eq(str(current_season))].copy()
+        for _, g in schedules.iterrows():
+            away = str(g.get("away_team") or "").upper().strip()
+            home = str(g.get("home_team") or "").upper().strip()
+            if away not in NFL_TEAMS or home not in NFL_TEAMS:
+                continue
+            matchup = f"{away} @ {home}"
+            miles = great_circle_miles(away, home)
+            stadium_text = str(g.get("stadium") or "")
+            location_text = str(g.get("location") or "")
+            international = int(any(x in stadium_text.lower() for x in ["london","wembley","tottenham","munich","frankfurt","madrid","dublin","mexico","sao paulo","berlin"]))
+            neutral = int(location_text.lower() not in {"home","","nan"})
+            for team, opp, is_away in [(away, home, True), (home, away, False)]:
+                team_miles = miles if is_away else 0.0
+                rest = g.get("away_rest") if is_away else g.get("home_rest")
+                opp_rest = g.get("home_rest") if is_away else g.get("away_rest")
+                travel_rows.append({
+                    "team": team, "opp": opp, "matchup": matchup,
+                    "season": current_season, "week": g.get("week"),
+                    "game_date": g.get("gameday"), "travel_miles": team_miles,
+                    "rest_days": rest, "opp_rest_days": opp_rest,
+                    "timezone_shift": np.nan, "consecutive_road_games": np.nan,
+                    "international_game": international, "neutral_site": neutral,
+                    "body_clock_risk": "HIGH" if (team_miles or 0) >= 2000 else "MEDIUM" if (team_miles or 0) >= 1000 else "LOW",
+                    "divisional_game": g.get("div_game"), "rematch_game": np.nan,
+                    "stadium": stadium_text, "roof": g.get("roof"), "surface": g.get("surface"),
+                    "updated_at": now_iso(),
+                })
+                opp_def = defense_map.get(opp, {})
+                match_row = {
+                    "team": team, "opp": opp, "matchup": matchup,
+                    "season": current_season, "week": g.get("week"),
+                    "pass_funnel": np.nan, "run_funnel": np.nan, "slot_weakness": np.nan,
+                    "te_weakness": np.nan, "rb_receiving_weakness": np.nan,
+                    "shadow_corner": "", "shadow_corner_grade": np.nan,
+                    "blitz_rate": opp_def.get("blitz_rate"), "man_rate": opp_def.get("man_rate"),
+                    "zone_rate": opp_def.get("zone_rate"),
+                    "qb_pass_protection_rank": np.nan,
+                    "opp_def_pressure_rank": opp_def.get("def_pressure_rank"),
+                    "def_pass_rank": opp_def.get("def_pass_rank"),
+                    "def_run_rank": opp_def.get("def_run_rank"),
+                    "def_role_rank": opp_def.get("def_role_rank"),
+                    "def_run_stop_rank": opp_def.get("def_run_stop_rank"),
+                    "updated_at": now_iso(),
+                }
+                matchup_rows.append(match_row)
+                personnel_rows.append({
+                    "team": team, "opp": opp, "matchup": matchup,
+                    "shadow_corner": "", "shadow_corner_grade": np.nan,
+                    "slot_weakness": np.nan, "te_weakness": np.nan,
+                    "rb_receiving_weakness": np.nan, "edge_rush_advantage": np.nan,
+                    "interior_run_stuffer_missing": np.nan,
+                    "updated_at": now_iso(), "data_status": "AWAITING_GAME_WEEK_PERSONNEL"
+                })
+    pd.DataFrame(travel_rows, columns=[
+        "team","opp","matchup","season","week","game_date","travel_miles","rest_days",
+        "opp_rest_days","timezone_shift","consecutive_road_games","international_game",
+        "neutral_site","body_clock_risk","divisional_game","rematch_game","stadium","roof",
+        "surface","updated_at"
+    ]).to_csv(TRAVEL_CONTEXT_FILE, index=False)
+    pd.DataFrame(matchup_rows, columns=[
+        "team","opp","matchup","season","week","pass_funnel","run_funnel","slot_weakness",
+        "te_weakness","rb_receiving_weakness","shadow_corner","shadow_corner_grade","blitz_rate",
+        "man_rate","zone_rate","qb_pass_protection_rank","opp_def_pressure_rank","def_pass_rank",
+        "def_run_rank","def_role_rank","def_run_stop_rank","updated_at"
+    ]).to_csv(MATCHUP_CONTEXT_FILE, index=False)
+    pd.DataFrame(personnel_rows, columns=[
+        "team","opp","matchup","shadow_corner","shadow_corner_grade","slot_weakness",
+        "te_weakness","rb_receiving_weakness","edge_rush_advantage",
+        "interior_run_stuffer_missing","updated_at","data_status"
+    ]).to_csv(PERSONNEL_CONTEXT_FILE, index=False)
+
+    # Live/slate-day hooks: exact schemas, intentionally not filled with guessed values.
+    _write_csv_template(MARKET_CONTEXT_FILE, [
+        "player","team","prop","consensus_line","best_line","open_line","close_line",
+        "market_prob_over","market_prob_under","market_books","line_move","updated_at"
+    ])
+    _write_json_template(WEATHER_FILE, {})
+    _write_json_template(DEF_INJURY_FILE, {})
+    _write_json_template(FINAL_INACTIVES_FILE, {})
+    _write_json_template(MANUAL_OVERRIDE_FILE, {})
+    _write_json_template(API_CONFIG_FILE, {
+        "updated_at": now_iso(),
+        "note": "Add licensed/live injury, weather, and market endpoints here when available.",
+        "nflverse_player_stats": "stats_player release",
+        "nflverse_rosters": "rosters release",
+        "nflverse_depth_charts": "depth_charts release",
+    })
+
+    # Ensure optional Phase 6 files have visible schemas even when full PBP is disabled.
+    _write_csv_template(PHASE6_TEAM_ADVANCED_FILE, [
+        "team","plays_pg","pass_rate","rush_rate","pass_attempts_pg","rush_attempts_pg","source_season"
+    ])
+    _write_csv_template(PHASE6_TRENCH_FILE, [
+        "team","pressure_rate","sack_rate","stuff_rate","yards_before_contact","source_season"
+    ])
+    _write_csv_template(PHASE6_RED_ZONE_FILE, [
+        "team","player","red_zone_touch_share","red_zone_carries","red_zone_targets",
+        "red_zone_pass_attempts","goal_line_touches","source_season"
+    ])
+    _write_csv_template(PHASE6_OT_FILE, ["team","games","overtime_games","overtime_rate","source_season"])
+
+    result = {
+        "status": "CURRENT_DATA_FILES_READY",
+        "current_season": current_season,
+        "baseline_season": NFL_LAST_SEASON,
+        "roster_rows": int(len(roster)),
+        "depth_rows": int(len(depth)),
+        "current_usage_rows": int(len(current_usage)),
+        "schedule_rows": int(len(schedules)) if schedules is not None else 0,
+        "travel_rows": int(len(travel_rows)),
+        "matchup_rows": int(len(matchup_rows)),
+        "injury_rows": int(len(injuries)),
+        "live_hooks": [
+            MARKET_CONTEXT_FILE.name, WEATHER_FILE.name, DEF_INJURY_FILE.name,
+            FINAL_INACTIVES_FILE.name, MANUAL_OVERRIDE_FILE.name
+        ],
+        "updated_at": now_iso(),
+    }
+    request_log("CURRENT_DATA_BUILDER", "READY", result)
+    return result
 
 
 # ---------- optional real NFL data loaders ----------
@@ -6892,6 +7486,11 @@ def _context_file_status(path, kind):
 def _render_projection_data_admin():
     st.markdown("### Projection Data")
     st.caption("Fresh files here override last-season defaults without breaking startup.")
+    try:
+        boot = BUNDLED_REAL_DATA_BOOTSTRAP
+        st.caption(f"Verified bundled baseline: {boot.get('valid', 0)}/11 real data files available in active storage · {boot.get('installed', 0)} installed this startup.")
+    except Exception:
+        pass
     status=[
         _context_file_status(USAGE_FILE, "csv"),
         _context_file_status(CURRENT_USAGE_FILE, "csv"),
@@ -7048,7 +7647,7 @@ def _render_projection_data_admin():
 
 def _render_phase6_admin():
     st.markdown("### Admin: Phase 6 Database")
-    st.caption("Builds or repairs the missing player summary, defense ranks, team advanced, red-zone, overtime, usage, and team-context files. Saved files load automatically after the build.")
+    st.caption("One click downloads/builds the completed-season projection baseline plus current roster, depth chart, travel, matchup, QB, injury-hook, market-hook, and all app-ready CSV/JSON files. Saved files load automatically.")
     season_to_build = st.number_input("Last season to build", min_value=1999, max_value=2030, value=NFL_LAST_SEASON, step=1, key="phase6_admin_season")
     existing_ready = _phase6_existing_database_ready()
     st.metric("Saved database", "READY" if existing_ready else "NOT BUILT")
@@ -7056,6 +7655,12 @@ def _render_phase6_admin():
         st.json(load_json(PHASE6_MANIFEST_FILE, {}))
     if st.button("🛠️ Build / Repair Projection Database", use_container_width=True, key="phase6_use_saved_sidebar"):
         diag = build_phase6_nfl_database(int(season_to_build), force_refresh=False)
+        current_diag = build_current_season_data_files(NFL_CURRENT_SEASON, force_refresh=False)
+        diag["current_data"] = current_diag
+        try:
+            diag["export_zip"] = str(_phase6_export_database_zip())
+        except Exception as e:
+            diag["export_error"] = str(e)
         if diag.get("status") in ["BUILT_AND_SAVED", "USING_SAVED_DATABASE", "PULL_FAILED_USING_SAVED_DATABASE", "USING_SAVED_LOCAL_DATABASE", "USING_GITHUB_HARD_INPUT_DATABASE", "BUILT_AND_SAVED_PHASE6_V3"]:
             st.success(f"Phase 6 ready: {diag.get('status')}.")
         else:
@@ -7063,12 +7668,18 @@ def _render_phase6_admin():
         st.json(diag)
     if st.button("🌐 Force Refresh Projection Data", use_container_width=True, key="phase6_force_sidebar"):
         diag = build_phase6_nfl_database(int(season_to_build), force_refresh=True)
+        current_diag = build_current_season_data_files(NFL_CURRENT_SEASON, force_refresh=True)
+        diag["current_data"] = current_diag
+        try:
+            diag["export_zip"] = str(_phase6_export_database_zip())
+        except Exception as e:
+            diag["export_error"] = str(e)
         if diag.get("status") in ["BUILT_AND_SAVED", "PULL_FAILED_USING_SAVED_DATABASE", "BUILT_AND_SAVED_PHASE6_V3", "BUILT_PREVIOUS_SEASON_AND_SAVED_PHASE6_V3"]:
             st.success(f"Phase 6 refreshed/saved: {diag.get('status')}.")
         else:
             st.warning(f"Phase 6 database not built: {diag.get('status')}")
         st.json(diag)
-    zip_path = PHASE6_DIR / "phase6_nfl_database_export.zip"
+    zip_path = PHASE6_DIR / "nfl_full_data_pack_2026.zip"
     if st.button("Export Saved Database ZIP", use_container_width=True, key="phase6_export_sidebar"):
         try:
             zip_path = _phase6_export_database_zip()
@@ -7077,7 +7688,7 @@ def _render_phase6_admin():
             st.error(f"Export failed: {e}")
     if zip_path.exists():
         try:
-            st.download_button("⬇️ Download Complete Phase 6 Database ZIP", data=zip_path.read_bytes(), file_name="phase6_nfl_database_export.zip", mime="application/zip", use_container_width=True, key="phase6_download_zip_sidebar")
+            st.download_button("⬇️ Download Complete NFL Data Pack ZIP", data=zip_path.read_bytes(), file_name="nfl_full_data_pack_2026.zip", mime="application/zip", use_container_width=True, key="phase6_download_zip_sidebar")
         except Exception as e:
             st.warning(f"ZIP exists but could not be prepared for download: {e}")
     if USAGE_FILE.exists():
