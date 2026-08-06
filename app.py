@@ -3446,7 +3446,7 @@ def _normalize_roster_frame(roster):
     out["player_id"] = _series_from_candidates(
         roster, ["gsis_id","player_id","sleeper_id","espn_id","pfr_id"]
     ).fillna("").astype(str)
-    out = out[out["player"].ne("") & out["team"].isin(NFL_TEAMS)].copy()
+    out = out[out["player"].ne("") & out["team"].isin(NFL_TEAM_ABBRS)].copy()
     out["_name_key"] = out["player"].map(norm)
     out = out.drop_duplicates(["_name_key","team","position"], keep="last")
     return out.reset_index(drop=True)
@@ -3481,7 +3481,7 @@ def _normalize_depth_frame(depth, roster_norm):
             depth, ["depth_team","depth_rank","depth_chart_order","depth_chart_position","rank"], np.nan
         )
         base["depth_rank"] = pd.to_numeric(rank_raw, errors="coerce")
-        base = base[base["player"].ne("") & base["team"].isin(NFL_TEAMS)].copy()
+        base = base[base["player"].ne("") & base["team"].isin(NFL_TEAM_ABBRS)].copy()
 
     # Fill missing depth ranks within team/position. This is ordering metadata, not a projection.
     base["_name_key"] = base["player"].map(norm)
@@ -3683,7 +3683,7 @@ def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_ref
     if isinstance(team_context, dict):
         current_team_context = {}
         for team, ctx in team_context.items():
-            if team not in NFL_TEAMS:
+            if team not in NFL_TEAM_ABBRS:
                 continue
             item = dict(ctx) if isinstance(ctx, dict) else {}
             item.update({"team": team, "source_season": NFL_LAST_SEASON, "current_season": current_season, "updated_at": now_iso()})
@@ -3705,7 +3705,7 @@ def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_ref
         for _, g in schedules.iterrows():
             away = str(g.get("away_team") or "").upper().strip()
             home = str(g.get("home_team") or "").upper().strip()
-            if away not in NFL_TEAMS or home not in NFL_TEAMS:
+            if away not in NFL_TEAM_ABBRS or home not in NFL_TEAM_ABBRS:
                 continue
             matchup = f"{away} @ {home}"
             miles = great_circle_miles(away, home)
