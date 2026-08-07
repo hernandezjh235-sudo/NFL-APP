@@ -10,7 +10,7 @@ when no NFL prop feed is available, it shows clearly labeled preseason/demo exam
 the UI and workflow can be tested without confusing them as real bets.
 """
 
-import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile
+import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile, html
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -19,8 +19,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "FULL-MARKETS-NFL v7.0 — REAL DATA AUTOLOAD + ACCURACY + MOBILE"
-MODEL_VERSION = "nfl-prop-engine-v7.0.0"
+APP_VERSION = "FULL-MARKETS-NFL v7.4 — MAIN LINE + ENVIRONMENT + MOBILE IQ"
+MODEL_VERSION = "nfl-prop-engine-v7.4.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -171,6 +171,10 @@ def install_bundled_real_projection_data():
 BUNDLED_REAL_DATA_BOOTSTRAP = install_bundled_real_projection_data()
 
 UNDERDOG_URLS = [
+    # v6 supports sport_id filtering; try the NFL-only board first so refreshes are
+    # faster and the parser does not have to walk every sport on Underdog.
+    "https://api.underdogfantasy.com/beta/v6/over_under_lines?sport_id=nfl",
+    "https://api.underdogfantasy.com/beta/v6/over_under_lines?sport_id=NFL",
     "https://api.underdogfantasy.com/beta/v6/over_under_lines",
     "https://api.underdogfantasy.com/beta/v5/over_under_lines",
     "https://api.underdogfantasy.com/beta/v4/over_under_lines",
@@ -422,7 +426,7 @@ STADIUM_ENV.update({
     "SF": {"stadium":"Levi's Stadium", "crowd":"MODERATE", "noise":0.996, "surface":"Grass", "roof":"Outdoor", "altitude":0},
     "TB": {"stadium":"Raymond James Stadium", "crowd":"MODERATE", "noise":0.996, "surface":"Grass", "roof":"Outdoor", "altitude":0},
     "TEN": {"stadium":"Nissan Stadium", "crowd":"MODERATE", "noise":0.986, "surface":"Turf", "roof":"Outdoor", "altitude":0},
-    "WAS": {"stadium":"Northwest Stadium", "crowd":"MODERATE", "noise":0.988, "surface":"Grass", "roof":"Outdoor", "altitude":0},
+    "WSH": {"stadium":"Northwest Stadium", "crowd":"MODERATE", "noise":0.988, "surface":"Grass", "roof":"Outdoor", "altitude":0},
 })
 
 DEMO_BOARD = [
@@ -1136,6 +1140,7 @@ def official_rejection_reasons(p):
     if str(p.get("volatility")) == "HIGH": reasons.append("High volatility tax")
     if p.get("injury_risk") in ["HIGH", "EXTREME"]: reasons.append(f"Injury/role risk: {p.get('injury_risk')}")
     if safe_float(p.get("usage_quality"),100) < 68: reasons.append("Usage data/role quality too weak")
+    if p.get("model_fallback_used"): reasons.append("Player/stat model data fallback used")
     if p.get("defense_risk") == "HIGH" and prob < 0.66: reasons.append("Tough defensive role matchup")
     if safe_float(p.get("collapse_prob"),0) >= 0.24 and prob < 0.69: reasons.append("High collapse-branch risk")
     if p.get("game_script_risk") == "HIGH" and prob < 0.67: reasons.append("Game-script risk on non-elite edge")
@@ -1182,13 +1187,25 @@ def get_secret(key, default=""):
     try: return st.secrets[key]
     except Exception: return os.getenv(key, default)
 
-@st.cache_data(ttl=180, show_spinner=False)
-def safe_get_json(url):
+@st.cache_data(ttl=120, show_spinner=False)
+def safe_get_json(url, cache_bust=0):
     try:
-        r=requests.get(url,headers={"User-Agent":"Mozilla/5.0 NFLPropEngine/1.0","Accept":"application/json,*/*"},timeout=12)
+        headers={
+            "User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept":"application/json,text/plain,*/*",
+            "Cache-Control":"no-cache",
+            "Pragma":"no-cache",
+            "Referer":"https://underdogfantasy.com/",
+            "Origin":"https://underdogfantasy.com",
+        }
+        # cache_bust is part of the Streamlit cache key, so a manual refresh forces
+        # a real request without changing Underdog's endpoint URL.
+        r=requests.get(url,headers=headers,timeout=15)
         if r.status_code!=200:
-            request_log(url,f"HTTP {r.status_code}",r.text[:200]); return None
-        return r.json()
+            request_log(url,f"HTTP {r.status_code}",r.text[:240]); return None
+        data=r.json()
+        request_log(url,"HTTP 200",f"bytes={len(r.content)} refresh={cache_bust}")
+        return data
     except Exception as e:
         request_log(url,"REQUEST_ERROR",e); return None
 
@@ -1240,10 +1257,32 @@ def looks_nfl(item):
     # NFL props may not explicitly say NFL, so recognized NFL market names count too.
     return any(term in b for term in NFL_SPORT_TERMS) or prop_name_from_blob(b) is not None
 
+def _normalized_market_text(value):
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii").lower()
+    text = re.sub(r"[^a-z0-9+]+", " ", text)
+    return " ".join(text.split())
+
+def _market_alias_matches(text, alias):
+    text = _normalized_market_text(text)
+    alias = _normalized_market_text(alias)
+    if not text or not alias:
+        return False
+    # Very short aliases such as rec/int must be whole tokens.  Substring matching
+    # used to turn unrelated labels into the wrong market.
+    if len(alias) <= 4 and " " not in alias:
+        return bool(re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text))
+    return bool(re.search(rf"(?<![a-z0-9]){re.escape(alias)}(?![a-z0-9])", text))
+
 def prop_name_from_blob(blob):
-    b = str(blob or "").lower()
+    b = _normalized_market_text(blob)
+    # Match the longest/specific aliases first.  This prevents e.g.
+    # 'Longest Reception' from being routed to plain 'Receptions'.
+    candidates=[]
     for prop, aliases in NFL_PROP_ALIASES.items():
-        if any(alias in b for alias in aliases):
+        for alias in aliases:
+            candidates.append((len(_normalized_market_text(alias)), prop, alias))
+    for _, prop, alias in sorted(candidates, key=lambda x: x[0], reverse=True):
+        if _market_alias_matches(b, alias):
             return prop
     return None
 
@@ -1415,6 +1454,25 @@ def _canonical_matchup(value="", team="", opp="", home_away=""):
         if ha in {"AWAY", "A"}:
             return f"{team} @ {opp}"
         return f"{team} vs {opp}"
+    return ""
+
+
+def _infer_home_away_from_matchup(row):
+    """Infer HOME/AWAY from an oriented ``AWAY @ HOME`` matchup when the feed omits it."""
+    ha=str((row or {}).get("home_away") or "").strip().upper()
+    if ha in {"HOME","H"}:
+        return "HOME"
+    if ha in {"AWAY","A"}:
+        return "AWAY"
+    matchup=str((row or {}).get("matchup") or "")
+    if "@" not in matchup:
+        return ""
+    away, home=_teams_from_matchup_text(matchup)
+    team=_normalize_nfl_team((row or {}).get("team"))
+    if team and away and team==away:
+        return "AWAY"
+    if team and home and team==home:
+        return "HOME"
     return ""
 
 def _extract_team_pos(o, player, player_bank):
@@ -1616,15 +1674,20 @@ def _prop_from_objs(*objs):
 
 def _is_probably_nfl_underdog(*objs):
     b=" ".join(_blob(o) for o in objs if isinstance(o, dict))
-    if any(x in b for x in ["nfl", "football", "national football", "nfl_player"]):
+    has_nfl=any(x in b for x in ["nfl", "football", "national football", "nfl_player"])
+    if any(x in b for x in NON_NFL_BLOCK_TERMS) and not has_nfl:
+        return False
+    if has_nfl:
         return True
-    # If the market is football-specific and the related player has football-ish position/team, accept it.
+    # Without an explicit league tag, require a football market plus an NFL-style position/team.
     if prop_name_from_blob(b):
         for o in objs:
-            pos=str((o or {}).get("position") or (o or {}).get("pos") or "").upper() if isinstance(o, dict) else ""
-            if pos in ["QB","RB","WR","TE","K"]:
+            if not isinstance(o, dict):
+                continue
+            pos=str(o.get("position") or o.get("pos") or "").upper().strip()
+            team=_normalize_nfl_team(o.get("team") or o.get("team_abbr") or o.get("team_code"))
+            if pos in ["QB","RB","FB","WR","TE","K","PK"] or team:
                 return True
-        return True
     return False
 
 def _extract_matchup_v2(*objs):
@@ -1637,6 +1700,85 @@ def _extract_matchup_v2(*objs):
     if away and home and away != home:
         return f"{away} @ {home}"
     return ""
+
+def _extract_underdog_v6_flat_rows(data, source_url):
+    """Parse Underdog's current v6 flat board shape directly.
+
+    Current boards expose over_under_lines plus top-level players, appearances and
+    games.  Parsing that native shape first is much more reliable than recursively
+    guessing relationships from the entire payload.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("over_under_lines"), list):
+        return [], {"native_v6": False}
+    players={str(x.get("id")):x for x in data.get("players",[]) if isinstance(x,dict) and x.get("id") is not None}
+    appearances={str(x.get("id")):x for x in data.get("appearances",[]) if isinstance(x,dict) and x.get("id") is not None}
+    games={str(x.get("id")):x for x in data.get("games",[]) if isinstance(x,dict) and x.get("id") is not None}
+    teams={str(x.get("id")):x for x in data.get("teams",[]) if isinstance(x,dict) and x.get("id") is not None}
+    rows=[]; dropped=0
+    for line_obj in data.get("over_under_lines",[]):
+        if not isinstance(line_obj,dict):
+            continue
+        ou=line_obj.get("over_under") if isinstance(line_obj.get("over_under"),dict) else {}
+        stat=ou.get("appearance_stat") if isinstance(ou.get("appearance_stat"),dict) else {}
+        raw_label=stat.get("display_stat") or stat.get("stat") or stat.get("name") or ou.get("title") or line_obj.get("title") or ""
+        prop=_canon_prop_label(raw_label)
+        line=safe_float(line_obj.get("stat_value"))
+        if prop not in ACTIVE_NFL_MARKETS or line is None or not _valid_market_line(prop,line):
+            dropped+=1; continue
+        app_id=stat.get("appearance_id") or ou.get("appearance_id") or line_obj.get("appearance_id")
+        app=appearances.get(str(app_id),{}) if app_id is not None else {}
+        player_id=app.get("player_id") or stat.get("player_id") or ou.get("player_id")
+        player=players.get(str(player_id),{}) if player_id is not None else {}
+        name=str(player.get("display_name") or player.get("full_name") or player.get("name") or "").strip()
+        if not name:
+            first=str(player.get("first_name") or "").strip(); last=str(player.get("last_name") or "").strip()
+            name=f"{first} {last}".strip()
+        if not name:
+            # Modern line options usually include the selection header as a final fallback.
+            for opt in line_obj.get("options",[]) if isinstance(line_obj.get("options"),list) else []:
+                if isinstance(opt,dict) and str(opt.get("selection_header") or "").strip():
+                    name=str(opt.get("selection_header")).strip(); break
+        if not name:
+            dropped+=1; continue
+        match_id=app.get("match_id") or stat.get("match_id") or ou.get("match_id")
+        game=games.get(str(match_id),{}) if match_id is not None else {}
+        team_id=app.get("team_id") or player.get("team_id")
+        team_obj=teams.get(str(team_id),{}) if team_id is not None else {}
+        team=_normalize_nfl_team(
+            app.get("team_abbr") or player.get("team_abbr") or team_obj.get("abbr") or
+            team_obj.get("abbreviation") or app.get("team") or player.get("team")
+        )
+        position=str(app.get("position") or player.get("position") or player.get("position_abbr") or "").upper().strip()
+        matchup=_canonical_matchup(game.get("title") or game.get("matchup") or "")
+        mt1,mt2=_teams_from_matchup_text(matchup)
+        if not team:
+            # Phase 6 lookup below can recover team/position from the player name.
+            resolved=_resolve_model_player_strict(name,None,position)
+            if resolved:
+                team=_normalize_nfl_team(resolved.get("team")); position=position or str(resolved.get("position") or "").upper()
+                name=resolved.get("player") or name
+        opp=""
+        if team and mt1 and mt2:
+            opp=mt2 if mt1==team else mt1 if mt2==team else ""
+        options=line_obj.get("options",[]) if isinstance(line_obj.get("options"),list) else []
+        higher=next((o for o in options if isinstance(o,dict) and str(o.get("choice") or "").lower() in {"higher","over"}),{})
+        lower=next((o for o in options if isinstance(o,dict) and str(o.get("choice") or "").lower() in {"lower","under"}),{})
+        rows.append({
+            "player":name,"team":team,"opp":opp,"position":position,"prop":prop,"raw_prop_label":str(raw_label),
+            "line":float(line),"source":"Underdog","source_url":source_url,"matchup":matchup,
+            "event_id":str(match_id or game.get("id") or ""),"underdog_id":str(line_obj.get("id") or ""),
+            "odds":safe_float(higher.get("american_price"),-110) or -110,
+            "over_price":safe_float(higher.get("american_price")),"under_price":safe_float(lower.get("american_price")),
+            "over_multiplier":safe_float(higher.get("payout_multiplier")),"under_multiplier":safe_float(lower.get("payout_multiplier")),
+            "line_status":line_obj.get("status") or ou.get("status") or "",
+            "line_type":line_obj.get("line_type") or line_obj.get("type") or ou.get("type") or "",
+            "line_variant":line_obj.get("variant") or line_obj.get("line_variant") or ou.get("variant") or "",
+            "line_title":line_obj.get("title") or ou.get("title") or "",
+            "is_standard_line":bool(line_obj.get("is_standard") is True or line_obj.get("standard") is True or (safe_float(higher.get("payout_multiplier")) in [None,1.0] and safe_float(lower.get("payout_multiplier")) in [None,1.0])),
+            "is_alt_line":bool(line_obj.get("is_alternate") is True or line_obj.get("alternate") is True),
+            "scheduled_at":game.get("scheduled_at"),
+        })
+    return rows,{"native_v6":True,"native_rows":len(rows),"native_dropped":dropped,"players":len(players),"appearances":len(appearances),"games":len(games)}
 
 def _extract_underdog_jsonapi_rows(data, source_url):
     objects, by_id, by_type = _entity_maps_from_underdog(data)
@@ -1713,12 +1855,20 @@ def fetch_underdog_nfl_props(cache_bust=0):
     rows=[]
     endpoint_debug=[]
     for url in UNDERDOG_URLS:
-        data=safe_get_json(url)
+        data=safe_get_json(url, cache_bust)
         if not data:
             endpoint_debug.append({"url":url,"status":"NO_DATA","rows":0})
             continue
 
-        # New relationship-aware parser first.
+        # Parse the current native v6 shape first, then keep the relationship-aware
+        # and recursive fallbacks for older/alternate endpoint versions.
+        native_rows=[]; native_diag={}
+        try:
+            native_rows,native_diag=_extract_underdog_v6_flat_rows(data,url)
+        except Exception as e:
+            native_diag={"native_parser_error":str(e)[:220]}; native_rows=[]
+        rows.extend(native_rows)
+
         rel_rows=[]; rel_diag={}
         try:
             rel_rows, rel_diag = _extract_underdog_jsonapi_rows(data, url)
@@ -1763,8 +1913,8 @@ def fetch_underdog_nfl_props(cache_bust=0):
             })
         rows.extend(flat_rows)
 
-        url_rows=len(rel_rows)+len(flat_rows)
-        endpoint_debug.append({"url":url,"status":"OK","rows":url_rows,"relationship_rows":len(rel_rows),"flat_rows":len(flat_rows),**rel_diag})
+        url_rows=len(native_rows)+len(rel_rows)+len(flat_rows)
+        endpoint_debug.append({"url":url,"status":"OK","rows":url_rows,"native_rows":len(native_rows),"relationship_rows":len(rel_rows),"flat_rows":len(flat_rows),**native_diag,**rel_diag})
         if url_rows > 0:
             break
 
@@ -1790,7 +1940,7 @@ def fetch_underdog_nfl_moneylines(cache_bust=0):
     rows=[]; endpoint_debug=[]
     money_terms=["moneyline", "money line", "match winner", "game winner", "winner", "to win"]
     for url in UNDERDOG_URLS:
-        data=safe_get_json(url)
+        data=safe_get_json(url, cache_bust)
         if not data:
             endpoint_debug.append({"url":url,"status":"NO_DATA","rows":0}); continue
         objects=flatten(data); url_rows=0
@@ -1874,7 +2024,7 @@ def _canon_prop_label(value):
     raw = str(value or "").strip()
     if not raw:
         return None
-    b = norm(raw)
+    b = _normalized_market_text(raw)
     # Highest-confidence direct mappings first. Underdog uses labels like Pass Yards,
     # Rush + Rec TDs, Rec Yards, INT, etc. These must match the app markets exactly.
     manual_map = {
@@ -1919,40 +2069,94 @@ def _canon_prop_label(value):
     return prop_name_from_blob(b)
 
 
+
 def _phase6_player_lookup():
-    """Build a fuzzy player lookup from saved Phase 6/player usage files for manual imports.
+    """Build a current-first player identity lookup.
 
-    This lets pasted Underdog shorthand like 'J. Goff' resolve to 'Jared Goff' using
-    team + last name where possible, so the projection engine can match historical stats.
+    Current usage/depth chart wins over old 2025 metadata.  The lookup also creates
+    first-initial + last-name aliases so a live full name such as ``Bijan Robinson``
+    can match a historical row stored as ``B.Robinson`` without changing the live
+    player identity shown on the card.
     """
-    rows = []
-    for path in [USAGE_FILE, PHASE6_PLAYER_SUMMARY_FILE, PHASE6_PLAYER_LOG_FILE]:
-        try:
-            if Path(path).exists():
-                df = pd.read_csv(path, usecols=lambda c: str(c).lower() in ["player", "team", "position", "recent_team", "player_display_name"])
-                df.columns = [str(c).strip() for c in df.columns]
-                if "player_display_name" in df.columns and "player" not in df.columns:
-                    df["player"] = df["player_display_name"]
-                if "recent_team" in df.columns and "team" not in df.columns:
-                    df["team"] = df["recent_team"]
-                rows.extend(df[[c for c in ["player", "team", "position"] if c in df.columns]].dropna(subset=["player"]).to_dict("records"))
-        except Exception:
-            continue
-    exact, by_last = {}, {}
-    for r in rows:
-        player = str(r.get("player") or "").strip()
-        if not player:
-            continue
-        team = str(r.get("team") or "").upper().strip()
-        pos = str(r.get("position") or "").upper().strip()
-        meta = {"player": player, "team": team, "position": pos}
-        exact[norm(player)] = meta
-        parts = norm(player).split()
-        if parts:
-            last = parts[-1]
-            by_last.setdefault(last, []).append(meta)
-    return {"exact": exact, "by_last": by_last}
+    sources = [
+        (100, CURRENT_USAGE_FILE),
+        (95, DEPTH_CHART_FILE),
+        (85, PHASE6_PLAYER_SUMMARY_FILE),
+        (80, USAGE_FILE),
+        (60, PHASE6_PLAYER_LOG_FILE),
+    ]
+    exact, by_last, by_initial_last = {}, {}, {}
 
+    def _initial_last_key(player):
+        parts=norm(player).split()
+        if len(parts)<2:
+            return ""
+        first=re.sub(r"[^a-z]", "", parts[0])
+        last=re.sub(r"[^a-z0-9]", "", parts[-1])
+        return f"{first[:1]}|{last}" if first and last else ""
+
+    def _merge_meta(old, new):
+        if not old:
+            return dict(new)
+        # Higher priority controls team/position, but never replace useful current
+        # metadata with blanks from an older file.
+        if new.get("priority",0) >= old.get("priority",0):
+            merged=dict(old)
+            for k,v in new.items():
+                if v not in [None, "", "NAN", "NA"]:
+                    merged[k]=v
+            return merged
+        merged=dict(old)
+        for k in ["team","position"]:
+            if merged.get(k) in [None, "", "NAN", "NA"] and new.get(k) not in [None, "", "NAN", "NA"]:
+                merged[k]=new.get(k)
+        return merged
+
+    for priority, path in sources:
+        try:
+            if not Path(path).exists():
+                continue
+            df=pd.read_csv(path, usecols=lambda c: str(c).lower() in [
+                "player","name","team","position","pos","recent_team","player_display_name"
+            ])
+            df.columns=[str(c).strip() for c in df.columns]
+            if "player_display_name" in df.columns and "player" not in df.columns:
+                df["player"]=df["player_display_name"]
+            if "name" in df.columns and "player" not in df.columns:
+                df["player"]=df["name"]
+            if "recent_team" in df.columns and "team" not in df.columns:
+                df["team"]=df["recent_team"]
+            if "pos" in df.columns and "position" not in df.columns:
+                df["position"]=df["pos"]
+            for _,r in df.iterrows():
+                player=str(r.get("player") or "").strip()
+                if not player or player.lower()=="nan":
+                    continue
+                team=_normalize_nfl_team(r.get("team"))
+                pos=str(r.get("position") or "").upper().strip()
+                if pos in {"NAN","NONE"}: pos=""
+                meta={"player":player,"team":team,"position":pos,"priority":priority,"source":Path(path).name}
+                key=norm(player)
+                exact[key]=_merge_meta(exact.get(key),meta)
+                parts=key.split()
+                if parts:
+                    by_last.setdefault(parts[-1],[]).append(meta)
+                il=_initial_last_key(player)
+                if il:
+                    by_initial_last.setdefault(il,[]).append(meta)
+        except Exception as e:
+            request_log("PLAYER_LOOKUP", "READ_ERROR", f"{Path(path).name}: {str(e)[:160]}")
+
+    # Deduplicate candidate banks with current/high-priority metadata first.
+    for bank in [by_last, by_initial_last]:
+        for k,items in list(bank.items()):
+            seen=set(); clean=[]
+            for item in sorted(items,key=lambda x:x.get("priority",0),reverse=True):
+                sig=(norm(item.get("player")),item.get("team"),item.get("position"))
+                if sig in seen: continue
+                seen.add(sig); clean.append(item)
+            bank[k]=clean
+    return {"exact":exact,"by_last":by_last,"by_initial_last":by_initial_last}
 
 def _infer_team_from_matchup(matchup, player_team=None):
     txt = str(matchup or "").upper()
@@ -2011,65 +2215,54 @@ def _infer_position_from_prop_player(prop, player=None, team=None, position=None
 
 
 
+
 def _resolve_model_player_strict(player, team=None, position=None):
-    """Return a Phase-6/model player match or None.
+    """Resolve a live NFL player against current-first model metadata.
 
-    This is stricter than the manual resolver: live Underdog rows must match a
-    player already in our saved NFL model database. This prevents MLB/tennis/etc.
-    rows from slipping into the NFL prop board just because the market label
-    looked similar.
+    Full-name ↔ initial/last-name matching is supported, but only within the same
+    team/position when those identifiers are available.  This avoids silently
+    attaching another player's historical usage to a live Underdog line.
     """
-    lookup = _phase6_player_lookup()
+    lookup=_phase6_player_lookup()
     if not lookup.get("exact") and not lookup.get("by_last"):
-        # If the saved model database is not present, do not hard-block startup.
-        return {"player": str(player or "").strip(), "team": team or "NFL", "position": position or "", "model_match": False, "model_filter_disabled": True}
-
-    raw = str(player or "").strip()
-    if not raw:
-        return None
-    n = norm(raw)
-    team_u = str(team or "").upper().strip()
-    pos_u = str(position or "").upper().strip()
-
-    meta = lookup["exact"].get(n)
-
+        return {"player":str(player or "").strip(),"team":team or "NFL","position":position or "","model_match":False,"model_filter_disabled":True}
+    raw=str(player or "").strip()
+    if not raw: return None
+    n=norm(raw); parts=n.split(); team_u=_normalize_nfl_team(team); pos_u=str(position or "").upper().strip()
+    candidates=[]
+    exact=lookup.get("exact",{}).get(n)
+    if exact: candidates=[exact]
+    if not candidates and len(parts)>=2:
+        first=re.sub(r"[^a-z]","",parts[0]); last=re.sub(r"[^a-z0-9]","",parts[-1])
+        il=f"{first[:1]}|{last}" if first and last else ""
+        candidates=list(lookup.get("by_initial_last",{}).get(il,[]))
+        if not candidates:
+            candidates=list(lookup.get("by_last",{}).get(last,[]))
+    if candidates:
+        if team_u:
+            tm=[m for m in candidates if _normalize_nfl_team(m.get("team"))==team_u]
+            if tm: candidates=tm
+        if pos_u:
+            pm=[m for m in candidates if str(m.get("position") or "").upper()==pos_u]
+            if pm: candidates=pm
+        # Require initial agreement when more than one same-last-name player remains.
+        if len(candidates)>1 and parts:
+            ini=parts[0][:1]
+            same=[m for m in candidates if norm(m.get("player")).split() and norm(m.get("player")).split()[0][:1]==ini]
+            if same: candidates=same
+        candidates=sorted(candidates,key=lambda x:x.get("priority",0),reverse=True)
+        meta=candidates[0] if candidates else None
+    else:
+        meta=None
     if not meta:
-        parts = n.split()
-        # Handle initials from Underdog like J. Goff, P Mahomes, C McCaffrey.
-        if len(parts) >= 2 and (len(parts[0]) <= 2 or parts[0].endswith(".")):
-            last = parts[-1]
-            candidates = list(lookup["by_last"].get(last, []))
-            if team_u:
-                tm = [m for m in candidates if str(m.get("team", "")).upper() == team_u]
-                if tm:
-                    candidates = tm
-            if pos_u:
-                pm = [m for m in candidates if str(m.get("position", "")).upper() == pos_u]
-                if pm:
-                    candidates = pm
-            if len(candidates) == 1:
-                meta = candidates[0]
-            elif candidates:
-                meta = candidates[0]
-
-    if not meta:
-        # Conservative fuzzy match only for near-exact full names.
-        names = list(lookup["exact"].keys())
-        close = difflib.get_close_matches(n, names, n=1, cutoff=0.94)
-        if close:
-            meta = lookup["exact"].get(close[0])
-
-    if not meta:
-        return None
-
-    return {
-        "player": meta.get("player") or raw,
-        "team": meta.get("team") or team or "NFL",
-        "position": meta.get("position") or position or "",
-        "model_match": True,
-        "model_filter_disabled": False,
-    }
-
+        # Conservative near-exact fallback for punctuation/spacing differences only.
+        names=list(lookup.get("exact",{}).keys())
+        close=difflib.get_close_matches(n,names,n=1,cutoff=0.965)
+        meta=lookup.get("exact",{}).get(close[0]) if close else None
+    if not meta: return None
+    resolved_team=_normalize_nfl_team(meta.get("team")) or team_u
+    resolved_pos=str(meta.get("position") or pos_u or "").upper().strip()
+    return {"player":meta.get("player") or raw,"team":resolved_team or team or "NFL","position":resolved_pos,"model_match":True,"model_filter_disabled":False,"model_identity_source":meta.get("source")}
 
 def _prop_allowed_for_model_position(prop, position):
     """Validate every enabled prop against realistic NFL position groups."""
@@ -2195,26 +2388,60 @@ def _filter_live_board_to_phase6_model(rows):
     return clean
 
 
+
+def _line_variant_text(row):
+    vals=[row.get(k) for k in ["line_type","line_variant","line_title","line_status","raw_prop_label"]]
+    return " ".join(str(v or "") for v in vals).lower()
+
+def _line_is_explicit_alt(row):
+    txt=_line_variant_text(row)
+    return any(x in txt for x in ["alternate"," alt ","alt-line","alt line","goblin","demon","promo","boost","special","discount"])
+
+def _primary_line_score(row, median):
+    """Lower score = more likely to be Underdog's standard/main line."""
+    line=safe_float(row.get("line"),0) or 0
+    status=str(row.get("line_status") or "").lower()
+    closed=1 if any(x in status for x in ["closed","suspend","inactive","settled"]) else 0
+    explicit_alt=1 if _line_is_explicit_alt(row) or row.get("is_alt_line") is True else 0
+    explicit_standard=0 if row.get("is_standard_line") is True else 1
+    om=safe_float(row.get("over_multiplier")); um=safe_float(row.get("under_multiplier"))
+    if om is not None or um is not None:
+        mult_dev=sum(abs(x-1.0) for x in [om,um] if x is not None)
+    else:
+        mult_dev=0.35
+    op=safe_float(row.get("over_price")); up=safe_float(row.get("under_price"))
+    price_dev=(abs(op+110)+abs(up+110))/400 if op is not None and up is not None else 0.25
+    central=abs(line-median)/max(1.0,abs(median))
+    return (closed, explicit_alt, explicit_standard, round(mult_dev,5), round(price_dev,5), round(central,5), str(row.get("underdog_id") or ""))
+
+
 def _select_primary_market_lines(rows):
-    """Keep one central/primary line per player, prop, and event to avoid projecting full alt ladders."""
-    groups = {}
+    """Keep Underdog's most likely standard/main line per player + prop + event.
+
+    Standard/default option metadata is preferred over alternate/promo lines. Median
+    is only a final tie-breaker, so an alt ladder can no longer silently become the
+    app's official line merely because it sits in the middle numerically.
+    """
+    groups={}
     for row in rows or []:
-        r = dict(row or {})
-        event = str(r.get("event_id") or r.get("game_id") or r.get("match_id") or r.get("matchup") or r.get("team") or "")
-        key = (event, norm(r.get("player")), str(r.get("prop") or ""))
-        groups.setdefault(key, []).append(r)
-    selected = []
+        r=dict(row or {})
+        event=str(r.get("event_id") or r.get("game_id") or r.get("match_id") or r.get("matchup") or r.get("team") or "")
+        key=(event,norm(r.get("player")),str(r.get("prop") or ""))
+        groups.setdefault(key,[]).append(r)
+    selected=[]
     for group in groups.values():
-        valid = [r for r in group if safe_float(r.get("line")) is not None]
-        if not valid:
-            continue
-        lines = sorted(float(r.get("line")) for r in valid)
-        median = lines[len(lines)//2]
-        # Prefer the central line; then prefer a neutral/default payout object.
-        best = min(valid, key=lambda r: (abs(float(r.get("line"))-median), 0 if r.get("price") in [None, "", 1, 1.0] else 1, str(r.get("underdog_id") or "")))
+        valid=[r for r in group if safe_float(r.get("line")) is not None]
+        if not valid: continue
+        lines=sorted(float(r.get("line")) for r in valid)
+        median=float(np.median(lines))
+        non_alt=[r for r in valid if not _line_is_explicit_alt(r) and r.get("is_alt_line") is not True]
+        pool=non_alt or valid
+        best=min(pool,key=lambda r:_primary_line_score(r,median))
+        best=dict(best); best["primary_line_selected"]=True
+        best["line_selection_reason"]="standard/default metadata" if pool is non_alt and len(valid)>1 else "single/central valid line"
+        best["alt_line_count"]=max(0,len(valid)-1)
         selected.append(best)
     return selected
-
 
 def _projection_context_signature():
     paths = [
@@ -3866,6 +4093,39 @@ def _records_by_player(path):
 def load_current_usage_bank():
     return _records_by_player(CURRENT_USAGE_FILE)
 
+
+def _lookup_player_record(bank, player, team=None, position=None):
+    """Lookup exact or first-initial/last-name record from a player-keyed bank."""
+    if not isinstance(bank,dict) or not bank:
+        return {}
+    n=norm(player)
+    if n in bank:
+        return dict(bank[n] or {})
+    parts=n.split()
+    if len(parts)<2:
+        return {}
+    wanted_last=parts[-1]; wanted_initial=parts[0][:1]
+    team_u=_normalize_nfl_team(team); pos_u=str(position or "").upper().strip()
+    candidates=[]
+    for k,v in bank.items():
+        kp=str(k).split()
+        if len(kp)<2 or kp[-1] != wanted_last or kp[0][:1] != wanted_initial:
+            continue
+        d=dict(v or {})
+        score=0
+        dteam=_normalize_nfl_team(d.get("team") or d.get("recent_team"))
+        dpos=str(d.get("position") or d.get("pos") or "").upper().strip()
+        if team_u and dteam==team_u: score+=3
+        if pos_u and dpos==pos_u: score+=2
+        candidates.append((score,d))
+    if not candidates:
+        return {}
+    candidates.sort(key=lambda x:x[0],reverse=True)
+    # If ambiguous and no team/position tie-breaker, don't guess.
+    if len(candidates)>1 and candidates[0][0]==candidates[1][0] and candidates[0][0]==0:
+        return {}
+    return candidates[0][1]
+
 def load_depth_chart_bank():
     """Optional depth-chart/role file.
 
@@ -4541,12 +4801,28 @@ def load_injury_bank():
     return data if isinstance(data,dict) else {}
 
 def merge_nfl_context(row):
-    """Attach real usage/team/injury context when local files exist. Missing data stays neutral."""
+    """Attach real usage/team/injury context without ever changing the market identity.
+
+    Supplemental files may contain generic rows such as prop=ALL.  Those values are
+    context only and must never overwrite the live Underdog prop/line.
+    """
     row=dict(row or {})
+    original_identity={k:row.get(k) for k in [
+        "player","prop","line","source","underdog_id","event_id","game_id","match_id",
+        "team","opp","position","matchup","home_away"
+    ]}
+    original_prop=_canon_prop_label(original_identity.get("prop"))
+    if original_prop not in ACTIVE_NFL_MARKETS:
+        raise ValueError(f"Unsupported/unmapped NFL prop: {original_identity.get('prop')!r}")
+    original_line=safe_float(original_identity.get("line"))
+    if original_line is None or not _valid_market_line(original_prop, original_line):
+        raise ValueError(f"Invalid {original_prop} line: {original_identity.get('line')!r}")
+    row["prop"]=original_prop
+    row["line"]=float(original_line)
     usage_bank = load_usage_bank()
     current_usage_bank = load_current_usage_bank()
-    usage=usage_bank.get(norm(row.get("player")), {})
-    current_usage=current_usage_bank.get(norm(row.get("player")), {})
+    usage=_lookup_player_record(usage_bank,row.get("player"),row.get("team"),row.get("position"))
+    current_usage=_lookup_player_record(current_usage_bank,row.get("player"),row.get("team"),row.get("position"))
     # Passing/Receiving yards need model context even when live Underdog object only has player+line.
     if row.get("prop") == "Passing Yards":
         row = enrich_passing_yards_context(row)
@@ -4657,7 +4933,7 @@ def merge_nfl_context(row):
         if v not in [None, ""]:
             row[k]=v
 
-    depth=load_depth_chart_bank().get(norm(row.get("player")), {})
+    depth=_lookup_player_record(load_depth_chart_bank(),row.get("player"),row.get("team"),row.get("position"))
     for k,v in depth.items():
         if v not in [None, ""]:
             row[k]=v
@@ -4717,18 +4993,49 @@ def merge_nfl_context(row):
     splits=_lookup_player_prop_context(load_splits_context_bank(), row)
     for k,v in splits.items():
         if v not in [None, ""]:
-            row[f"split_{k}" if k not in ["player","prop","team"] else k]=v
+            # player/prop/team are lookup identifiers, not projection inputs.
+            # In particular the generic split file uses prop=ALL.
+            if k in ["player","prop","team"]:
+                continue
+            row[f"split_{k}"]=v
             row["has_splits_context"] = True
 
     personnel=_lookup_pair_context(load_personnel_context_bank(), row)
     for k,v in personnel.items():
         if v not in [None, ""]:
-            row[f"personnel_{k}" if k not in ["team","opp","matchup"] else k]=v
+            # Never let supplemental context replace live team/opponent/matchup identity.
+            row[f"personnel_{k}"]=v
             row["has_personnel_context"] = True
     manual_override=_lookup_manual_override(row)
     for k,v in manual_override.items():
         if v not in [None, ""]:
             row[k]=v
+
+    # FINAL MARKET-ID LOCK. Context is allowed to fill missing team/position/opponent,
+    # but never to mutate player, prop, line, source, or feed IDs.
+    for k in ["player","source","underdog_id","event_id","game_id","match_id"]:
+        if original_identity.get(k) not in [None, ""]:
+            row[k]=original_identity.get(k)
+    row["prop"]=original_prop
+    row["line"]=float(original_line)
+    original_team=_normalize_nfl_team(original_identity.get("team"))
+    if original_team:
+        row["team"]=original_team
+    original_opp=_normalize_nfl_team(original_identity.get("opp"))
+    if original_opp:
+        row["opp"]=original_opp
+    if str(original_identity.get("position") or "").strip():
+        row["position"]=str(original_identity.get("position") or "").upper().strip()
+    original_matchup=_canonical_matchup(original_identity.get("matchup"), row.get("team"), row.get("opp"), original_identity.get("home_away"))
+    if original_matchup:
+        row["matchup"]=original_matchup
+    # Modern Underdog rows often omit home_away even when matchup is oriented.
+    # Infer it here so stadium, crowd-noise, travel, home/road splits, and weather
+    # all use the correct venue instead of assuming every unknown row is away.
+    inferred_ha=_infer_home_away_from_matchup(row)
+    if inferred_ha:
+        row["home_away"]=inferred_ha
+    row["market_identity_locked"]=True
     return row
 
 def apply_real_usage_to_role(row, role):
@@ -5189,16 +5496,25 @@ def player_role_defaults(position, prop):
     return role
 
 def environment_for(row):
-    team=row.get("team",""); opp=row.get("opp",""); home_away=(row.get("home_away") or "").upper()
-    home_team = team if home_away=="HOME" else (opp if opp else team)
-    env=STADIUM_ENV.get(home_team, {"stadium":"Unknown Stadium","crowd":"MODERATE","noise":1.0,"surface":"Unknown","roof":"Unknown","altitude":0})
+    team=_normalize_nfl_team(row.get("team")); opp=_normalize_nfl_team(row.get("opp"))
+    home_away=_infer_home_away_from_matchup(row)
+    # Prefer the oriented matchup itself for venue identity when available.
+    away_team, matchup_home=_teams_from_matchup_text(row.get("matchup")) if "@" in str(row.get("matchup") or "") else ("","")
+    home_team = matchup_home or (team if home_away=="HOME" else opp if home_away=="AWAY" else team)
+    env=dict(STADIUM_ENV.get(home_team, {"stadium":"Unknown Stadium","crowd":"MODERATE","noise":1.0,"surface":"Unknown","roof":"Unknown","altitude":0}))
+    # Current schedule/travel context is more authoritative for stadium/roof/surface.
+    for key in ["stadium","roof","surface"]:
+        if row.get(key) not in [None,"","nan","NaN"]:
+            env[key]=row.get(key)
+    env["home_team"]=home_team
+    env["home_away"]=home_away
     return env
 
 def apply_environment(base, row, prop):
     env=environment_for(row)
     factor=1.0
     notes=[]
-    away=(row.get("home_away") or "").upper()=="AWAY"
+    away=env.get("home_away")=="AWAY"
     if away and env["crowd"] in ["LOUD","EXTREME"] and prop in ["Passing Yards","Passing TDs","Interceptions","Pass Attempts","Completions"]:
         factor*=env.get("noise",1.0); notes.append(f"Road crowd noise: {env['crowd']}")
     if env.get("roof") in ["Dome","Retractable"] and prop in ["Passing Yards","Receiving Yards","Receptions","Passing TDs","Pass Attempts","Completions","Longest Reception"]:
@@ -5395,7 +5711,9 @@ def empirical_values_for_row(row, prop):
     return _empirical_prop_bank().get((norm((row or {}).get("model_player_match") or (row or {}).get("player")),prop),[])
 
 XGB_FEATURE_KEYS = [
-    "projection", "line", "edge", "fair_prob", "data_score", "stability_score", "usage_quality",
+    # Keep the assist independent of sportsbook pricing. Projection is the rule-model
+    # output; line/edge/fair_prob are intentionally excluded to prevent market leakage.
+    "projection", "data_score", "stability_score", "usage_quality",
     "opportunity_score", "pace_factor", "vegas_factor", "game_script_factor", "matchup_factor",
     "blowout_prob", "collapse_prob", "ceiling_prob", "snap_share", "route_participation",
     "target_share", "air_yards_share", "red_zone_touch_share", "targets_pg", "receptions_pg",
@@ -5783,7 +6101,16 @@ def _historical_player_values(player, prop, max_games=18):
             return []
         df = pd.read_csv(PHASE6_PLAYER_LOG_FILE, usecols=list(dict.fromkeys(base_cols)))
         name_col = possible_name_cols[0]
-        g = df[df[name_col].map(norm) == norm(player)].copy()
+        player_norm=norm(player)
+        g = df[df[name_col].map(norm) == player_norm].copy()
+        if g.empty:
+            parts=player_norm.split()
+            if len(parts)>=2:
+                ini=parts[0][:1]; last=parts[-1]
+                def _same_initial_last(v):
+                    vp=norm(v).split()
+                    return len(vp)>=2 and vp[0][:1]==ini and vp[-1]==last
+                g=df[df[name_col].map(_same_initial_last)].copy()
         if g.empty:
             return []
         if "week" in g.columns:
@@ -5826,7 +6153,7 @@ def opponent_adjusted_recent_context(row, prop):
         if baseline and baseline > 0:
             break
     if not baseline:
-        baseline=safe_float((row or {}).get("line"), recent_mean) or recent_mean
+        baseline=recent_mean
     recent_ratio=clamp(recent_mean/max(1.0, baseline), 0.84, 1.16)
 
     rank_key="def_pass_rank" if prop == "Passing Yards" else "def_run_rank" if prop == "Rushing Yards" else "def_role_rank"
@@ -6000,8 +6327,7 @@ def passing_yards_stat_projection(row, role, cfg):
     - opponent pass defense rank
     - spread / total / stadium/weather
 
-    This replaces line-driven projection behavior for Passing Yards so the model
-    projects from football inputs first, then only lightly checks the market line.
+    The sportsbook line is not used to create the raw projection. It is compared only after simulation to determine OVER/UNDER.
     """
     row = enrich_passing_yards_context(dict(row or {}))
     notes = []
@@ -6033,7 +6359,7 @@ def passing_yards_stat_projection(row, role, cfg):
     if player_ypg is None or player_ypg <= 0:
         # Fallback is intentionally near market but not equal to market; this prevents
         # blind 300+ projections when historical data is missing.
-        player_ypg = (line * 0.96) if line and _valid_market_line("Passing Yards", line) else cfg.get("base", 235)
+        player_ypg = cfg.get("base", 235)
         notes.append("QB pass yards fallback used")
     current_games=safe_float(row.get("current_games"), 0) or 0
     cur_ypg=safe_float(row.get("current_passing_yards_pg"))
@@ -6114,14 +6440,9 @@ def passing_yards_stat_projection(row, role, cfg):
     history_model = player_ypg * total_factor * stadium_factor * matchup_factor * pressure_factor
     projection = (history_model * 0.55) + (attempt_model * 0.45)
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Passing Yards", consensus):
-        projection=(projection*0.84)+(consensus*0.16)
-        notes.append("Market consensus blend active")
 
     # A final realism guard before market sanity. Passing yards game projections
     # generally should not be extreme unless the live line/team context justifies it.
-    if line is not None and _valid_market_line("Passing Yards", line):
-        projection = clamp(projection, line - 42, line + 42)
     projection = clamp(projection, 90, 390)
 
     breakdown = {
@@ -6184,7 +6505,7 @@ def receiving_yards_stat_projection(row, role, cfg):
             targets_pg = 7.2 if pos=="WR" else 5.4 if pos=="TE" else 3.8
             notes.append("Targets fallback used")
     if rec_ypg is None or rec_ypg <= 0:
-        rec_ypg = (line * 0.96) if line and _valid_market_line("Receiving Yards", line) else cfg.get("base", 52)
+        rec_ypg = cfg.get("base", 52)
         notes.append("Receiving yards fallback used")
     current_games=safe_float(row.get("current_games"), 0) or 0
     cur_rec_ypg=safe_float(row.get("current_receiving_yards_pg"))
@@ -6251,11 +6572,6 @@ def receiving_yards_stat_projection(row, role, cfg):
     history_model=rec_ypg * script_factor * total_factor * stadium_factor * matchup_factor * coverage_factor
     projection=(history_model*0.58)+(target_model*0.42)
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Receiving Yards", consensus):
-        projection=(projection*0.82)+(consensus*0.18)
-        notes.append("Market consensus blend active")
-    if line is not None and _valid_market_line("Receiving Yards", line):
-        projection=clamp(projection, line-32, line+32)
     projection=clamp(projection, 4, 185)
     breakdown={
         "player_rec_ypg": round(rec_ypg,2),
@@ -6300,7 +6616,7 @@ def rushing_yards_stat_projection(row, role, cfg):
         carries_pg=(team_plays*rush_rate/100.0)*(carry_share/100.0)
         notes.append("Carries estimated from team rush rate and carry share")
     if rush_ypg is None or rush_ypg <= 0:
-        rush_ypg=(line*0.96) if line and _valid_market_line("Rushing Yards", line) else cfg.get("base",49)
+        rush_ypg=cfg.get("base",49)
         notes.append("Rushing yards fallback used")
     if current_games >= 2 and cur_ypg and cur_ypg > 0:
         blend=0.25 if current_games < 5 else 0.38
@@ -6350,10 +6666,6 @@ def rushing_yards_stat_projection(row, role, cfg):
         weather_factor*=1.01; notes.append("Weather rush-volume nudge")
     projection=(rush_ypg*0.54 + expected_carries*ypc*0.46)*script_factor*total_factor*matchup_factor*trench_factor*weather_factor
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Rushing Yards", consensus):
-        projection=(projection*0.82)+(consensus*0.18); notes.append("Market consensus blend active")
-    if line is not None and _valid_market_line("Rushing Yards", line):
-        projection=clamp(projection,line-26,line+26)
     projection=clamp(projection,1,175)
     breakdown={
         "player_rush_ypg": round(rush_ypg,2),
@@ -6378,8 +6690,8 @@ def pass_attempts_stat_projection(row, role, cfg):
     team_plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
     pass_rate=safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"), 56)) or 56
     if att_pg is None or att_pg <= 0:
-        att_pg=(line*0.96) if line and _valid_market_line("Pass Attempts", line) else cfg.get("base", 33.5)
-        notes.append("Pass attempts fallback anchored to market/default")
+        att_pg=cfg.get("base", 33.5)
+        notes.append("Pass attempts model-data fallback used")
     projected_dropbacks=team_plays*pass_rate/100.0
     spread=safe_float(row.get("spread"),0) or 0
     total=safe_float(row.get("game_total"),44) or 44
@@ -6392,10 +6704,6 @@ def pass_attempts_stat_projection(row, role, cfg):
         pressure_factor*=0.985; notes.append("Strong pressure can reduce attempts/completion rhythm")
     projection=(att_pg*0.52 + projected_dropbacks*0.48)*script_factor*total_factor*pace_factor*pressure_factor
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Pass Attempts", consensus):
-        projection=(projection*0.80)+(consensus*0.20); notes.append("Market consensus blend active")
-    if line is not None and _valid_market_line("Pass Attempts", line):
-        projection=clamp(projection,line-8,line+8)
     projection=clamp(projection,5,62)
     breakdown={"pass_attempts_pg":round(att_pg,2),"projected_dropbacks":round(projected_dropbacks,2),"team_pass_rate":round(pass_rate,2),"team_plays_pg":round(team_plays,2),"script_factor":round(script_factor,3),"total_factor":round(total_factor,3),"pace_factor":round(pace_factor,3),"pressure_factor":round(pressure_factor,3)}
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
@@ -6406,7 +6714,7 @@ def completions_stat_projection(row, role, cfg):
     comp_pg=safe_float(row.get("current_completions_pg"), safe_float(row.get("completions_pg")))
     attempts=safe_float(row.get("current_pass_attempts_pg"), safe_float(row.get("last5_pass_attempts_pg"), safe_float(row.get("pass_attempts_pg"))))
     if attempts is None or attempts <= 0:
-        attempts=(safe_float(row.get("market_consensus_line")) or line or 33.5) * 1.45 if line else 33.5
+        attempts=33.5
     completion_rate=safe_float(row.get("completion_rate"), safe_float(row.get("qb_completion_rate")))
     if completion_rate is None:
         if comp_pg and attempts:
@@ -6428,10 +6736,6 @@ def completions_stat_projection(row, role, cfg):
     if comp_pg and comp_pg > 0:
         projection=(projection*0.65)+(comp_pg*0.35)
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Completions", consensus):
-        projection=(projection*0.80)+(consensus*0.20); notes.append("Market consensus blend active")
-    if line is not None and _valid_market_line("Completions", line):
-        projection=clamp(projection,line-6,line+6)
     projection=clamp(projection,2,45)
     breakdown={"projected_attempts":round(pass_att_base,2),"completion_rate":round(completion_rate,2),"rate_factor":round(rate_factor,3),"completions_pg":None if comp_pg is None else round(comp_pg,2),"attempt_model":pass_att_info.get("breakdown",{})}
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
@@ -6442,8 +6746,8 @@ def receptions_stat_projection(row, role, cfg):
     rec_pg=safe_float(row.get("current_receptions_pg"), safe_float(row.get("last5_receptions_pg"), safe_float(row.get("receptions_pg"))))
     targets_pg=safe_float(row.get("current_targets_pg"), safe_float(row.get("last5_targets_pg"), safe_float(row.get("targets_pg"))))
     if targets_pg is None or targets_pg <= 0:
-        targets_pg=(line*1.55) if line and _valid_market_line("Receptions", line) else 6.2
-        notes.append("Targets fallback anchored to reception line/default")
+        targets_pg=6.2
+        notes.append("Targets model-data fallback used")
     catch_rate=safe_float(row.get("catch_rate"), safe_float(row.get("reception_rate")))
     if catch_rate is None:
         catch_rate=100*rec_pg/max(1,targets_pg) if rec_pg and targets_pg else (69 if str(row.get("position") or "").upper()=="TE" else 64)
@@ -6462,10 +6766,6 @@ def receptions_stat_projection(row, role, cfg):
     if rec_pg and rec_pg > 0:
         projection=(projection*0.62)+(rec_pg*0.38)
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Receptions", consensus):
-        projection=(projection*0.80)+(consensus*0.20); notes.append("Market consensus blend active")
-    if line is not None and _valid_market_line("Receptions", line):
-        projection=clamp(projection,line-2.5,line+2.5)
     projection=clamp(projection,0,16)
     breakdown={"receptions_pg":None if rec_pg is None else round(rec_pg,2),"targets_pg":round(targets_pg,2),"catch_rate":round(catch_rate,2),"role_factor":round(role_factor,3),"qb_factor":round(qb_factor,3),"matchup_factor":round(matchup_factor,3)}
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
@@ -6475,8 +6775,8 @@ def rush_attempts_stat_projection(row, role, cfg):
     line=safe_float(row.get("line"))
     carries_pg=safe_float(row.get("current_rush_attempts_pg"), safe_float(row.get("last5_rush_attempts_pg"), safe_float(row.get("rush_attempts_pg"))))
     if carries_pg is None or carries_pg <= 0:
-        carries_pg=(line*0.96) if line and _valid_market_line("Rush Attempts", line) else cfg.get("base",13.5)
-        notes.append("Rush attempts fallback anchored to market/default")
+        carries_pg=cfg.get("base",13.5)
+        notes.append("Rush attempts model-data fallback used")
     team_plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
     rush_rate=safe_float(row.get("pbp_rush_rate"), safe_float(row.get("rush_rate"), 44)) or 44
     carry_share=safe_float(row.get("carries_share"), role.get("carry",35)) or role.get("carry",35)
@@ -6490,50 +6790,43 @@ def rush_attempts_stat_projection(row, role, cfg):
         script_factor*=0.94
     projection=(carries_pg*0.58 + expected_team_rushes*(carry_share/100.0)*0.42)*script_factor*(1+min(0.04, blowout*0.06))
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-    if consensus is not None and _valid_market_line("Rush Attempts", consensus):
-        projection=(projection*0.80)+(consensus*0.20); notes.append("Market consensus blend active")
-    if line is not None and _valid_market_line("Rush Attempts", line):
-        projection=clamp(projection,line-5,line+5)
     projection=clamp(projection,0,38)
     breakdown={"rush_attempts_pg":round(carries_pg,2),"expected_team_rushes":round(expected_team_rushes,2),"carry_share":round(carry_share,2),"script_factor":round(script_factor,3)}
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
 
-def _market_line_sanity_projection(base, line, prop, source=None):
-    """Prevent early/live NFL markets from producing unrealistic high edges.
 
-    The model still uses opportunity, matchup, weather, game script, Bayesian/ML, and
-    Monte Carlo, but after those layers it is re-anchored to the actual Underdog line
-    and capped by market-specific realistic edge bands. This is important before we
-    have enough graded NFL prop samples.
+def _market_line_sanity_projection(base, line, prop, source=None):
+    """Projection-integrity guard.
+
+    The sportsbook line is *not* an input to the raw projection.  It is used only
+    after simulation to decide OVER/UNDER and for market diagnostics.  This guard
+    only applies absolute football-realism bounds, never line-relative anchoring.
     """
-    line = safe_float(line)
-    base = safe_float(base, 0.0) or 0.0
-    if line is None or prop not in ACTIVE_NFL_MARKETS or line <= 0:
-        return base, {"active": False, "note": "No active market line cap"}
-    # Stronger anchor for live/manual lines while NFL learning is still warming up.
-    # Passing Yards has its own stat model, so keep it less market-forced.
-    if prop == "Passing Yards":
-        anchored = (base * 0.70) + (float(line) * 0.30)
-    elif prop == "Receiving Yards":
-        anchored = (base * 0.62) + (float(line) * 0.38)
-    elif prop == "Rushing Yards":
-        anchored = (base * 0.64) + (float(line) * 0.36)
-    else:
-        anchored = (base * 0.48) + (float(line) * 0.52)
-    cap = PROJECTION_EDGE_CAPS.get(prop, max(8.0, float(line) * 0.18))
-    capped = clamp(anchored, float(line) - cap, float(line) + cap)
-    return float(capped), {
-        "active": abs(capped - base) >= 0.01,
-        "raw_before_cap": round(base, 3),
-        "anchored": round(anchored, 3),
-        "cap": cap,
-        "note": f"{prop} line sanity anchor/cap active"
+    base=safe_float(base,0.0) or 0.0
+    bounds={
+        "Passing Yards":(45,430),"Passing TDs":(0.02,4.8),"Interceptions":(0.02,2.8),
+        "Pass Attempts":(4,62),"Completions":(1,45),"Rushing Yards":(0,190),
+        "Rush Attempts":(0,40),"Receiving Yards":(0,205),"Receptions":(0,17),
+        "Fantasy Points":(0,55),"Anytime TD":(0.01,0.95),"Longest Reception":(1,100),
+        "Longest Rush":(1,85),"Kicking Points":(0,24),"Field Goals Made":(0,5.5),
+        "Tackles + Assists":(0,20),"Sacks":(0,3.5),
     }
+    lo,hi=bounds.get(prop,(0,999))
+    capped=float(clamp(base,lo,hi))
+    return capped,{"active":abs(capped-base)>=0.01,"raw_before_cap":round(base,3),"cap_bounds":[lo,hi],"note":f"{prop} absolute realism guard"}
 
 def project_row(row, sims=12000):
     row=merge_nfl_context(row)
-    prop=row.get("prop","Passing Yards")
-    cfg=PROP_CONFIG.get(prop, PROP_CONFIG["Passing Yards"])
+    prop=_canon_prop_label(row.get("prop"))
+    if prop not in ACTIVE_NFL_MARKETS or prop not in PROP_CONFIG:
+        raise ValueError(f"Projection blocked: unmapped prop {row.get('prop')!r}")
+    row["prop"]=prop
+    line_check=safe_float(row.get("line"))
+    if line_check is None or not _valid_market_line(prop, line_check):
+        raise ValueError(f"Projection blocked: invalid {prop} line {row.get('line')!r}")
+    if not _prop_allowed_for_model_position(prop, row.get("position")):
+        raise ValueError(f"Projection blocked: {prop} is not valid for position {row.get('position')!r}")
+    cfg=PROP_CONFIG[prop]
     role=player_role_defaults(row.get("position"),prop)
     role=apply_real_usage_to_role(row, role)
     role, current_week_role = current_week_role_engine(row, role, prop)
@@ -6625,17 +6918,9 @@ def project_row(row, sims=12000):
         # be filtered earlier, but this final guard prevents 3000+ yard cards.
         line = None
         row["line"] = None
-
-    # Market reference is secondary to the raw model. Fresh multi-book consensus can
-    # receive a small anchor; stale/single-book context never determines the projection.
+    # Market information is audit/confidence context only. The raw projection stays
+    # independent of the Underdog line so the line only determines OVER/UNDER afterward.
     market_intelligence=market_intelligence_engine(row, projection=base, line=line)
-    if line is not None and row.get("source")!="DEMO" and prop in ACTIVE_NFL_MARKETS:
-        base_line_weight={"Passing Yards":0.18,"Receiving Yards":0.22,"Rushing Yards":0.22,"Receptions":0.27,"Pass Attempts":0.25,"Completions":0.25,"Rush Attempts":0.27}.get(prop,0.32)
-        if market_intelligence.get("stale"): base_line_weight*=0.45
-        consensus=safe_float(market_intelligence.get("consensus"))
-        consensus_weight=safe_float(market_intelligence.get("anchor_weight"),0) or 0
-        line_weight=max(0.0,base_line_weight-consensus_weight*0.55)
-        base=base*(1-line_weight-consensus_weight) + line*line_weight + (consensus if consensus is not None else line)*consensus_weight
 
     xgb_info = {"enabled": bool(st.session_state.get("xgb_assist_enabled", False)), "status": "OFF"}
     if st.session_state.get("xgb_assist_enabled", False):
@@ -6665,10 +6950,13 @@ def project_row(row, sims=12000):
 
     mean=float(np.mean(sim)); p50=float(np.percentile(sim,50)); p75=float(np.percentile(sim,75)); p90=float(np.percentile(sim,90)); p10=float(np.percentile(sim,10))
     if line is None:
-        prob=None; side="NO LINE"; edge=None; ev=None; kelly=0.0
+        over=None; under=None; prob=None; side="NO LINE"; edge=None; ev=None; kelly=0.0
     else:
-        over=float(np.mean(sim>line)); under=1-over
-        side="OVER" if over>=under else "UNDER"
+        over=float(np.mean(sim>line)); under=float(np.mean(sim<line))
+        push=max(0.0, 1.0-over-under)
+        # For half-point NFL props pushes are normally zero.  If a whole-number market
+        # can push, compare the actual win probabilities instead of forcing an OVER.
+        side="OVER" if over>under else "UNDER" if under>over else "PASS"
         prob=max(over,under)
         edge=mean-line
         ev=expected_value(prob, safe_float(row.get("odds"), -110) or -110)
@@ -6704,6 +6992,12 @@ def project_row(row, sims=12000):
         score-=12
     if audit_preview.get("hard_blocks"):
         score-=18
+    model_fallback_used = any(
+        "fallback" in str(n).lower()
+        for n in (env_notes or [])
+    ) or row.get("model_match_status") == "NO_MODEL_MATCH"
+    if model_fallback_used:
+        score=min(score,74)
     score=int(clamp(score,0,99))
 
     line_delta=update_clv_snapshot(row.get("player"), prop, row.get("source"), line) if line is not None else None
@@ -6786,7 +7080,7 @@ def project_row(row, sims=12000):
 
     factor_stack={"role":round(role_factor,3),"current_week_role":round(current_role_factor,3),"game_env":round(game_factor,3),"defense":round(defense_factor,3),"offense_defense_rank":round(rank_factor,3),"opportunity":round(opportunity.get("factor",1.0),3),"pace":round(pace_factor,3),"vegas":round(vegas_factor,3),"script":round(script_factor,3),"blowout":round(blowout_factor,3),"advanced":round(advanced_factor,3),"splits_personnel":round(split_factor,3),"learning":round(learn,3),"calibration":round(cal_scale,3),"sigma":round(sigma,3),"line_sanity_active":bool(line_sanity_info.get("active"))}
     model_meta={"model_version":MODEL_VERSION,"app_version":APP_VERSION,"generated_at":now_iso(),"active_market_count":len(ACTIVE_NFL_MARKETS),"prop":prop,"source":row.get("source"),"context_layers":audit_preview.get("layers",{}),"staleness":context_staleness(row),"calibration_status":cal_status}
-    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"split_personnel_factor":round(split_factor,3),"split_personnel_context":split_context,"advanced_context":advanced_context,"offense_defense_rank_context":rank_context,"offense_defense_rank_factor":round(rank_factor,3),"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"rushing_yards_model":rushing_yards_model_info,"pass_attempts_model":pass_attempts_model_info,"completions_model":completions_model_info,"receptions_model":receptions_model_info,"rush_attempts_model":rush_attempts_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"factor_stack":factor_stack,"model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,"smart_calibration":smart_calibration,"role_bucket":current_week_role.get("role_bucket") or projection_role_bucket(row,role),"data_quality_bucket":projection_data_quality_bucket(row,usage_quality),"current_week_role":current_week_role,"market_intelligence":market_intelligence,"distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_preview.get("label"),"audit_score":audit_preview.get("score"),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"over_prob":None if over is None else round(over,3),"under_prob":None if under is None else round(under,3),"push_prob":None if line is None else round(push,3),"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"split_personnel_factor":round(split_factor,3),"split_personnel_context":split_context,"advanced_context":advanced_context,"offense_defense_rank_context":rank_context,"offense_defense_rank_factor":round(rank_factor,3),"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"rushing_yards_model":rushing_yards_model_info,"pass_attempts_model":pass_attempts_model_info,"completions_model":completions_model_info,"receptions_model":receptions_model_info,"rush_attempts_model":rush_attempts_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"factor_stack":factor_stack,"model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,"smart_calibration":smart_calibration,"role_bucket":current_week_role.get("role_bucket") or projection_role_bucket(row,role),"data_quality_bucket":projection_data_quality_bucket(row,usage_quality),"current_week_role":current_week_role,"market_intelligence":market_intelligence,"distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_preview.get("label"),"audit_score":audit_preview.get("score"),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"model_fallback_used":model_fallback_used,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     out["market_compare"]=_market_compare_text(out)
     out["recent_form"]=_recent_form_text(out)
     signal, action_tier, rejections = build_signal(out)
@@ -7053,6 +7347,33 @@ def build_learning_summary_df(results):
     summ["avg_abs_error"]=summ["avg_abs_error"].round(3)
     return summ.sort_values(["graded","avg_abs_error"], ascending=[False, True])
 
+
+st.markdown("""
+<style>
+.compact-prop-head,.compact-prop-row{display:grid;grid-template-columns:2.15fr 1.15fr .8fr .8fr 1.05fr 1fr;gap:14px;align-items:center}
+.compact-prop-head{padding:10px 14px;color:#72798b;font-size:11px;font-weight:850;letter-spacing:.12em;border-bottom:1px solid rgba(255,255,255,.08);background:#0c111c}
+.compact-prop-row{padding:15px 14px;border-bottom:1px solid rgba(255,255,255,.075);background:linear-gradient(180deg,rgba(12,18,29,.96),rgba(6,10,17,.96))}
+.compact-prop-row:hover{background:rgba(25,31,45,.96)}
+.compact-prop-row strong{display:block;color:#eef3ff;font-size:16px;line-height:1.15}.compact-prop-row span{display:block;color:#737d91;font-size:11px;margin-top:4px}
+.cp-player strong{font-size:18px}.cp-proj strong{color:#57e67b;font-size:25px;font-weight:500}.cp-edge strong{font-size:18px}.edge-pos strong{color:#55e778}.edge-neg strong{color:#ff5c56}
+.cp-pick strong{font-size:18px}.pick-over strong{color:#58e779}.pick-under strong{color:#4d8dff}.pick-pass strong{color:#efc759}.cp-over strong{font-size:13px;color:#9aa4b8}
+.cp-bar{height:8px;background:#202735;border-radius:999px;overflow:hidden;margin-top:7px}.cp-bar i{display:block;height:100%;background:linear-gradient(90deg,#4377e6,#57e67b);border-radius:999px}
+.prop-view-toolbar{margin:.25rem 0 1rem}
+@media(max-width:760px){
+ /* Keep the same six-column IQ-card language as the reference image on phones. */
+ .compact-prop-head,.compact-prop-row{grid-template-columns:1.75fr .92fr .70fr .72fr .92fr .90fr;gap:4px;min-width:0}
+ .compact-prop-head{display:grid;padding:8px 5px;font-size:8px;letter-spacing:.08em}
+ .compact-prop-row{padding:11px 5px;border-bottom:1px solid rgba(255,255,255,.075);border-radius:0;margin-bottom:0}
+ .compact-prop-row>div{min-width:0;overflow:hidden}
+ .compact-prop-row strong{font-size:11px;white-space:normal;overflow-wrap:anywhere}.compact-prop-row span{font-size:8px;margin-top:2px;white-space:normal}
+ .cp-player strong{font-size:13px}.cp-proj strong{font-size:19px}.cp-edge strong{font-size:12px}.cp-pick strong{font-size:13px}.cp-over strong{font-size:9px}
+ .cp-bar{height:6px;margin-top:4px}
+}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('\n<style>\n@media(max-width:760px){\n  .hero-panel .sub-title{display:none}\n  .hero-panel{padding:11px 12px!important}\n  .hero-panel .badge{font-size:9px!important;padding:3px 6px!important}\n  .kpi-sub{display:none}\n  .kpi-box{min-height:58px!important;padding:8px!important}\n  .compact-prop-row{background:#080d16!important}\n}\n</style>\n', unsafe_allow_html=True)
+
 # ---------- UI ----------
 POSITION_TAB_PROPS = {
     "QBs": ["All", "Passing Yards", "Passing TDs", "Interceptions", "Pass Attempts", "Completions", "Rushing Yards"],
@@ -7112,6 +7433,67 @@ def _render_prop_table(rows, title="Board"):
     lo=(int(page)-1)*page_size; hi=min(len(view), lo+page_size)
     st.caption(f"Showing {lo+1}-{hi} of {len(view)} rows")
     st.dataframe(view.iloc[lo:hi], use_container_width=True, hide_index=True, height=min(720, 42*(hi-lo+1)+38))
+
+def _fmt_num(v, digits=1):
+    x=safe_float(v)
+    if x is None:
+        return "—"
+    if abs(x-round(x)) < 1e-9:
+        return str(int(round(x)))
+    return f"{x:.{digits}f}"
+
+def _render_compact_prop_board(rows, title="Prop Board"):
+    """Mobile-first compact IQ board modeled after the clean WNBA row layout."""
+    if not rows:
+        st.warning(f"No {title} lines are loaded.")
+        return
+    rows=sorted(rows, key=lambda p: (-(safe_float(p.get("fair_prob"),0) or 0), -(abs(safe_float(p.get("edge"),0) or 0))))
+    page_size=20
+    safe_key=re.sub(r"[^a-z0-9]+","_",str(title).lower()).strip("_") or "compact"
+    pages=max(1, math.ceil(len(rows)/page_size))
+    page=1
+    if pages>1:
+        page=int(st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key=f"{safe_key}_compact_page"))
+    lo=(page-1)*page_size; shown=rows[lo:lo+page_size]
+    st.markdown("""
+    <div class='compact-prop-head'>
+      <div>PLAYER</div><div>PROP / LINE</div><div>PROJ</div><div>EDGE</div><div>PICK</div><div>OVER %</div>
+    </div>
+    """, unsafe_allow_html=True)
+    cards=[]
+    for p in shown:
+        player=html.escape(str(p.get("player") or ""))
+        team=html.escape(str(p.get("team") or ""))
+        pos=html.escape(str(p.get("position") or ""))
+        matchup=html.escape(str(p.get("matchup") or ""))
+        prop=html.escape(str(ACTIVE_NFL_MARKET_LABELS.get(p.get("prop"),p.get("prop") or "")))
+        line=_fmt_num(p.get("line"),1)
+        line_tag="UD MAIN" if p.get("primary_line_selected") else "UD" if str(p.get("source") or "").lower()=="underdog" else str(p.get("source") or "")
+        proj=_fmt_num(p.get("projection"),1)
+        edge=safe_float(p.get("edge"))
+        edge_txt="—" if edge is None else f"{edge:+.1f}"
+        pick=str(p.get("pick") or "PASS").upper()
+        fair=safe_float(p.get("fair_prob"))
+        fair_txt="—" if fair is None else f"{fair*100:.0f}%"
+        overp=safe_float(p.get("over_prob"))
+        over_txt="—" if overp is None else f"{overp*100:.0f}%"
+        bar=max(0,min(100,(overp or 0)*100))
+        pick_cls="pick-over" if pick=="OVER" else "pick-under" if pick=="UNDER" else "pick-pass"
+        edge_cls="edge-pos" if (edge or 0)>0 else "edge-neg" if (edge or 0)<0 else ""
+        audit=html.escape(str(p.get("audit_label") or "Partial"))
+        cards.append(f"""
+        <div class='compact-prop-row'>
+          <div class='cp-player'><strong>{player}</strong><span>{team} · {pos}{(' · '+matchup) if matchup else ''}</span></div>
+          <div class='cp-prop'><strong>{prop}</strong><span>{line_tag} · vs {line}</span></div>
+          <div class='cp-proj'><strong>{proj}</strong><span>projection</span></div>
+          <div class='cp-edge {edge_cls}'><strong>{edge_txt}</strong><span>edge</span></div>
+          <div class='cp-pick {pick_cls}'><strong>{pick}</strong><span>{fair_txt} · {audit}</span></div>
+          <div class='cp-over'><strong>{over_txt}</strong><div class='cp-bar'><i style='width:{bar:.0f}%'></i></div></div>
+        </div>
+        """)
+    st.markdown("".join(cards), unsafe_allow_html=True)
+    if pages>1:
+        st.caption(f"Showing {lo+1}-{min(len(rows),lo+page_size)} of {len(rows)}")
 
 def _render_player_cards(rows, limit=None, header=None):
     if header:
@@ -7187,6 +7569,7 @@ def _render_player_cards(rows, limit=None, header=None):
                 st.subheader("Environment")
                 env=p.get("env", {})
                 st.write(f"Stadium: **{env.get('stadium','')}**")
+                st.write(f"Venue Team: **{env.get('home_team','')}** · Player: **{env.get('home_away','') or 'SITE TBD'}**")
                 st.write(f"Crowd Noise: **{env.get('crowd','')}**")
                 st.write(f"Roof: **{env.get('roof','')}**")
                 st.write(f"Surface: **{env.get('surface','')}**")
@@ -8222,72 +8605,100 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 with st.sidebar:
-    st.header("Controls")
+    st.header("NFL Controls")
     source_mode=st.radio("Prop Source", ["Live Underdog only", "Live Underdog first, demo fallback", "Demo board only"], index=0)
 
     if "board_pull_id" not in st.session_state:
         st.session_state["board_pull_id"] = 0
-    if "manual_board_pull_requested" not in st.session_state:
-        st.session_state["manual_board_pull_requested"] = False
-    last_board_meta = load_last_pulled_board()
-    if st.button("🔄 Refresh / Pull Underdog Board Lines", use_container_width=True):
+    if "nfl_live_rows" not in st.session_state:
+        _cached=load_last_pulled_board()
+        st.session_state["nfl_live_rows"]=_cached.get("rows",[]) or []
+    if "nfl_moneyline_rows" not in st.session_state:
+        _cached_ml=load_last_pulled_moneylines()
+        st.session_state["nfl_moneyline_rows"]=_cached_ml.get("rows",[]) or []
+    if "nfl_pull_status" not in st.session_state:
+        st.session_state["nfl_pull_status"]="READY"
+
+    st.subheader("Live Lines")
+    st.caption("One Streamlit rerun is normal when you pull. The last good board stays visible if the network request fails.")
+    pull_clicked=st.button("🔄 Pull Fresh Underdog Lines", use_container_width=True, type="primary")
+    if pull_clicked and source_mode != "Demo board only":
         st.session_state["board_pull_id"] = int(st.session_state.get("board_pull_id", 0)) + 1
-        st.session_state["manual_board_pull_requested"] = True
-        st.session_state.pop("nfl_projection_cache_key", None)
-        st.session_state.pop("nfl_projection_cache_rows", None)
+        _pid=st.session_state["board_pull_id"]
         try:
-            fetch_underdog_nfl_props.clear()
-            fetch_underdog_nfl_moneylines.clear()
-            safe_get_json.clear()
+            fetch_underdog_nfl_props.clear(); fetch_underdog_nfl_moneylines.clear(); safe_get_json.clear()
         except Exception:
             pass
-        request_log("MANUAL_PULL_BOARD", "REQUESTED", f"pull_id={st.session_state['board_pull_id']}")
-        st.rerun()
-    st.caption(f"Last saved board pull: {last_board_meta.get('pulled_at') or 'None'} · Rows: {last_board_meta.get('row_count', 0)}")
-    use_saved_board_if_blank = st.checkbox("Use last pulled/manual board if live pull is blank", value=True, help="Loads your last saved Underdog/manual board instantly and only hits Underdog when you press Refresh/Pull. This prevents slow startup.")
-    auto_pull_on_load = st.checkbox("Auto-pull live board on app load", value=False, help="Leave OFF for Streamlit Cloud speed. Turn ON only if you want the app to call Underdog every page load.")
+        with st.spinner("Pulling fresh Underdog NFL lines…"):
+            _pulled=fetch_underdog_nfl_props(_pid)
+            _pulled_ml=fetch_underdog_nfl_moneylines(_pid)
+        if _pulled:
+            st.session_state["nfl_live_rows"]=_pulled
+            st.session_state["nfl_moneyline_rows"]=_pulled_ml
+            save_last_pulled_board(_pulled,_pulled_ml)
+            st.session_state.pop("nfl_projection_cache_key",None)
+            st.session_state.pop("nfl_projection_cache_rows",None)
+            st.session_state["nfl_pull_status"]=f"SUCCESS · {len(_pulled)} rows"
+            st.success(f"Fresh pull loaded: {len(_pulled)} valid NFL lines. Main-line selection will run before projection.")
+        else:
+            # Do not blank the page when a fresh request fails. Keep the last successful
+            # board visible and tell the user the live request returned no valid rows.
+            st.session_state["nfl_pull_status"]="NO VALID LIVE ROWS · previous board preserved"
+            st.warning("Fresh request returned no valid NFL rows. The last successful board was preserved instead of clearing the page.")
+    elif pull_clicked:
+        st.info("Switch Prop Source to a Live Underdog mode to pull lines.")
 
-    with st.expander("Manual Underdog Board Import", expanded=False):
-        st.caption("Use this when the live endpoint returns no rows. This build accepts all enabled NFL single-game markets, including yards, volume, touchdowns, fantasy, kicking, and defensive props.")
+    last_board_meta=load_last_pulled_board()
+    st.caption(f"Last successful pull: {last_board_meta.get('pulled_at') or 'None'} · {last_board_meta.get('row_count',0)} rows")
+    st.caption(f"Status: {st.session_state.get('nfl_pull_status','READY')}")
+
+    with st.expander("Manual Board Import / Cache", expanded=False):
+        st.caption("Fallback only. Live pull is always attempted from the button above; there is no separate 'use saved board' switch anymore.")
         manual_upload = st.file_uploader("Upload CSV/TXT board", type=["csv", "txt"], key="manual_board_upload")
-        manual_text = st.text_area("Paste Underdog Pass Yards board text", height=150, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO\nD. Prescott\n266.5\nDAL @ NYG", key="manual_board_text")
-        if st.button("📥 Load Manual Board Into App", use_container_width=True, key="load_manual_board_btn"):
-            manual_rows = parse_manual_underdog_board(manual_text, manual_upload)
-            manual_rows = _filter_live_board_to_phase6_model(manual_rows)
+        manual_text = st.text_area("Paste Underdog board text", height=130, placeholder="Pass Yards\nJ. Goff\n271.5\nDET vs NO", key="manual_board_text")
+        if st.button("📥 Load Manual Board", use_container_width=True, key="load_manual_board_btn"):
+            manual_rows = _filter_live_board_to_phase6_model(parse_manual_underdog_board(manual_text, manual_upload))
             if manual_rows:
                 save_last_pulled_board(manual_rows, [])
-                request_log("MANUAL_BOARD_IMPORT", "SAVED", f"rows={len(manual_rows)}")
-                st.success(f"Loaded {len(manual_rows)} manual Underdog rows into the board cache.")
-                st.rerun()
+                st.session_state["nfl_live_rows"]=manual_rows
+                st.session_state["nfl_moneyline_rows"]=[]
+                st.session_state.pop("nfl_projection_cache_key",None)
+                st.session_state.pop("nfl_projection_cache_rows",None)
+                st.success(f"Loaded {len(manual_rows)} valid manual rows.")
             else:
-                st.warning("No valid manual rows found. Use columns player, prop, line, team, opp, matchup, position — or paste market/player/line/matchup groups.")
-        if st.button("🧹 Clear Saved Board Cache", use_container_width=True, key="clear_saved_board_cache_btn"):
-            save_json(BOARD_CACHE_FILE, {"pulled_at": None, "source": "CLEARED", "row_count": 0, "rows": []})
-            save_json(MONEYLINE_CACHE_FILE, {"pulled_at": None, "source": "CLEARED", "row_count": 0, "rows": []})
-            st.success("Saved board cache cleared.")
-            st.rerun()
+                st.warning("No valid manual NFL rows found.")
+        if st.button("🧹 Clear Saved Board", use_container_width=True, key="clear_saved_board_cache_btn"):
+            save_json(BOARD_CACHE_FILE,{"pulled_at":None,"source":"CLEARED","row_count":0,"rows":[]})
+            save_json(MONEYLINE_CACHE_FILE,{"pulled_at":None,"source":"CLEARED","row_count":0,"rows":[]})
+            st.session_state["nfl_live_rows"]=[]; st.session_state["nfl_moneyline_rows"]=[]
+            st.session_state.pop("nfl_projection_cache_key",None); st.session_state.pop("nfl_projection_cache_rows",None)
+            st.success("Saved board cleared.")
 
-    # Keep every supported market active in the engine. Main-page market sections
-    # and pagination prevent the expanded board from becoming heavy on mobile.
+    # Keep every supported market active; render only the chosen section.
     prop_filter=list(ACTIVE_NFL_MARKET_ORDER)
-    st.session_state["xgb_assist_enabled"] = st.toggle("XGBoost Assist after grading", value=bool(st.session_state.get("xgb_assist_enabled", False)), help="Uses your graded results to assist the main projection before Monte Carlo. Stays neutral until enough grades exist.")
-    if st.session_state.get("xgb_assist_enabled", False):
-        st.session_state["xgb_min_rows"] = st.slider("XGB min graded rows", 25, 250, int(st.session_state.get("xgb_min_rows", 50)), 5)
-        st.session_state["xgb_blend_weight"] = st.slider("XGB max blend", 0.05, 0.40, float(st.session_state.get("xgb_blend_weight", 0.22)), 0.01)
-    st.session_state["advanced_sim_assist_enabled"] = st.toggle("Bayesian / Markov / Poisson Assist", value=bool(st.session_state.get("advanced_sim_assist_enabled", True)), help="Adds bounded Bayesian historical-log updating, Markov game-state volume, Poisson event-rate nudges, and Elo/efficiency matchup context before Monte Carlo.")
-    st.session_state["smart_calibration_enabled"] = st.toggle("Smart role calibration", value=bool(st.session_state.get("smart_calibration_enabled", True)), help="Calibrates by prop, position, role and data quality only after enough prior graded rows.")
-    st.session_state["team_volume_reconciliation_enabled"] = st.toggle("Team-volume reconciliation", value=bool(st.session_state.get("team_volume_reconciliation_enabled", True)), help="Prevents listed receptions, receiving yards and carries from exceeding realistic team/QB volume.")
-    if st.session_state.get("advanced_sim_assist_enabled", True):
-        st.session_state["bayes_min_games"] = st.slider("Bayesian min player games", 3, 12, int(st.session_state.get("bayes_min_games", 5)), 1)
-    st.session_state["ensemble_ml_assist_enabled"] = st.toggle("Random Forest / Tree Ensemble Assist after grading", value=bool(st.session_state.get("ensemble_ml_assist_enabled", False)), help="Optional ML assist from graded results. Stays neutral until enough graded props exist.")
-    if st.session_state.get("ensemble_ml_assist_enabled", False):
-        st.session_state["ensemble_min_rows"] = st.slider("Ensemble min graded rows", 50, 400, int(st.session_state.get("ensemble_min_rows", 75)), 5)
-        st.session_state["ensemble_blend_weight"] = st.slider("Ensemble max blend", 0.04, 0.30, float(st.session_state.get("ensemble_blend_weight", 0.16)), 0.01)
-    primary_lines_only=st.checkbox("Use one primary line per player/prop", True, help="Recommended. Removes alternate-line ladders from the main projection build so the app stays fast. Alt lines can still be reviewed separately.")
-    min_score=st.slider("Minimum Data Score",0,99,0)
-    show_all=st.checkbox("Larger player-card pages", False, help="OFF renders 12 cards at a time. ON renders 24 at a time. The app never renders all 446 cards at once.")
-    st.session_state["nfl_card_page_size"] = 24 if show_all else 12
-    st.session_state["nfl_table_page_size"] = st.selectbox("Table rows per page", [25, 50, 100], index=1, key="global_table_page_size")
+    primary_lines_only=True
+    min_score=0
+    st.session_state.setdefault("nfl_card_page_size",12)
+    st.session_state.setdefault("nfl_table_page_size",50)
+    with st.expander("Advanced Model Settings", expanded=False):
+        st.session_state["xgb_assist_enabled"] = st.toggle("XGBoost Assist after grading", value=bool(st.session_state.get("xgb_assist_enabled", False)))
+        if st.session_state.get("xgb_assist_enabled", False):
+            st.session_state["xgb_min_rows"] = st.slider("XGB min graded rows",25,250,int(st.session_state.get("xgb_min_rows",50)),5)
+            st.session_state["xgb_blend_weight"] = st.slider("XGB max blend",0.05,0.40,float(st.session_state.get("xgb_blend_weight",0.22)),0.01)
+        st.session_state["advanced_sim_assist_enabled"] = st.toggle("Bayesian / Markov / Poisson Assist", value=bool(st.session_state.get("advanced_sim_assist_enabled", True)))
+        st.session_state["smart_calibration_enabled"] = st.toggle("Smart role calibration", value=bool(st.session_state.get("smart_calibration_enabled", True)))
+        st.session_state["team_volume_reconciliation_enabled"] = st.toggle("Team-volume reconciliation", value=bool(st.session_state.get("team_volume_reconciliation_enabled", True)))
+        if st.session_state.get("advanced_sim_assist_enabled", True):
+            st.session_state["bayes_min_games"] = st.slider("Bayesian min player games",3,12,int(st.session_state.get("bayes_min_games",5)),1)
+        st.session_state["ensemble_ml_assist_enabled"] = st.toggle("Random Forest / Tree Ensemble Assist", value=bool(st.session_state.get("ensemble_ml_assist_enabled", False)))
+        if st.session_state.get("ensemble_ml_assist_enabled", False):
+            st.session_state["ensemble_min_rows"] = st.slider("Ensemble min graded rows",50,400,int(st.session_state.get("ensemble_min_rows",75)),5)
+            st.session_state["ensemble_blend_weight"] = st.slider("Ensemble max blend",0.04,0.30,float(st.session_state.get("ensemble_blend_weight",0.16)),0.01)
+        primary_lines_only=st.checkbox("Use one primary line per player/prop",True)
+        min_score=st.slider("Minimum Data Score",0,99,0)
+        show_all=st.checkbox("Larger detailed-card pages",False)
+        st.session_state["nfl_card_page_size"]=24 if show_all else 12
+        st.session_state["nfl_table_page_size"]=st.selectbox("Table rows per page",[25,50,100],index=1,key="global_table_page_size")
     st.divider()
     st.caption("API keys can be added in Streamlit secrets or Railway variables later.")
     show_feed_debug=st.checkbox("Show Underdog feed debug", False)
@@ -8297,28 +8708,20 @@ with st.sidebar:
         _render_phase6_admin()
     st.code("STORAGE_DIR=nfl_engine", language="bash")
 
-pull_id = int(st.session_state.get("board_pull_id", 0))
-should_pull_live = (source_mode != "Demo board only") and (bool(st.session_state.get("manual_board_pull_requested", False)) or bool(st.session_state.get("auto_pull_on_load", False)) or bool(locals().get("auto_pull_on_load", False)))
+pull_id=int(st.session_state.get("board_pull_id",0))
 live=[]
 moneylines=[]
-if source_mode != "Demo board only" and use_saved_board_if_blank:
-    cached_board = load_last_pulled_board()
-    cached_money = load_last_pulled_moneylines()
-    live = cached_board.get("rows", []) or []
-    moneylines = cached_money.get("rows", []) or []
-    if live:
-        request_log("UNDERDOG_BOARD_CACHE", "USING_LAST_PULLED", f"rows={len(live)} pulled_at={cached_board.get('pulled_at')}")
-if should_pull_live:
-    with st.spinner("Pulling Underdog NFL board lines..."):
-        pulled_live = fetch_underdog_nfl_props(pull_id)
-        pulled_moneylines = fetch_underdog_nfl_moneylines(pull_id)
-    st.session_state["manual_board_pull_requested"] = False
-    if pulled_live:
-        live = pulled_live
-        moneylines = pulled_moneylines
-        save_last_pulled_board(live, moneylines)
-    elif not live:
-        request_log("UNDERDOG_BOARD_PULL", "NO_ROWS_AND_NO_CACHE", "Manual/auto pull found no rows and no saved board was loaded.")
+if source_mode != "Demo board only":
+    live=list(st.session_state.get("nfl_live_rows",[]) or [])
+    moneylines=list(st.session_state.get("nfl_moneyline_rows",[]) or [])
+    if not live:
+        cached_board=load_last_pulled_board(); cached_money=load_last_pulled_moneylines()
+        live=cached_board.get("rows",[]) or []
+        moneylines=cached_money.get("rows",[]) or []
+        if live:
+            st.session_state["nfl_live_rows"]=live
+            st.session_state["nfl_moneyline_rows"]=moneylines
+            request_log("UNDERDOG_BOARD_CACHE","RESTORED_LAST_SUCCESS",f"rows={len(live)} pulled_at={cached_board.get('pulled_at')}")
 raw_all = live if live else ([] if source_mode=="Live Underdog only" else DEMO_BOARD)
 raw = _select_primary_market_lines(raw_all) if primary_lines_only else list(raw_all)
 projection_cache_key = _board_projection_cache_key(raw, primary_lines_only)
@@ -8364,6 +8767,12 @@ if projection_errors:
     with st.expander("Projection errors", expanded=False):
         st.dataframe(pd.DataFrame(projection_errors), use_container_width=True, hide_index=True)
 
+# Final board integrity audit: no unknown prop can reach the UI.
+invalid_board_rows=[p for p in projected if p.get("prop") not in ACTIVE_NFL_MARKETS or not _valid_market_line(p.get("prop"),p.get("line"))]
+if invalid_board_rows:
+    st.error(f"Blocked {len(invalid_board_rows)} invalid market rows before display.")
+    projected=[p for p in projected if p not in invalid_board_rows]
+
 df=pd.DataFrame(projected)
 real_count=sum(1 for p in projected if p.get("source")!="DEMO")
 best_edges=[p for p in projected if p.get("action_tier")=="BET"]
@@ -8382,7 +8791,7 @@ if live:
     build_note = "cached projections reused" if cache_hit else f"built in {st.session_state.get('nfl_projection_cache_seconds','—')}s"
     st.success(f"🟢 Underdog NFL feed: {len(live)} valid rows · {len(raw)} projected rows · {build_note}. Last board pull: {cached_meta.get('pulled_at') or 'current refresh'}.")
 elif source_mode == "Live Underdog only":
-    st.warning("No live Underdog NFL rows were detected. Click 🔄 Refresh / Pull Underdog Board Lines in the sidebar when props are posted.")
+    st.warning("No live Underdog NFL rows were detected. Click 🔄 Pull Fresh Underdog Lines in the sidebar when props are posted.")
 else:
     st.info("Demo/testing mode is active. These rows are for UI testing only and should not be treated as real plays.")
 
@@ -8394,68 +8803,39 @@ if 'show_feed_debug' in globals() and show_feed_debug:
 if not _phase6_existing_database_ready():
     st.warning("Projection database is incomplete. Projections still run with safe fallbacks, but use Sidebar → Admin: Phase 6 Database → Build / Repair Projection Database for stronger player, defense, team, and red-zone inputs.")
 
-page_options = [
-    "Today / Weekly Board", "Pass Yards", "Receiving Yards", "Rushing Yards", "Volume Props",
-    "Touchdowns + Turnovers", "Fantasy + Explosive", "Kickers", "Defense",
-    "Closing Review", "Exposure", "Best Edges", "Player Cards", "Alt-Line Ladder",
-    "Correlation Builder", "Save + Grade", "Learning Dashboard", "Money Line", "Backtest"
-]
-active_page = st.selectbox("NFL App Section", page_options, index=0, key="nfl_main_page")
-st.markdown("<div class='nfl-page-note'>Only the selected section is rendered. This prevents hidden tabs and hundreds of cards from keeping the app on RUNNING.</div>", unsafe_allow_html=True)
+PRIMARY_PROP_SECTIONS = {
+    "Pass Yards": ["Passing Yards"],
+    "Receiving Yards": ["Receiving Yards"],
+    "Rushing Yards": ["Rushing Yards"],
+    "Receptions": ["Receptions"],
+    "Rush Attempts": ["Rush Attempts"],
+    "Pass Attempts": ["Pass Attempts"],
+    "Completions": ["Completions"],
+    "Pass TDs": ["Passing TDs"],
+    "Interceptions": ["Interceptions"],
+    "Anytime TD": ["Anytime TD"],
+    "Fantasy Points": ["Fantasy Points"],
+    "Longest Reception": ["Longest Reception"],
+    "Longest Rush": ["Longest Rush"],
+    "Kickers": ["Kicking Points","Field Goals Made"],
+    "Defense": ["Tackles + Assists","Sacks"],
+}
+TOOL_SECTIONS=["Best Edges","Player Cards","Alt-Line Ladder","Closing Review","Exposure","Correlation Builder","Save + Grade","Learning Dashboard","Money Line","Backtest"]
+page_options=list(PRIMARY_PROP_SECTIONS.keys())+TOOL_SECTIONS
+active_page=st.selectbox("NFL Prop Section",page_options,index=0,key="nfl_main_page")
+st.caption("Choose the prop you want to read. Only this section renders, so mobile stays fast.")
 
-if active_page == 'Today / Weekly Board':
-    st.markdown("<div class='section-title-pro'>NFL Board</div>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title-pro'>Slate Context</div>", unsafe_allow_html=True)
-    _render_slate_context(projected)
-    _render_prop_table(projected, "NFL Board")
-
-elif active_page == 'Pass Yards':
-    st.markdown("<div class='section-title-pro'>Passing Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Passing Yards"]
-    _render_prop_table(rows, "Passing Yards")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Receiving Yards':
-    st.markdown("<div class='section-title-pro'>Receiving Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Receiving Yards"]
-    _render_prop_table(rows, "Receiving Yards")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Rushing Yards':
-    st.markdown("<div class='section-title-pro'>Rushing Yards Board</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") == "Rushing Yards"]
-    _render_prop_table(rows, "Rushing Yards")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Volume Props':
-    st.markdown("<div class='section-title-pro'>Volume Props</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") in ["Pass Attempts", "Completions", "Receptions", "Rush Attempts"]]
-    _render_prop_table(rows, "Volume Props")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Touchdowns + Turnovers':
-    st.markdown("<div class='section-title-pro'>Touchdowns + Turnovers</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") in ["Passing TDs", "Interceptions", "Anytime TD"]]
-    _render_prop_table(rows, "Touchdowns + Turnovers")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Fantasy + Explosive':
-    st.markdown("<div class='section-title-pro'>Fantasy + Explosive Props</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") in ["Fantasy Points", "Longest Reception", "Longest Rush"]]
-    _render_prop_table(rows, "Fantasy + Explosive")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Kickers':
-    st.markdown("<div class='section-title-pro'>Kicker Props</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") in ["Kicking Points", "Field Goals Made"]]
-    _render_prop_table(rows, "Kickers")
-    _render_player_cards(rows, header=None)
-
-elif active_page == 'Defense':
-    st.markdown("<div class='section-title-pro'>Defensive Player Props</div>", unsafe_allow_html=True)
-    rows=[p for p in projected if p.get("prop") in ["Tackles + Assists", "Sacks"]]
-    _render_prop_table(rows, "Defense")
-    _render_player_cards(rows, header=None)
+if active_page in PRIMARY_PROP_SECTIONS:
+    wanted=set(PRIMARY_PROP_SECTIONS[active_page])
+    rows=[p for p in projected if p.get("prop") in wanted]
+    st.markdown(f"<div class='section-title-pro'>{active_page}</div>", unsafe_allow_html=True)
+    view_mode=st.radio("View",["Compact","Full Table","Detailed Cards"],horizontal=True,index=0,key=f"view_{re.sub(r'[^a-z0-9]+','_',active_page.lower())}")
+    if view_mode=="Compact":
+        _render_compact_prop_board(rows,active_page)
+    elif view_mode=="Full Table":
+        _render_prop_table(rows,active_page)
+    else:
+        _render_player_cards(rows,header=None)
 
 elif active_page == 'Closing Review':
     _render_closing_review(projected)
