@@ -3594,7 +3594,7 @@ def projection_database_readiness():
     minimums={
         "player_logs":1000,"player_summary":100,"defense_teams":28,
         "team_advanced":28,"team_context":28,"player_usage":100,
-        "depth_chart":100,"injury_players":100,
+        "depth_chart":100,
     }
     missing=[f"{key} {counts[key]}/{minimum}" for key,minimum in minimums.items() if counts[key]<minimum]
     data={
