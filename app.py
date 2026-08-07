@@ -18,8 +18,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v7.7 — LIVE PROPS + MONEYLINE GAME CARDS"
-MODEL_VERSION = "nfl-prop-engine-v7.7.0"
+APP_VERSION = "NFL v7.10 — LIVE PROPS + LOGOS + CONTEXT DEDUPE"
+MODEL_VERSION = "nfl-prop-engine-v7.10.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -248,6 +248,16 @@ NFL_TEAM_NAME_ALIASES = {
     "NEW YORK JETS":"NYJ", "PHILADELPHIA EAGLES":"PHI", "PITTSBURGH STEELERS":"PIT",
     "SAN FRANCISCO 49ERS":"SF", "SEATTLE SEAHAWKS":"SEA", "TAMPA BAY BUCCANEERS":"TB",
     "TENNESSEE TITANS":"TEN", "WASHINGTON COMMANDERS":"WSH",
+}
+# ESPN's public team-logo CDN uses the current NFL abbreviations below. Keep an
+# explicit map so a feed alias can never silently point at the wrong franchise.
+ESPN_NFL_LOGO_IDS = {
+    "ARI":"ari", "ATL":"atl", "BAL":"bal", "BUF":"buf", "CAR":"car", "CHI":"chi",
+    "CIN":"cin", "CLE":"cle", "DAL":"dal", "DEN":"den", "DET":"det", "GB":"gb",
+    "HOU":"hou", "IND":"ind", "JAX":"jax", "KC":"kc", "LV":"lv", "LAC":"lac",
+    "LAR":"lar", "MIA":"mia", "MIN":"min", "NE":"ne", "NO":"no", "NYG":"nyg",
+    "NYJ":"nyj", "PHI":"phi", "PIT":"pit", "SEA":"sea", "SF":"sf", "TB":"tb",
+    "TEN":"ten", "WSH":"wsh",
 }
 ACTIVE_NFL_MARKET_LABELS = {
     "Passing Yards": "Pass Yards", "Passing TDs": "Pass TDs", "Interceptions": "Interceptions",
@@ -512,8 +522,21 @@ def now_iso(): return datetime.now().isoformat(timespec="seconds")
 def safe_float(x, default=None):
     try:
         if x is None or x == "": return default
-        return float(x)
-    except Exception: return default
+        value=float(x)
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+def _usable_context_value(value):
+    """True when a CSV/JSON value can safely override an existing context value."""
+    if value is None:
+        return False
+    if isinstance(value,str):
+        return value.strip().lower() not in {"", "nan", "none", "null", "n/a"}
+    if isinstance(value,(float,np.floating)):
+        return math.isfinite(float(value))
+    return True
+
 def clamp(x, lo, hi): return max(lo, min(hi, x))
 _JSON_RUNTIME_CACHE = {}
 _CSV_RUNTIME_CACHE = {}
@@ -2192,10 +2215,14 @@ def _phase6_player_lookup():
         # Higher priority controls team/position, but never replace useful current
         # metadata with blanks from an older file.
         if new.get("priority",0) >= old.get("priority",0):
+            if new.get("priority",0) == old.get("priority",0) and new.get("record_quality",0) < old.get("record_quality",0):
+                return dict(old)
             merged=dict(old)
             for k,v in new.items():
                 if v not in [None, "", "NAN", "NA"]:
                     merged[k]=v
+            if new.get("priority",0) == old.get("priority",0) and new.get("record_quality",0) > old.get("record_quality",0) and not new.get("position"):
+                merged["position"]=""
             return merged
         merged=dict(old)
         for k in ["team","position"]:
@@ -2208,7 +2235,9 @@ def _phase6_player_lookup():
             if not Path(path).exists():
                 continue
             df=pd.read_csv(path, usecols=lambda c: str(c).lower() in [
-                "player","name","team","position","pos","recent_team","player_display_name"
+                "player","name","team","position","pos","recent_team","player_display_name",
+                "games_played","current_games","pass_attempts_pg","rush_attempts_pg","targets_pg",
+                "passing_yards_pg","rushing_yards_pg","receiving_yards_pg"
             ])
             df.columns=[str(c).strip() for c in df.columns]
             if "player_display_name" in df.columns and "player" not in df.columns:
@@ -2226,7 +2255,7 @@ def _phase6_player_lookup():
                 team=_normalize_nfl_team(r.get("team"))
                 pos=str(r.get("position") or "").upper().strip()
                 if pos in {"NAN","NONE"}: pos=""
-                meta={"player":player,"team":team,"position":pos,"priority":priority,"source":Path(path).name}
+                meta={"player":player,"team":team,"position":pos,"priority":priority,"source":Path(path).name,"record_quality":_player_record_quality(r.to_dict())}
                 key=norm(player)
                 exact[key]=_merge_meta(exact.get(key),meta)
                 parts=key.split()
@@ -2353,8 +2382,17 @@ def _resolve_model_player_strict(player, team=None, position=None):
         close=difflib.get_close_matches(n,names,n=1,cutoff=0.965)
         meta=lookup.get("exact",{}).get(close[0]) if close else None
     if not meta: return None
-    resolved_team=_normalize_nfl_team(meta.get("team")) or team_u
-    resolved_pos=str(meta.get("position") or pos_u or "").upper().strip()
+    meta_team=_normalize_nfl_team(meta.get("team"))
+    meta_pos=str(meta.get("position") or "").upper().strip()
+    # Never overwrite a reliable live team/position with conflicting historical
+    # metadata. A no-match is safer and still lets the live row project at a
+    # reduced data score.
+    if team_u and meta_team and meta_team != team_u:
+        return None
+    if pos_u and meta_pos and meta_pos != pos_u:
+        return None
+    resolved_team=meta_team or team_u
+    resolved_pos=meta_pos or pos_u
     return {"player":meta.get("player") or raw,"team":resolved_team or team or "NFL","position":resolved_pos,"model_match":True,"model_filter_disabled":False,"model_identity_source":meta.get("source")}
 
 def _prop_allowed_for_model_position(prop, position):
@@ -2577,7 +2615,7 @@ def clear_projection_result_cache():
 
 def _manual_row_to_board_row(row, default_prop=None):
     # Flexible column names from CSV upload or pasted tables.
-    get = lambda *keys: next((row.get(k) for k in keys if k in row and row.get(k) not in [None, "", np.nan]), None)
+    get = lambda *keys: next((row.get(k) for k in keys if k in row and _usable_context_value(row.get(k))), None)
     player = get("player", "Player", "name", "Name", "athlete", "Athlete")
     prop = _canon_prop_label(get("prop", "Prop", "market", "Market", "stat", "Stat", "category", "Category") or default_prop)
     line = safe_float(get("line", "Line", "value", "Value", "projection", "Projection", "total", "Total"))
@@ -3276,12 +3314,38 @@ def build_phase6_nfl_database(season=NFL_LAST_SEASON, force_refresh=False):
         if len(join_cols) >= 3:
             logs = logs.merge(s.drop_duplicates(join_cols), on=join_cols, how="left", suffixes=("","_snap"))
 
-    # Build player summaries.
-    group_cols = ["player","team","position"]
+    # Build one player/team summary. Weekly feeds can assign a one-game QB label
+    # to a non-QB and previously that split the same player into duplicate rows.
+    group_cols = ["player","team"]
     sum_cols = _phase6_sum_cols(logs, numeric_cols + ["offense_snaps","defense_snaps","st_snaps"])
     summary = logs.groupby(group_cols, dropna=False)[sum_cols].sum(numeric_only=True).reset_index() if sum_cols else logs[group_cols].drop_duplicates()
     games = logs.groupby(group_cols, dropna=False)["week"].nunique().reset_index(name="games_played") if "week" in logs.columns else summary[group_cols].assign(games_played=17)
     summary = summary.merge(games, on=group_cols, how="left")
+    position_rows=[]
+    for keys,g in logs.groupby(group_cols,dropna=False):
+        player,team=keys if isinstance(keys,tuple) else (keys,"")
+        def _group_total(column):
+            return float(pd.to_numeric(g[column],errors="coerce").fillna(0).sum()) if column in g.columns else 0.0
+        attempts=_group_total("attempts")
+        carries=_group_total("carries")
+        targets=_group_total("targets")
+        positions=[str(x).upper().strip() for x in g.get("position",pd.Series(dtype=str)).tolist() if str(x).upper().strip() in {"QB","RB","FB","WR","TE","K"}]
+        non_qb=[x for x in positions if x != "QB"]
+        if attempts >= 20:
+            position="QB"
+        elif non_qb:
+            position=max(set(non_qb),key=non_qb.count)
+        elif carries >= 10 and carries >= targets:
+            position="RB"
+        elif targets >= 3:
+            position="WR"
+        else:
+            position=positions[0] if positions else ""
+        position_rows.append({"player":player,"team":team,"position":position})
+    if position_rows:
+        summary=summary.merge(pd.DataFrame(position_rows),on=group_cols,how="left")
+    elif "position" not in summary.columns:
+        summary["position"]=""
     gp = summary["games_played"].replace(0, np.nan)
     per_game_map = {
         "attempts": "pass_attempts_pg", "completions": "completions_pg", "passing_yards": "passing_yards_pg",
@@ -3572,7 +3636,7 @@ def _phase6_database_quality(db_dir):
 
 
 def projection_database_readiness():
-    """Audit historical and current-roster coverage required for official plays."""
+    """Audit blocking model data separately from advisory injury coverage."""
     paths=[
         PHASE6_PLAYER_LOG_FILE,PHASE6_PLAYER_SUMMARY_FILE,PHASE6_DEFENSE_RANK_FILE,
         PHASE6_TEAM_ADVANCED_FILE,PHASE6_TEAM_CONTEXT_FILE,USAGE_FILE,
@@ -3597,12 +3661,19 @@ def projection_database_readiness():
         "depth_chart":100,
     }
     missing=[f"{key} {counts[key]}/{minimum}" for key,minimum in minimums.items() if counts[key]<minimum]
+    advisory_minimums={"injury_players":100}
+    warnings=[
+        f"{key} {counts[key]}/{minimum} (advisory only)"
+        for key,minimum in advisory_minimums.items() if counts[key]<minimum
+    ]
     data={
         "ready":not missing,
         "status":"GAME READY" if not missing else "BLOCKED",
         "counts":counts,
         "minimums":minimums,
+        "advisory_minimums":advisory_minimums,
         "missing":missing,
+        "warnings":warnings,
         "checked_at":now_iso(),
     }
     _PROJECTION_READINESS_CACHE.update({"sig":sig,"data":data})
@@ -3944,6 +4015,8 @@ def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_ref
     if not summary.empty:
         summary = summary.copy()
         summary["_name_key"] = summary["player"].map(norm)
+        summary["_context_quality"] = summary.apply(lambda r:_player_record_quality(r.to_dict()),axis=1)
+        summary = summary.sort_values("_context_quality",ascending=False).drop_duplicates("_name_key",keep="first")
     last5 = _last_n_player_means(logs, 5)
 
     offensive_positions = {"QB","RB","WR","TE","FB","K"}
@@ -4222,6 +4295,23 @@ def _read_optional_csv(path):
 def load_usage_bank():
     return _records_by_player(USAGE_FILE)
 
+def _player_record_quality(row):
+    """Prefer a player's full-season/high-volume row over duplicate tiny samples."""
+    row=row or {}
+    games=safe_float(row.get("games_played"),safe_float(row.get("current_games"),0)) or 0
+    volume=max(
+        safe_float(row.get("pass_attempts_pg"),0) or 0,
+        safe_float(row.get("rush_attempts_pg"),0) or 0,
+        safe_float(row.get("targets_pg"),0) or 0,
+    )
+    production=max(
+        safe_float(row.get("passing_yards_pg"),0) or 0,
+        safe_float(row.get("rushing_yards_pg"),0) or 0,
+        safe_float(row.get("receiving_yards_pg"),0) or 0,
+    )
+    filled=sum(1 for value in row.values() if _usable_context_value(value))
+    return games*100.0 + volume*3.0 + production*0.05 + filled*0.01
+
 def _records_by_player(path):
     sig = _path_signature(path)
     key = (str(Path(path)), sig)
@@ -4236,7 +4326,7 @@ def _records_by_player(path):
         d={k:r.get(k) for k in df.columns}
         player = d.get("player") or d.get("player_display_name") or d.get("name")
         pkey=norm(player)
-        if pkey:
+        if pkey and (pkey not in bank or _player_record_quality(d) > _player_record_quality(bank[pkey])):
             bank[pkey]=d
     _RECORD_BANK_RUNTIME_CACHE[key] = bank
     return bank
@@ -4697,7 +4787,10 @@ def _online_passing_yards_context_bank(season=NFL_LAST_SEASON):
                 if ypg is None and safe_float(r.get("passing_yards"), None) is not None:
                     games=safe_float(r.get("games_played"), 17) or 17
                     ypg=(safe_float(r.get("passing_yards"), 0) or 0)/max(1,games)
-                if attempts < 8 and pos != "QB":
+                # Some nflverse summary rows carry a one-week QB label for a
+                # non-QB. Require real passing volume so that row cannot enter the
+                # quarterback context bank merely because of the label.
+                if attempts < 8 or (ypg or 0) < 40:
                     continue
                 player=str(r.get("player") or r.get("player_display_name") or "").strip()
                 if not player:
@@ -4706,7 +4799,7 @@ def _online_passing_yards_context_bank(season=NFL_LAST_SEASON):
                 comps=safe_float(r.get("completions_pg"), None)
                 games=safe_float(r.get("games_played"), 17) or 17
                 ypa=(safe_float(r.get("passing_yards"), 0) or 0) / max(1.0, safe_float(r.get("attempts"), 0) or 0)
-                ctx["players"][norm(player)] = {
+                candidate = {
                     "player": player, "team": team, "position": "QB" if pos == "QB" or attempts >= 10 else pos,
                     "passing_yards_pg": round(float(ypg or 0),3),
                     "pass_attempts_pg": round(float(attempts or 0),3),
@@ -4715,6 +4808,9 @@ def _online_passing_yards_context_bank(season=NFL_LAST_SEASON):
                     "games_played": int(games),
                     "passing_context_source": ctx["source"],
                 }
+                pkey=norm(player)
+                if pkey not in ctx["players"] or _player_record_quality(candidate) > _player_record_quality(ctx["players"][pkey]):
+                    ctx["players"][pkey] = candidate
             # Team offense/pass rate from summary totals.
             if all(c in df.columns for c in ["team"]):
                 tmp=df.copy()
@@ -4865,8 +4961,6 @@ def _online_receiving_yards_context_bank(season=NFL_LAST_SEASON):
             ctx["rows"] = int(len(df))
             for _, r in df.iterrows():
                 pos=str(r.get("position") or "").upper()
-                if pos not in ["WR","TE","RB"]:
-                    continue
                 player=str(r.get("player") or r.get("player_display_name") or "").strip()
                 if not player:
                     continue
@@ -4885,8 +4979,14 @@ def _online_receiving_yards_context_bank(season=NFL_LAST_SEASON):
                 ypt=(rec_yards or 0)/max(1.0, targets or 0)
                 if targets_pg is None or targets_pg < 1.0:
                     continue
-                ctx["players"][norm(player)] = {
-                    "player": player, "team": team, "position": pos,
+                pass_attempts=safe_float(r.get("pass_attempts_pg"),safe_float(r.get("attempts"),0)) or 0
+                if pos == "QB" and pass_attempts >= 8:
+                    continue
+                # Live Underdog supplies the exact WR/TE/RB position. Historical
+                # rows with a blank position are still valid receiving samples.
+                inferred_pos=pos if pos in ["WR","TE","RB"] else "WR"
+                candidate = {
+                    "player": player, "team": team, "position": inferred_pos,
                     "receiving_yards_pg": round(float(yards_pg or 0),3),
                     "targets_pg": round(float(targets_pg or 0),3),
                     "receptions_pg": None if receptions_pg is None else round(float(receptions_pg),3),
@@ -4895,6 +4995,9 @@ def _online_receiving_yards_context_bank(season=NFL_LAST_SEASON):
                     "games_played": int(games),
                     "receiving_context_source": ctx["source"],
                 }
+                pkey=norm(player)
+                if pkey not in ctx["players"] or _player_record_quality(candidate) > _player_record_quality(ctx["players"][pkey]):
+                    ctx["players"][pkey] = candidate
         teams = load_json(TEAM_CONTEXT_FILE,{})
         if isinstance(teams, dict):
             for team, data in teams.items():
@@ -4993,7 +5096,7 @@ def _moneyline_team_context_bank(team_bank=None):
             team=_normalize_nfl_team(raw_team)
             if not team or not isinstance(raw_ctx,dict):
                 continue
-            bank.setdefault(team,{}).update({k:v for k,v in raw_ctx.items() if v not in [None,""]})
+            bank.setdefault(team,{}).update({k:v for k,v in raw_ctx.items() if _usable_context_value(v)})
             bank[team].setdefault("moneyline_context_sources",[])
             if source not in bank[team]["moneyline_context_sources"]:
                 bank[team]["moneyline_context_sources"].append(source)
@@ -5284,27 +5387,27 @@ def merge_nfl_context(row):
         usage=usage or usage_bank.get(norm(row.get("model_player_match") or row.get("player")), {})
         current_usage=current_usage or current_usage_bank.get(norm(row.get("model_player_match") or row.get("player")), {})
     for k,v in usage.items():
-        if not k:
+        if not k or not _usable_context_value(v):
             continue
-        if k not in row or row.get(k) in [None, "", "NFL"]:
+        if k not in row or not _usable_context_value(row.get(k)) or row.get(k) == "NFL":
             row[k]=v
     # Current-season/weekly usage should override last-season Phase 6 when present.
     for k,v in current_usage.items():
-        if not k or v in [None, ""]:
+        if not k or not _usable_context_value(v):
             continue
         row[k]=v
         if str(k).startswith("current_"):
             row["has_current_usage"] = True
     # Fix generic live-feed labels after usage/model context is attached.
     if row.get("team") in [None, "", "NFL"]:
-        if current_usage.get("team") not in [None, ""]:
+        if _usable_context_value(current_usage.get("team")):
             row["team"] = current_usage.get("team")
-        elif usage.get("team") not in [None, ""]:
+        elif _usable_context_value(usage.get("team")):
             row["team"] = usage.get("team")
     if row.get("position") in [None, ""]:
-        if current_usage.get("position") not in [None, ""]:
+        if _usable_context_value(current_usage.get("position")):
             row["position"] = current_usage.get("position")
-        elif usage.get("position") not in [None, ""]:
+        elif _usable_context_value(usage.get("position")):
             row["position"] = usage.get("position")
 
     # If current-season nflverse has games, blend its rolling values into the row.
@@ -5312,7 +5415,7 @@ def merge_nfl_context(row):
     current_player=_fuzzy_player_context(row.get("player"), current_bank.get("players",{}), team=row.get("team"), min_score=0.88)
     if current_player:
         for k,v in current_player.items():
-            if v not in [None, ""]:
+            if _usable_context_value(v):
                 row[k]=v
         row["current_context_source"]=current_player.get("current_context_source")
     teams=load_team_context()
@@ -5338,7 +5441,7 @@ def merge_nfl_context(row):
         "ol_pass_pro_rank","ol_run_block_rank","wr_unit_rank","rb_unit_rank","qb_unit_rank"
     ]
     for k in team_keys:
-        if row.get(k) in [None, ""] and team_ctx.get(k) not in [None, ""]:
+        if not _usable_context_value(row.get(k)) and _usable_context_value(team_ctx.get(k)):
             row[k]=team_ctx.get(k)
     for src, dst in [
         ("current_plays_pg", "plays_pg"),
@@ -5348,11 +5451,11 @@ def merge_nfl_context(row):
         ("pbp_pass_rate", "pbp_pass_rate"),
         ("pbp_rush_rate", "pbp_rush_rate"),
     ]:
-        if current_team_ctx.get(src) not in [None, ""]:
+        if _usable_context_value(current_team_ctx.get(src)):
             row[dst]=current_team_ctx.get(src)
             row["has_current_team_context"] = True
     for k in team_keys:
-        if current_team_ctx.get(k) not in [None, ""]:
+        if _usable_context_value(current_team_ctx.get(k)):
             row[k]=current_team_ctx.get(k)
             row["has_current_team_context"] = True
 
@@ -5361,32 +5464,37 @@ def merge_nfl_context(row):
     opp_keys = [
         "def_pass_rank","def_run_rank","def_slot_rank","def_te_rank","def_rb_rec_rank",
         "def_role_rank","coverage_grade","pressure_rate","def_pressure_rate",
+        "pass_yards_allowed_pg","rush_yards_allowed_pg","rec_yards_allowed_pg","receptions_allowed_pg",
         "def_epa_allowed_per_play","def_success_allowed_rate","def_sacks_pg",
         "def_qb_hits_pg","def_fumbles_forced_pg","explosive_pass_allowed_rate",
         "explosive_rush_allowed_rate","def_explosive_pass_rank","def_explosive_run_rank",
         "def_pressure_rank","def_run_stop_rank"
     ]
     for k in opp_keys:
-        if opp_ctx.get(k) not in [None, ""]:
-            row.setdefault(k, opp_ctx.get(k))
-            row.setdefault("opp_"+k, opp_ctx.get(k))
+        if _usable_context_value(opp_ctx.get(k)):
+            if not _usable_context_value(row.get(k)):
+                row[k]=opp_ctx.get(k)
+            if not _usable_context_value(row.get("opp_"+k)):
+                row["opp_"+k]=opp_ctx.get(k)
     injuries=load_injury_bank()
     inj=injuries.get(norm(row.get("player"))) or injuries.get(str(row.get("player") or ""))
+    row["has_injury_context"]=bool(inj)
+    row["injury_context_status"]="MATCHED" if inj else "NOT_LISTED"
     if inj and row.get("injury_status") in [None, ""]:
         row["injury_status"] = inj.get("status") if isinstance(inj,dict) else inj
     if isinstance(inj, dict):
         for k in ["practice_status","injury_note","body_part","limited_snap_risk","expected_snap_share"]:
-            if inj.get(k) not in [None, ""]:
+            if _usable_context_value(inj.get(k)):
                 row[k]=inj.get(k)
 
     final_inactives=_lookup_final_inactives(row)
     for k,v in final_inactives.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             row[k]=v
 
     depth=_lookup_player_record(load_depth_chart_bank(),row.get("player"),row.get("team"),row.get("position"))
     for k,v in depth.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             row[k]=v
             row["has_depth_chart_context"] = True
 
@@ -5394,7 +5502,7 @@ def merge_nfl_context(row):
     if weather_ctx:
         risk, pass_factor, weather_notes = _weather_risk_from_detail(weather_ctx)
         for k,v in weather_ctx.items():
-            if v not in [None, ""]:
+            if _usable_context_value(v):
                 row[f"weather_{k}"]=v
         if risk and risk != "LOW":
             row["weather_risk"]=risk
@@ -5405,14 +5513,14 @@ def merge_nfl_context(row):
     market=market_bank.get((norm(row.get("player")), str(row.get("prop") or ""), team)) or market_bank.get((norm(row.get("player")), str(row.get("prop") or ""), ""))
     if market:
         for k,v in market.items():
-            if v not in [None, ""]:
+            if _usable_context_value(v):
                 row[f"market_{k}"]=v
         row["has_market_context"] = True
 
     travel_ctx=_lookup_pair_context(load_travel_context_bank(), row)
     if travel_ctx:
         for k,v in travel_ctx.items():
-            if v not in [None, ""]:
+            if _usable_context_value(v):
                 row[k]=v
                 row["has_travel_context"] = True
     elif team and opp:
@@ -5423,13 +5531,13 @@ def merge_nfl_context(row):
 
     matchup_ctx=_lookup_pair_context(load_matchup_context_bank(), row)
     for k,v in matchup_ctx.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             row[k]=v
             row["has_matchup_context"] = True
 
     qb_ctx=_lookup_qb_context(row)
     for k,v in qb_ctx.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             row[k if str(k).startswith("qb_") else f"qb_{k}"]=v
             row["has_qb_context"] = True
 
@@ -5437,13 +5545,13 @@ def merge_nfl_context(row):
     opp_def=def_inj.get(opp) if isinstance(def_inj, dict) else None
     if isinstance(opp_def, dict):
         for k,v in opp_def.items():
-            if v not in [None, ""]:
+            if _usable_context_value(v):
                 row[f"opp_def_injury_{k}"]=v
                 row["has_defensive_injury_context"] = True
 
     splits=_lookup_player_prop_context(load_splits_context_bank(), row)
     for k,v in splits.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             # player/prop/team are lookup identifiers, not projection inputs.
             # In particular the generic split file uses prop=ALL.
             if k in ["player","prop","team"]:
@@ -5453,13 +5561,13 @@ def merge_nfl_context(row):
 
     personnel=_lookup_pair_context(load_personnel_context_bank(), row)
     for k,v in personnel.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             # Never let supplemental context replace live team/opponent/matchup identity.
             row[f"personnel_{k}"]=v
             row["has_personnel_context"] = True
     manual_override=_lookup_manual_override(row)
     for k,v in manual_override.items():
-        if v not in [None, ""]:
+        if _usable_context_value(v):
             row[k]=v
 
     # FINAL MARKET-ID LOCK. Context is allowed to fill missing team/position/opponent,
@@ -6809,11 +6917,17 @@ def passing_yards_stat_projection(row, role, cfg):
         stadium_factor *= 0.988
         notes.append("Road crowd communication tax")
 
-    # Opponent pass defense: rank 1 is tough, rank 32 is weak.
+    # Opponent pass defense: rank 1 is tough, rank 32 is weak. Raw yards
+    # allowed is a fallback when a current feed has not supplied the rank yet.
     opp_rank = safe_float(row.get("def_pass_rank"), safe_float(row.get("opp_def_pass_rank")))
+    pass_allowed = safe_float(row.get("pass_yards_allowed_pg"), safe_float(row.get("opp_pass_yards_allowed_pg")))
     if opp_rank is None:
-        matchup_factor = 1.0
-        notes.append("Opponent pass defense rank missing")
+        if pass_allowed is None:
+            matchup_factor = 1.0
+            notes.append("Opponent pass defense rank/yards allowed missing")
+        else:
+            matchup_factor = clamp(1 + (pass_allowed - 220.0) * 0.0015, 0.94, 1.06)
+            notes.append(f"Pass defense fallback: {pass_allowed:.1f} yards allowed/game")
     else:
         matchup_factor = clamp(1 + (opp_rank - 16.5) * 0.0065, 0.90, 1.105)
         if opp_rank <= 8:
@@ -6821,7 +6935,10 @@ def passing_yards_stat_projection(row, role, cfg):
         elif opp_rank >= 25:
             notes.append("Weak pass defense boost")
 
-    pressure = safe_float(row.get("pressure_rate"), safe_float(row.get("opp_def_pressure_rate")))
+    pressure = safe_float(
+        row.get("opp_def_pressure_rate"),
+        safe_float(row.get("def_pressure_rate"), safe_float(row.get("pressure_rate"))),
+    )
     pressure_factor = 1.0
     if pressure is not None:
         # Higher pressure suppresses efficiency more than attempts.
@@ -6847,6 +6964,7 @@ def passing_yards_stat_projection(row, role, cfg):
         "team_pass_rate": round(pass_rate, 2),
         "team_plays_pg": round(team_plays, 2),
         "opponent_pass_def_rank": None if opp_rank is None else int(round(opp_rank)),
+        "opponent_pass_yards_allowed_pg": None if pass_allowed is None else round(pass_allowed,2),
         "game_total": round(total, 2),
         "spread": round(spread, 2),
         "matchup_factor": round(matchup_factor, 3),
@@ -6946,12 +7064,18 @@ def receiving_yards_stat_projection(row, role, cfg):
     if weather_pass_factor is not None:
         stadium_factor*=clamp(weather_pass_factor,0.86,1.03)
         notes.extend(row.get("weather_notes") or [])
-    # Opponent role/pass defense: higher rank = easier.
+    # Opponent role/pass defense: higher rank = easier. Raw receiving yards
+    # allowed is a fallback when rank generation has not completed yet.
     role_rank=safe_float(row.get("def_role_rank"), safe_float(row.get("opp_def_role_rank")))
     pass_rank=safe_float(row.get("def_pass_rank"), safe_float(row.get("opp_def_pass_rank")))
+    rec_allowed=safe_float(row.get("rec_yards_allowed_pg"), safe_float(row.get("opp_rec_yards_allowed_pg")))
     opp_rank=role_rank if role_rank is not None else pass_rank
     if opp_rank is None:
-        matchup_factor=1.0; notes.append("Opponent receiving/pass defense rank missing")
+        if rec_allowed is None:
+            matchup_factor=1.0; notes.append("Opponent receiving/pass defense rank/yards allowed missing")
+        else:
+            matchup_factor=clamp(1 + (rec_allowed-215.0)*0.0014,0.94,1.06)
+            notes.append(f"Receiving defense fallback: {rec_allowed:.1f} yards allowed/game")
     else:
         matchup_factor=clamp(1 + (opp_rank-16.5)*0.0058, 0.90, 1.10)
         if opp_rank <= 8: notes.append("Top receiving/pass defense tax")
@@ -6975,6 +7099,7 @@ def receiving_yards_stat_projection(row, role, cfg):
         "team_pass_rate": round(pass_rate,2),
         "team_plays_pg": round(team_plays,2),
         "opponent_receiving_def_rank": None if opp_rank is None else int(round(opp_rank)),
+        "opponent_receiving_yards_allowed_pg": None if rec_allowed is None else round(rec_allowed,2),
         "game_total": round(total,2),
         "spread": round(spread,2),
         "matchup_factor": round(matchup_factor,3),
@@ -7034,13 +7159,21 @@ def rushing_yards_stat_projection(row, role, cfg):
         script_factor+=0.012; notes.append("Close game rushing stability")
     total_factor=clamp(1 + (total-44)*0.003,0.96,1.04)
     run_rank=safe_float(row.get("def_run_rank"), safe_float(row.get("opp_def_run_rank")))
+    rush_allowed=safe_float(row.get("rush_yards_allowed_pg"), safe_float(row.get("opp_rush_yards_allowed_pg")))
     if run_rank is None:
-        matchup_factor=1.0; notes.append("Opponent run defense rank missing")
+        if rush_allowed is None:
+            matchup_factor=1.0; notes.append("Opponent run defense rank/yards allowed missing")
+        else:
+            matchup_factor=clamp(1 + (rush_allowed-115.0)*0.0020,0.94,1.06)
+            notes.append(f"Run defense fallback: {rush_allowed:.1f} yards allowed/game")
     else:
         matchup_factor=clamp(1 + (run_rank-16.5)*0.006,0.90,1.10)
         if run_rank <= 8: notes.append("Top run defense tax")
         elif run_rank >= 25: notes.append("Weak run defense boost")
-    run_block=safe_float(row.get("ol_run_block_proxy_rank"), safe_float(row.get("run_block_rank")))
+    run_block=safe_float(
+        row.get("ol_run_block_rank"),
+        safe_float(row.get("ol_run_block_proxy_rank"), safe_float(row.get("run_block_rank"))),
+    )
     run_stop=safe_float(row.get("def_run_stop_rank"), safe_float(row.get("opp_def_run_stop_rank")))
     trench_factor=1.0
     if run_block is not None and run_stop is not None:
@@ -7067,6 +7200,7 @@ def rushing_yards_stat_projection(row, role, cfg):
         "team_rush_rate": round(rush_rate,2),
         "team_plays_pg": round(team_plays,2),
         "opponent_run_def_rank": None if run_rank is None else int(round(run_rank)),
+        "opponent_rush_yards_allowed_pg": None if rush_allowed is None else round(rush_allowed,2),
         "script_factor": round(script_factor,3),
         "matchup_factor": round(matchup_factor,3),
         "trench_factor": round(trench_factor,3),
@@ -7785,7 +7919,7 @@ st.markdown("""
 .ml-card-head{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.08);color:#8d97aa;font-size:11px;font-weight:800}
 .ml-status{color:#efc759}.ml-status.ready{color:#62e88a}.ml-status.blocked{color:#ff6b70}
 .ml-teams{display:grid;grid-template-columns:1fr 1.15fr 1fr;align-items:center;padding:16px 14px 12px}
-.ml-team{text-align:center;min-width:0}.ml-team-badge{width:54px;height:54px;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(239,199,89,.42);border-radius:8px;background:#101827;color:#fff;font-size:18px;font-weight:950}
+.ml-team{text-align:center;min-width:0}.ml-team-badge{position:relative;width:54px;height:54px;margin:0 auto 7px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(239,199,89,.42);border-radius:8px;background:#101827;color:#fff;font-size:18px;font-weight:950;overflow:hidden}.ml-team-badge span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}.ml-team-badge img{position:absolute;inset:3px;width:calc(100% - 6px);height:calc(100% - 6px);object-fit:contain;background:#101827}
 .ml-team-name{font-size:23px;color:#f1f5ff;font-weight:950}.ml-team-proj{font-size:36px;color:#efc759;font-weight:500;line-height:1.05;margin-top:8px}.ml-team-prob{font-size:12px;color:#8f99ac;margin-top:3px}
 .ml-center{text-align:center;min-width:0}.ml-center-label{color:#778196;font-size:11px;text-transform:uppercase;font-weight:850}.ml-favorite{color:#efc759;font-size:13px;font-weight:950;margin-top:7px}.ml-winbar{display:flex;height:9px;background:#1d2635;border-radius:99px;overflow:hidden;margin:8px 0 5px}.ml-winbar-away{background:#4a84ef}.ml-winbar-home{background:#efc759}.ml-wintext{display:flex;justify-content:space-between;color:#8d97aa;font-size:10px}
 .ml-total-band{display:grid;grid-template-columns:1.2fr 1fr;align-items:center;gap:12px;padding:14px;border-top:1px solid rgba(255,255,255,.08);border-bottom:1px solid rgba(255,255,255,.08);background:#0b1320}.ml-total-label{font-size:11px;color:#7d879a;font-weight:850}.ml-total-number{font-size:35px;color:#ff4e85;line-height:1.05;margin-top:3px}.ml-total-edge{color:#57e67b;font-size:13px;font-weight:850}.ml-total-call{text-align:right}.ml-total-pick{font-size:20px;color:#efc759;font-weight:950}.ml-total-pick.pass{color:#9ba5b7}.ml-total-confidence{font-size:11px;color:#8d97aa;margin-top:4px}
@@ -7923,6 +8057,24 @@ def _format_american_odds(value):
         return "—"
     return f"{int(round(value)):+d}"
 
+def nfl_team_logo_url(team):
+    team=_normalize_nfl_team(team)
+    logo_id=ESPN_NFL_LOGO_IDS.get(team)
+    return f"https://a.espncdn.com/i/teamlogos/nfl/500/{logo_id}.png" if logo_id else ""
+
+def _moneyline_team_badge(team):
+    team=html.escape(str(_normalize_nfl_team(team) or team or ""))
+    logo=html.escape(nfl_team_logo_url(team),quote=True)
+    if not logo:
+        return f"<div class='ml-team-badge'><span>{team}</span></div>"
+    # The text remains underneath the image and becomes visible if the CDN image
+    # cannot load, so phone users still get an identifiable team badge.
+    return (
+        f"<div class='ml-team-badge'><span>{team}</span>"
+        f"<img src='{logo}' alt='{team} logo' loading='lazy' decoding='async' "
+        f"referrerpolicy='no-referrer' onerror=\"this.remove()\"></div>"
+    )
+
 def _moneyline_time_label(value):
     dt=_parse_any_datetime(value)
     if not dt:
@@ -7937,6 +8089,8 @@ def _render_moneyline_cards(cards):
     for card in cards:
         away=html.escape(str(card.get("away") or ""))
         home=html.escape(str(card.get("home") or ""))
+        away_badge=_moneyline_team_badge(away)
+        home_badge=_moneyline_team_badge(home)
         matchup=html.escape(str(card.get("matchup") or ""))
         start=html.escape(_moneyline_time_label(card.get("scheduled_at")))
         status=html.escape(str(card.get("status") or ("BLOCKED" if card.get("blocked") else "MODEL READY")))
@@ -8007,9 +8161,9 @@ def _render_moneyline_cards(cards):
 
         markup.append(f"""
         <div class='ml-teams'>
-          <div class='ml-team'><div class='ml-team-badge'>{away}</div><div class='ml-team-name'>{away}</div><div class='ml-team-proj'>{away_projection}</div><div class='ml-team-prob'>{away_prob:.0f}% win</div></div>
+          <div class='ml-team'>{away_badge}<div class='ml-team-name'>{away}</div><div class='ml-team-proj'>{away_projection}</div><div class='ml-team-prob'>{away_prob:.0f}% win</div></div>
           <div class='ml-center'><div class='ml-center-label'>DATA {data_score} | {plays} PLAYS</div><div class='ml-winbar'><i class='ml-winbar-away' style='width:{away_prob:.1f}%'></i><i class='ml-winbar-home' style='width:{home_prob:.1f}%'></i></div><div class='ml-wintext'><span>{away_prob:.0f}%</span><span>{home_prob:.0f}%</span></div><div class='ml-favorite'>{favorite} FAV {favorite_prob:.0f}%</div></div>
-          <div class='ml-team'><div class='ml-team-badge'>{home}</div><div class='ml-team-name'>{home}</div><div class='ml-team-proj'>{home_projection}</div><div class='ml-team-prob'>{home_prob:.0f}% win</div></div>
+          <div class='ml-team'>{home_badge}<div class='ml-team-name'>{home}</div><div class='ml-team-proj'>{home_projection}</div><div class='ml-team-prob'>{home_prob:.0f}% win</div></div>
         </div>
         <div class='ml-total-band'>
           <div><div class='ml-total-label'>GAME TOTAL PROJECTION</div><div class='ml-total-number'>{model_total}</div><div class='ml-total-edge'>{total_detail}</div></div>
@@ -9198,13 +9352,21 @@ with st.sidebar:
     st.metric("Projection database",sidebar_readiness.get("status","BLOCKED"))
     if not sidebar_readiness.get("ready"):
         st.error("Official plays are blocked until historical and current-roster coverage is complete.")
+    elif sidebar_readiness.get("warnings"):
+        st.warning("Projections are enabled. Injury coverage is partial, so player status and final inactives remain individual safety checks.")
     with st.expander("Readiness details",expanded=False):
         readiness_rows=[]
         for readiness_key,minimum in sidebar_readiness.get("minimums",{}).items():
             count=sidebar_readiness.get("counts",{}).get(readiness_key,0)
             readiness_rows.append({
                 "dataset":readiness_key.replace("_"," ").title(),
-                "loaded":count,"required":minimum,"ready":count>=minimum,
+                "loaded":count,"required":minimum,"blocking":"YES","ready":count>=minimum,
+            })
+        for readiness_key,minimum in sidebar_readiness.get("advisory_minimums",{}).items():
+            count=sidebar_readiness.get("counts",{}).get(readiness_key,0)
+            readiness_rows.append({
+                "dataset":readiness_key.replace("_"," ").title(),
+                "loaded":count,"required":minimum,"blocking":"NO","ready":count>=minimum,
             })
         if readiness_rows:
             st.dataframe(pd.DataFrame(readiness_rows),use_container_width=True,hide_index=True)
