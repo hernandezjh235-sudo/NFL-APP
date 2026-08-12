@@ -18,7 +18,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "NFL v7.30 — PRESEASON ROTATION + ZERO-SUM ROOMS + EFFICIENCY PRIORS"
+APP_VERSION = "NFL v7.31 — PRESEASON ROTATION UI HOTFIX"
 MODEL_VERSION = "nfl-prop-engine-v7.30.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -10645,17 +10645,31 @@ def _render_preseason_rotation_panel():
             routes=st.number_input("Expected routes",0.0,60.0,float(safe_float(existing.get("preseason_expected_routes"),0) or 0),1.0,key="preseason_rotation_routes")
         note=st.text_area("Coach / rotation note",value=str(existing.get("note") or ""),placeholder="e.g. starter gets two drives; QB2 plays first half",key="preseason_rotation_note")
         confidence=st.slider("Rotation confidence",0.0,1.0,float(_as_fraction(existing.get("confidence"),0.80) or 0.80),0.05,key="preseason_rotation_confidence")
-        with st.expander("Optional efficiency prior for rookie / backup", expanded=False):
+        # Do not nest st.expander() here: this entire panel is already rendered inside
+        # the outer "Preseason Rotations" expander. Streamlit rejects nested expanders.
+        show_efficiency_prior=st.checkbox(
+            "Show optional efficiency prior for rookie / backup",
+            value=False,
+            key="show_preseason_efficiency_prior",
+        )
+        # Keep safe defaults defined even while the optional controls are hidden.
+        prior_ypa=float(safe_float(existing.get("preseason_prior_ypa"),0) or 0)
+        prior_comp=float(100*_as_fraction(existing.get("preseason_prior_completion_rate"),0.0))
+        prior_ypc=float(safe_float(existing.get("preseason_prior_ypc"),0) or 0)
+        prior_ypt=float(safe_float(existing.get("preseason_prior_ypt"),0) or 0)
+        prior_catch=float(100*_as_fraction(existing.get("preseason_prior_catch_rate"),0.0))
+        prior_conf=float(_as_fraction(existing.get("prior_confidence"),0.70) or 0.70)
+        if show_efficiency_prior:
             st.caption("Leave zero to use the automatic NFL/role-shrunk prior. Use only if you have a trustworthy preseason/college-adjusted/vendor estimate.")
             ec1,ec2=st.columns(2)
             with ec1:
-                prior_ypa=st.number_input("QB YPA prior",0.0,12.0,float(safe_float(existing.get("preseason_prior_ypa"),0) or 0),0.1,key="preseason_prior_ypa_ui")
-                prior_comp=st.number_input("QB completion % prior",0.0,100.0,float(100*_as_fraction(existing.get("preseason_prior_completion_rate"),0.0)),1.0,key="preseason_prior_comp_ui")
-                prior_ypc=st.number_input("Rush YPC prior",0.0,10.0,float(safe_float(existing.get("preseason_prior_ypc"),0) or 0),0.1,key="preseason_prior_ypc_ui")
+                prior_ypa=st.number_input("QB YPA prior",0.0,12.0,prior_ypa,0.1,key="preseason_prior_ypa_ui")
+                prior_comp=st.number_input("QB completion % prior",0.0,100.0,prior_comp,1.0,key="preseason_prior_comp_ui")
+                prior_ypc=st.number_input("Rush YPC prior",0.0,10.0,prior_ypc,0.1,key="preseason_prior_ypc_ui")
             with ec2:
-                prior_ypt=st.number_input("Receiving YPT prior",0.0,15.0,float(safe_float(existing.get("preseason_prior_ypt"),0) or 0),0.1,key="preseason_prior_ypt_ui")
-                prior_catch=st.number_input("Catch % prior",0.0,100.0,float(100*_as_fraction(existing.get("preseason_prior_catch_rate"),0.0)),1.0,key="preseason_prior_catch_ui")
-                prior_conf=st.slider("Efficiency prior confidence",0.0,1.0,float(_as_fraction(existing.get("prior_confidence"),0.70) or 0.70),0.05,key="preseason_prior_conf_ui")
+                prior_ypt=st.number_input("Receiving YPT prior",0.0,15.0,prior_ypt,0.1,key="preseason_prior_ypt_ui")
+                prior_catch=st.number_input("Catch % prior",0.0,100.0,prior_catch,1.0,key="preseason_prior_catch_ui")
+                prior_conf=st.slider("Efficiency prior confidence",0.0,1.0,prior_conf,0.05,key="preseason_prior_conf_ui")
         b1,b2=st.columns(2)
         with b1:
             if st.button("Save Rotation",use_container_width=True,key="save_preseason_rotation"):
