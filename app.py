@@ -18,19 +18,954 @@ import pandas as pd
 import requests
 import streamlit as st
 
-from nfl_savant_adapter import (
-    SAVANT_BOARD_ENDPOINTS,
-    attach_savant_context,
-    build_savant_backup_zip,
-    build_savant_feature_store,
-    clear_savant_runtime_cache,
-    distribution_conflict_audit,
-    import_savant_payloads,
-    refresh_nfl_savant_data,
-    savant_data_readiness,
-    savant_shadow_projection,
-    side_distribution_audit,
-)
+# -----------------------------------------------------------------------------
+# EMBEDDED NFL SAVANT ADAPTER
+# -----------------------------------------------------------------------------
+# Kept in this file so Railway/Streamlit deployments need only app.py.
+SAVANT_BASE_URL = "https://nflsavant.com"
+SAVANT_BOARD_ENDPOINTS = {
+    "receiving": "/api/leaderboard/leaders/receiving",
+    "ngs-receiving": "/api/leaderboard/leaders/ngs-receiving",
+    "route-tree": "/api/leaderboard/leaders/route-tree",
+    "passing": "/api/leaderboard/leaders/passing",
+    "ngs-passing": "/api/leaderboard/leaders/ngs-passing",
+    "rushing": "/api/leaderboard/leaders/rushing",
+    "ngs-rushing": "/api/leaderboard/leaders/ngs-rushing",
+    "pressure": "/api/leaderboard/leaders/pressure",
+    "penalties": "/api/leaderboard/leaders/penalties",
+    "movers": "/api/leaderboard/movers",
+    "league": "/api/league",
+}
+SAVANT_REQUIRED_BOARDS = {
+    "receiving", "ngs-receiving", "route-tree", "passing", "ngs-passing",
+    "rushing", "ngs-rushing", "pressure", "penalties",
+}
+
+BOARD_FILENAME_HINTS = {
+    "ngs-receiving": ("ngs-receiving", "receiving-air-yds", "air-yds-tgt"),
+    "route-tree": ("route-tree", "route_tree", "target-share-route"),
+    "ngs-passing": ("ngs-passing", "passing-cpoe"),
+    "ngs-rushing": ("ngs-rushing", "rushing-rush-yoe", "yoe-att"),
+    "receiving": ("receiving-epa", "epa-tgt"),
+    "passing": ("passing-epa", "epa-play"),
+    "rushing": ("rushing-epa", "epa-att"),
+    "pressure": ("pass-rush", "pressure"),
+    "penalties": ("penalties", "flags"),
+    "movers": ("movers", "rank-movement"),
+    "league": ("league", "team-metrics", "team-advanced"),
+}
+
+BOARD_REQUIRED_COLUMN_GROUPS = {
+    "passing": (("player", "name"), ("epa_play", "epa", "epa_per_play"), ("att", "attempts")),
+    "ngs-passing": (("player", "name"), ("cpoe",), ("xcomp_pct", "xcomp")),
+    "receiving": (("player", "name"), ("epa_tgt", "epa", "epa_target"), ("tgt", "targets")),
+    "ngs-receiving": (("player", "name"), ("air_yards_per_target", "ayds_tgt", "air_yards_target", "air_yds_tgt"), ("tgt", "targets")),
+    "route-tree": (("player", "name"), ("tgt", "targets"), ("screen",), ("go",)),
+    "rushing": (("player", "name"), ("epa_att", "epa", "epa_attempt"), ("carries", "att")),
+    "ngs-rushing": (("player", "name"), ("yoe_per_attempt", "yoe_att", "rush_yoe_att"), ("carries", "att")),
+    "pressure": (("player", "name"), ("pressure_pct", "pressure"), ("pressures",)),
+    "penalties": (("player", "name"), ("penalties", "flags", "pen")),
+    "movers": (("player", "name"), ("rank", "current_rank"), ("prev_rank", "prior_rank", "delta")),
+    "league": (("team", "abbr"),),
+}
+
+TEAM_ALIASES = {
+    "JAC": "JAX", "WAS": "WSH", "OAK": "LV", "SD": "LAC", "STL": "LAR",
+    "LA": "LAR",
+}
+
+_PACK_CACHE: dict[str, object] = {"signature": None, "pack": None}
+_BANK_CACHE: dict[str, object] = {"signature": None, "banks": None}
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _finite(value, default=None):
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def normalize_savant_player_name(value) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower().replace(".", " ").replace("'", "").replace("-", " ")
+    text = re.sub(r"\b(jr|sr|ii|iii|iv)\b", " ", text)
+    return " ".join(text.split())
+
+
+def normalize_savant_team(value) -> str:
+    team = re.sub(r"[^A-Z]", "", str(value or "").upper())
+    return TEAM_ALIASES.get(team, team)
+
+
+def _canonical_column(value) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).strip().lower()
+    text = text.replace("%", " pct ").replace("+/-", " plus_minus ").replace("/", "_")
+    text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+    aliases = {
+        "rank": "rank", "player": "player", "name": "player", "pos": "position",
+        "position": "position", "team": "team", "epa_play": "epa_play",
+        "epa_tgt": "epa_tgt", "epa_att": "epa_att", "epa_target": "epa_tgt",
+        "epa_attempt": "epa_att", "success_pct": "success_pct", "comp_pct": "comp_pct",
+        "success": "success_pct", "succ": "success_pct", "xcomp": "xcomp_pct",
+        "xcomp_pct": "xcomp_pct", "pressure_pct": "pressure_pct", "tgt_pct": "target_share",
+        "target_pct": "target_share", "rztgt": "rz_targets", "rztgt_pct": "rz_target_share",
+        "gltgt": "goal_line_targets", "gltgt_pct": "goal_line_target_share",
+        "rz_carry_pct": "rz_carry_share", "gl_carry_pct": "goal_line_carry_share",
+        "yds_tgt": "yards_per_target", "y_tgt": "yards_per_target",
+        "y_rec": "yards_per_reception", "yac_rec": "yac_per_reception",
+        "ayds_tgt": "air_yards_per_target", "air_yds_tgt": "air_yards_per_target",
+        "y_a": "yards_per_attempt", "ya": "yards_per_attempt", "ypc": "yards_per_carry", "yoe_att": "yoe_per_attempt",
+        "opp_db": "opportunities", "qb_hits": "qb_hits", "ttt": "time_to_throw",
+        "aggr_pct": "aggression_pct", "aiay": "intended_air_yards", "tgt": "targets",
+        "att": "attempts", "comp": "completions", "rec": "receptions", "yds": "yards",
+        "rz_carries": "rz_carries", "gl_carries": "goal_line_carries",
+        "auto_1st": "automatic_first_downs", "measured": "measured_flags",
+        "epa_cost": "penalty_epa_cost", "wpa_cost": "penalty_wpa_cost",
+        "pen": "penalties", "flags": "penalties", "pen_yds": "penalty_yards",
+        "prev_rank": "previous_rank", "prior_rank": "previous_rank",
+        "current_rank": "rank", "delta_rank": "rank_delta",
+    }
+    return aliases.get(text, text)
+
+
+def _raw_bytes(source) -> bytes:
+    if isinstance(source, (bytes, bytearray)):
+        return bytes(source)
+    if isinstance(source, (str, Path)):
+        return Path(source).read_bytes()
+    if hasattr(source, "read"):
+        data = source.read()
+        return data.encode("utf-8") if isinstance(data, str) else bytes(data)
+    raise TypeError("unsupported Savant CSV source")
+
+
+def read_savant_csv(source) -> pd.DataFrame:
+    """Read a Savant export with BOM/comment attribution lines before the header."""
+    raw = _raw_bytes(source)
+    if not raw or len(raw) < 10:
+        raise ValueError("empty Savant file")
+    probe = raw[:2048].decode("utf-8-sig", errors="replace").lstrip().lower()
+    if probe.startswith(("<!doctype html", "<html", "<?xml")) or "<body" in probe[:500]:
+        raise ValueError("HTML/XML response is not a Savant CSV")
+    text = raw.decode("utf-8-sig", errors="replace")
+    lines = text.splitlines()
+    header_index = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "," in stripped:
+            header_index = index
+            break
+    if header_index is None:
+        raise ValueError("CSV header not found after Savant attribution comments")
+    frame = pd.read_csv(io.StringIO("\n".join(lines[header_index:])))
+    frame.columns = [_canonical_column(col) for col in frame.columns]
+    frame = frame.loc[:, ~frame.columns.duplicated()].copy()
+    frame = frame.dropna(how="all")
+    if frame.empty:
+        raise ValueError("Savant CSV has no data rows")
+    return frame
+
+
+def _schema_score(frame: pd.DataFrame, board: str) -> int:
+    columns = set(frame.columns)
+    groups = BOARD_REQUIRED_COLUMN_GROUPS.get(board, ())
+    return sum(1 for choices in groups if any(choice in columns for choice in choices))
+
+
+def detect_savant_board(filename: str, frame: pd.DataFrame) -> str | None:
+    name = Path(str(filename or "")).name.lower().replace("_", "-")
+    hinted = []
+    for board, hints in BOARD_FILENAME_HINTS.items():
+        if any(hint in name for hint in hints):
+            hinted.append(board)
+    candidates = hinted + [board for board in BOARD_REQUIRED_COLUMN_GROUPS if board not in hinted]
+    scored = [(board, _schema_score(frame, board)) for board in candidates]
+    scored.sort(key=lambda item: (item[1], item[0] in hinted), reverse=True)
+    if not scored:
+        return None
+    board, score = scored[0]
+    minimum = max(1, len(BOARD_REQUIRED_COLUMN_GROUPS.get(board, ())) - 1)
+    return board if score >= minimum else None
+
+
+def _season_from_name(filename: str, default_season=None) -> int | None:
+    matches = re.findall(r"(?:19|20)\d{2}", Path(str(filename or "")).name)
+    if matches:
+        return int(matches[-1])
+    return int(default_season) if default_season is not None else None
+
+
+def _frame_is_valid(frame: pd.DataFrame, board: str) -> tuple[bool, str]:
+    if frame.empty:
+        return False, "no rows"
+    groups = BOARD_REQUIRED_COLUMN_GROUPS.get(board, ())
+    missing = ["/".join(group) for group in groups if not any(col in frame.columns for col in group)]
+    if missing:
+        return False, "missing schema: " + ", ".join(missing)
+    if board != "league" and "player" not in frame.columns:
+        return False, "missing player column"
+    return True, "ok"
+
+
+def _normalized_frame(frame: pd.DataFrame, board: str, season: int) -> pd.DataFrame:
+    out = frame.copy()
+    if "player" in out.columns:
+        out["player"] = out["player"].astype(str).str.strip()
+        out["player_key"] = out["player"].map(normalize_savant_player_name)
+    if "team" in out.columns:
+        out["team"] = out["team"].map(normalize_savant_team)
+    if "position" in out.columns:
+        out["position"] = out["position"].astype(str).str.upper().str.strip()
+    out["savant_board"] = board
+    out["savant_season"] = int(season)
+    return out
+
+
+def _iter_payloads(uploaded_files):
+    for item in uploaded_files or []:
+        if isinstance(item, tuple) and len(item) == 2:
+            name, raw = item
+        else:
+            name = getattr(item, "name", "upload.csv")
+            raw = _raw_bytes(item)
+        name = Path(str(name)).name
+        raw = bytes(raw)
+        if name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+                    for member in archive.infolist():
+                        if member.is_dir() or not member.filename.lower().endswith(".csv"):
+                            continue
+                        yield Path(member.filename).name, archive.read(member)
+            except zipfile.BadZipFile as exc:
+                yield name, exc
+        else:
+            yield name, raw
+
+
+def import_savant_payloads(uploaded_files, savant_dir, default_season=None) -> list[dict]:
+    """Import ZIP/multi-CSV payloads, preserving originals and normalized boards."""
+    root = Path(savant_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    results = []
+    selected: dict[tuple[int, str], tuple[str, bytes, pd.DataFrame, str]] = {}
+    for order, (name, payload) in enumerate(_iter_payloads(uploaded_files)):
+        result = {"filename": name, "detected_board": "", "season": default_season,
+                  "rows": 0, "columns": 0, "valid": False, "saved_path": ""}
+        if isinstance(payload, Exception):
+            result["detail"] = f"ZIP read failed: {payload}"
+            results.append(result)
+            continue
+        try:
+            frame = read_savant_csv(payload)
+            board = detect_savant_board(name, frame)
+            season = _season_from_name(name, default_season)
+            result.update({"detected_board": board or "UNKNOWN", "season": season,
+                           "rows": len(frame), "columns": len(frame.columns)})
+            if board is None or season is None:
+                result["detail"] = "board or season could not be detected"
+                results.append(result)
+                continue
+            valid, detail = _frame_is_valid(frame, board)
+            result.update({"valid": valid, "detail": detail})
+            if valid:
+                selected[(int(season), board)] = (name, payload, frame, f"upload_order_{order}")
+            results.append(result)
+        except Exception as exc:
+            result["detail"] = str(exc)[:180]
+            results.append(result)
+
+    manifest = load_savant_manifest(root)
+    entries = [entry for entry in manifest.get("files", []) if isinstance(entry, dict)]
+    for (season, board), (name, raw, frame, selection) in selected.items():
+        raw_dir = root / "raw" / str(season)
+        norm_dir = root / "normalized" / str(season)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        norm_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = raw_dir / Path(name).name
+        norm_path = norm_dir / f"{board}.csv"
+        raw_path.write_bytes(raw)
+        normalized = _normalized_frame(frame, board, season)
+        normalized.to_csv(norm_path, index=False)
+        checksum = hashlib.sha256(raw).hexdigest()
+        entries = [e for e in entries if not (e.get("season") == season and e.get("board") == board)]
+        entries.append({
+            "board": board, "season": season, "source_filename": name,
+            "source_url": "UPLOAD", "pulled_at": _now_iso(), "checksum": checksum,
+            "rows": int(len(normalized)), "columns": int(len(normalized.columns)),
+            "parse_status": "VALID", "raw_path": str(raw_path),
+            "normalized_path": str(norm_path), "selection": selection,
+        })
+        for result in results:
+            if result.get("filename") == name and result.get("detected_board") == board and result.get("season") == season:
+                result["saved_path"] = str(norm_path)
+                result["valid"] = True
+    save_savant_manifest(root, entries)
+    clear_savant_runtime_cache()
+    for selected_season in sorted({season for season, _board in selected}):
+        try:
+            build_savant_feature_store(root, selected_season)
+        except Exception:
+            # The normalized source pack remains valid even if a derived cache cannot
+            # be written. The explicit UI rebuild action can retry it later.
+            pass
+    return results
+
+
+def load_savant_manifest(savant_dir) -> dict:
+    path = Path(savant_dir) / "savant_manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_savant_manifest(savant_dir, entries) -> dict:
+    root = Path(savant_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = {"version": 1, "updated_at": _now_iso(), "files": sorted(
+        entries, key=lambda e: (int(e.get("season", 0)), str(e.get("board", "")))
+    )}
+    tmp = root / "savant_manifest.json.tmp"
+    target = root / "savant_manifest.json"
+    tmp.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    tmp.replace(target)
+    return manifest
+
+
+def _json_board_frame(payload, board: str, season: int) -> pd.DataFrame:
+    rows = payload if isinstance(payload, list) else None
+    if isinstance(payload, dict):
+        candidate_keys = (
+            ("teams", "rows", "data", "results") if board == "league"
+            else ("rows", "leaders", "movers", "data", "results")
+        )
+        rows = next((payload.get(key) for key in candidate_keys if isinstance(payload.get(key), list)), rows)
+        if not isinstance(rows, list):
+            # Some API versions group movers by category. Flatten only list-valued
+            # groups and retain the group name as an audit field.
+            grouped = []
+            for category, values in payload.items():
+                if not isinstance(values, list):
+                    continue
+                grouped.extend({"category": category, **item} for item in values if isinstance(item, dict))
+            rows = grouped or None
+    if not isinstance(rows, list):
+        raise ValueError("Savant JSON response has no recognized row collection")
+    flat = []
+    for rank, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            continue
+        values = row.get("values") if isinstance(row.get("values"), dict) else {}
+        merged = {**row, **values}
+        merged.setdefault("rank", rank)
+        if "name" in merged and "player" not in merged:
+            merged["player"] = merged.get("name")
+        flat.append(merged)
+    if not flat:
+        raise ValueError("Savant JSON board is empty")
+    frame = pd.DataFrame(flat)
+    frame.columns = [_canonical_column(col) for col in frame.columns]
+    frame = frame.loc[:, ~frame.columns.duplicated()].copy()
+    return _normalized_frame(frame, board, season)
+
+
+def _request_json(session, url, timeout=(4.0, 14.0), attempts=3):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
+            ctype = str(response.headers.get("content-type") or "").lower()
+            if "json" not in ctype and response.text.lstrip().lower().startswith("<"):
+                raise ValueError("endpoint returned HTML instead of JSON")
+            return response.json(), response.content
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(0.35 * (2 ** attempt))
+    raise RuntimeError(str(last_error))
+
+
+def refresh_nfl_savant_data(season, savant_dir, force=False, ttl_hours=12, session=None) -> list[dict]:
+    """Refresh stable Savant JSON endpoints; preserve last-good files on every error."""
+    season = int(season)
+    root = Path(savant_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    manifest = load_savant_manifest(root)
+    entries = [entry for entry in manifest.get("files", []) if isinstance(entry, dict)]
+    by_board = {(int(e.get("season", 0)), e.get("board")): e for e in entries}
+    client = session or requests.Session()
+    client.headers.update({
+        "User-Agent": "NFLPropEngine/7.32 (+cached-public-data-adapter)",
+        "Accept": "application/json,text/plain;q=0.9,*/*;q=0.5",
+    })
+    results = []
+    for board, endpoint in SAVANT_BOARD_ENDPOINTS.items():
+        existing = by_board.get((season, board), {})
+        age_hours = None
+        try:
+            stamp = datetime.fromisoformat(str(existing.get("pulled_at") or ""))
+            age_hours = max(0.0, (datetime.now() - stamp).total_seconds() / 3600.0)
+        except Exception:
+            pass
+        if not force and age_hours is not None and age_hours < float(ttl_hours) and Path(str(existing.get("normalized_path") or "")).exists():
+            results.append({"board": board, "season": season, "status": "CACHED", "rows": existing.get("rows", 0), "detail": f"{age_hours:.1f}h old"})
+            continue
+        query = f"?season={season}"
+        url = SAVANT_BASE_URL + endpoint + query
+        try:
+            payload, raw = _request_json(client, url)
+            frame = _json_board_frame(payload, board, season)
+            valid, detail = _frame_is_valid(frame, board)
+            if not valid:
+                raise ValueError(detail)
+            raw_dir = root / "raw" / str(season)
+            norm_dir = root / "normalized" / str(season)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            norm_dir.mkdir(parents=True, exist_ok=True)
+            raw_path = raw_dir / f"{board}.json"
+            norm_path = norm_dir / f"{board}.csv"
+            raw_path.write_bytes(raw)
+            frame.to_csv(norm_path, index=False)
+            entry = {
+                "board": board, "season": season, "source_filename": raw_path.name,
+                "source_url": url, "pulled_at": _now_iso(),
+                "checksum": hashlib.sha256(raw).hexdigest(), "rows": int(len(frame)),
+                "columns": int(len(frame.columns)), "parse_status": "VALID",
+                "raw_path": str(raw_path), "normalized_path": str(norm_path),
+            }
+            entries = [e for e in entries if not (e.get("season") == season and e.get("board") == board)]
+            entries.append(entry)
+            results.append({"board": board, "season": season, "status": "SAVED", "rows": len(frame), "detail": url})
+        except Exception as exc:
+            fallback = "LAST_GOOD" if existing and Path(str(existing.get("normalized_path") or "")).exists() else "UPLOAD_REQUIRED"
+            results.append({"board": board, "season": season, "status": fallback, "rows": existing.get("rows", 0), "detail": str(exc)[:180]})
+    save_savant_manifest(root, entries)
+    clear_savant_runtime_cache()
+    try:
+        build_savant_feature_store(root, season)
+    except Exception:
+        pass
+    return results
+
+
+def _manifest_signature(root: Path):
+    manifest = root / "savant_manifest.json"
+    try:
+        stat = manifest.stat()
+        return (str(manifest.resolve()), stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return (str(manifest), 0, 0)
+
+
+def clear_savant_runtime_cache():
+    _PACK_CACHE.update({"signature": None, "pack": None})
+    _BANK_CACHE.update({"signature": None, "banks": None})
+
+
+def load_savant_pack(savant_dir, season=None) -> dict[str, pd.DataFrame]:
+    root = Path(savant_dir)
+    manifest = load_savant_manifest(root)
+    entries = [entry for entry in manifest.get("files", []) if isinstance(entry, dict) and entry.get("parse_status") == "VALID"]
+    seasons = sorted({int(entry.get("season")) for entry in entries if entry.get("season") is not None})
+    selected_season = int(season) if season is not None else (seasons[-1] if seasons else None)
+    signature = (_manifest_signature(root), selected_season)
+    if _PACK_CACHE.get("signature") == signature and isinstance(_PACK_CACHE.get("pack"), dict):
+        return _PACK_CACHE["pack"]
+    pack = {}
+    for entry in entries:
+        if selected_season is None or int(entry.get("season", -1)) != selected_season:
+            continue
+        path = Path(str(entry.get("normalized_path") or ""))
+        try:
+            frame = pd.read_csv(path)
+            if not frame.empty:
+                pack[str(entry.get("board"))] = frame
+        except Exception:
+            continue
+    _PACK_CACHE.update({"signature": signature, "pack": pack})
+    return pack
+
+
+def _prefixed_record(row, board):
+    skip = {"rank", "qualified", "v", "savant_board", "savant_season", "name"}
+    record = {}
+    for key, value in row.items():
+        if key in skip or (isinstance(value, float) and math.isnan(value)):
+            continue
+        if key in {"id", "player", "player_key", "team", "position"}:
+            record[key] = value
+        else:
+            record[f"{board.replace('-', '_')}__{key}"] = value
+    return record
+
+
+def build_savant_player_bank(pack: dict[str, pd.DataFrame]) -> dict:
+    by_id, by_exact, by_name_pos = {}, {}, {}
+    for board, frame in (pack or {}).items():
+        if frame.empty or "player" not in frame.columns:
+            continue
+        for _, series in frame.iterrows():
+            row = series.to_dict()
+            name = normalize_savant_player_name(row.get("player"))
+            team = normalize_savant_team(row.get("team"))
+            position = str(row.get("position") or "").upper().strip()
+            if not name:
+                continue
+            exact_key = (name, team, position)
+            record = by_exact.setdefault(exact_key, {"player": row.get("player"), "player_key": name, "team": team, "position": position, "boards": []})
+            record.update(_prefixed_record(row, board))
+            if board not in record["boards"]:
+                record["boards"].append(board)
+            player_id = str(row.get("id") or "").strip()
+            if player_id and player_id.lower() != "nan":
+                by_id[player_id] = record
+            by_name_pos.setdefault((name, position), []).append(record)
+    for key, records in list(by_name_pos.items()):
+        unique = []
+        seen = set()
+        for record in records:
+            marker = (record.get("player_key"), record.get("team"), record.get("position"))
+            if marker not in seen:
+                seen.add(marker); unique.append(record)
+        by_name_pos[key] = unique
+    return {"by_id": by_id, "by_exact": by_exact, "by_name_pos": by_name_pos}
+
+
+def build_savant_team_bank(pack: dict[str, pd.DataFrame]) -> dict:
+    teams: dict[str, dict] = {}
+    pressure = (pack or {}).get("pressure")
+    if isinstance(pressure, pd.DataFrame) and not pressure.empty and "team" in pressure.columns:
+        for team, group in pressure.groupby("team"):
+            team = normalize_savant_team(team)
+            if not team:
+                continue
+            g = group.copy()
+            pcol = next((c for c in ["pressure_pct", "pressure__pressure_pct"] if c in g.columns), None)
+            ocol = next((c for c in ["opportunities", "pressure__opportunities", "attempts"] if c in g.columns), None)
+            scol = next((c for c in ["sacks", "pressure__sacks"] if c in g.columns), None)
+            hcol = next((c for c in ["qb_hits", "pressure__qb_hits"] if c in g.columns), None)
+            values = pd.to_numeric(g[pcol], errors="coerce") if pcol else pd.Series(dtype=float)
+            opportunities = pd.to_numeric(g[ocol], errors="coerce") if ocol else pd.Series(1.0, index=g.index)
+            top = g.assign(_pressure=values, _opp=opportunities).sort_values("_pressure", ascending=False).head(4)
+            weights = pd.to_numeric(top["_opp"], errors="coerce").fillna(1).clip(lower=1)
+            top_rate = float(np.average(pd.to_numeric(top["_pressure"], errors="coerce").fillna(0), weights=weights)) if len(top) else None
+            sacks = float(pd.to_numeric(g[scol], errors="coerce").fillna(0).sum()) if scol else None
+            hits = float(pd.to_numeric(g[hcol], errors="coerce").fillna(0).sum()) if hcol else None
+            teams.setdefault(team, {}).update({
+                "pressure_top4_rate": top_rate, "pressure_top4_opportunities": float(weights.sum()) if len(top) else 0,
+                "pass_rush_sacks": sacks, "pass_rush_qb_hits": hits,
+                "elite_edge_presence": bool(len(top) and float(top["_pressure"].max()) >= 6.0),
+                "pressure_player_count": int(len(g)),
+            })
+    league = (pack or {}).get("league")
+    if isinstance(league, pd.DataFrame) and not league.empty and "team" in league.columns:
+        for _, series in league.iterrows():
+            team = normalize_savant_team(series.get("team"))
+            if not team:
+                continue
+            record = teams.setdefault(team, {})
+            for key, value in series.items():
+                if key not in {"team", "savant_board", "savant_season"} and not pd.isna(value):
+                    record[f"league__{key}"] = value
+    penalties = (pack or {}).get("penalties")
+    if isinstance(penalties, pd.DataFrame) and not penalties.empty and "team" in penalties.columns:
+        for team, group in penalties.groupby("team"):
+            team = normalize_savant_team(team)
+            if not team:
+                continue
+            pcol = next((c for c in ["penalties", "penalties__penalties"] if c in group.columns), None)
+            ycol = next((c for c in ["penalty_yards", "penalties__penalty_yards"] if c in group.columns), None)
+            teams.setdefault(team, {}).update({
+                "penalties": float(pd.to_numeric(group[pcol], errors="coerce").fillna(0).sum()) if pcol else None,
+                "penalty_yards": float(pd.to_numeric(group[ycol], errors="coerce").fillna(0).sum()) if ycol else None,
+            })
+    return teams
+
+
+def _savant_banks(savant_dir, season=None):
+    root = Path(savant_dir)
+    signature = (_manifest_signature(root), season)
+    if _BANK_CACHE.get("signature") == signature and isinstance(_BANK_CACHE.get("banks"), dict):
+        return _BANK_CACHE["banks"]
+    pack = load_savant_pack(root, season)
+    banks = {"pack": pack, "players": build_savant_player_bank(pack), "teams": build_savant_team_bank(pack)}
+    _BANK_CACHE.update({"signature": signature, "banks": banks})
+    return banks
+
+
+def _sample_size(record, position=""):
+    position = str(position or record.get("position") or "").upper()
+    if position == "QB":
+        keys = ["passing__attempts", "ngs_passing__attempts"]
+    elif position in {"RB", "FB"}:
+        keys = ["rushing__carries", "ngs_rushing__carries", "receiving__targets"]
+    elif position in {"WR", "TE"}:
+        keys = ["receiving__targets", "ngs_receiving__targets", "route_tree__targets"]
+    else:
+        keys = ["pressure__opportunities", "penalties__measured_flags"]
+    return int(max([_finite(record.get(key), 0) or 0 for key in keys] or [0]))
+
+
+def savant_player_context(player, team, position, savant_dir, season=None, player_id=None) -> dict:
+    banks = _savant_banks(savant_dir, season)
+    player_bank = banks["players"]
+    name = normalize_savant_player_name(player)
+    team = normalize_savant_team(team)
+    position = str(position or "").upper().strip()
+    record = None
+    status = "NO_MATCH"
+    if player_id and str(player_id) in player_bank["by_id"]:
+        candidate = player_bank["by_id"][str(player_id)]
+        if not position or not candidate.get("position") or candidate.get("position") == position:
+            record = candidate; status = "ID_MATCH"
+    if record is None:
+        record = player_bank["by_exact"].get((name, team, position))
+        if record is not None:
+            status = "EXACT_MATCH"
+    if record is None:
+        candidates = player_bank["by_name_pos"].get((name, position), [])
+        if len(candidates) == 1:
+            record = candidates[0]
+            status = "TRADED_OR_TEAMLESS_MATCH"
+        elif len(candidates) > 1:
+            return {"matched": False, "match_status": "AMBIGUOUS_REJECTED", "candidate_count": len(candidates)}
+    if record is None and len(name) >= 7 and position:
+        fuzzy=[]
+        for (candidate_name,candidate_position), candidates in player_bank["by_name_pos"].items():
+            if candidate_position != position or len(candidates) != 1:
+                continue
+            score=difflib.SequenceMatcher(None,name,candidate_name).ratio()
+            if score >= 0.94:
+                fuzzy.append((score,candidate_name,candidates[0]))
+        fuzzy.sort(key=lambda item:item[0],reverse=True)
+        if fuzzy and (len(fuzzy)==1 or fuzzy[0][0]-fuzzy[1][0] >= 0.04):
+            record=fuzzy[0][2]; status="STRICT_FUZZY_MATCH"
+        elif fuzzy:
+            return {"matched":False,"match_status":"AMBIGUOUS_FUZZY_REJECTED","candidate_count":len(fuzzy)}
+    if record is None:
+        return {"matched": False, "match_status": status, "sample_size": 0, "reliability": 0}
+    out = dict(record)
+    sample = _sample_size(out, position)
+    board_count = len(out.get("boards") or [])
+    target = 300 if position == "QB" else 100 if position in {"WR", "TE"} else 160 if position in {"RB", "FB"} else 400
+    reliability = int(_clamp(35 + 42 * min(1.0, sample / max(1, target)) + min(18, board_count * 5), 0, 99))
+    out.update({"matched": True, "match_status": status, "sample_size": sample, "reliability": reliability})
+    return out
+
+
+def savant_team_context(team, savant_dir, season=None) -> dict:
+    record = dict(_savant_banks(savant_dir, season)["teams"].get(normalize_savant_team(team), {}))
+    record["matched"] = bool(record)
+    record["team"] = normalize_savant_team(team)
+    return record
+
+
+def savant_matchup_context(team, opp, savant_dir, season=None) -> dict:
+    offense = savant_team_context(team, savant_dir, season)
+    defense = savant_team_context(opp, savant_dir, season)
+    pressure = _finite(defense.get("league__pressure"), _finite(defense.get("pressure_top4_rate")))
+    rush_def = _finite(defense.get("league__def_rush_epa"))
+    pass_def = _finite(defense.get("league__def_pass_epa"))
+    off_epa = _finite(offense.get("league__off_epa"), _finite(offense.get("league__epa")))
+    off_success = _finite(offense.get("league__off_success"), _finite(offense.get("league__success")))
+    def_success = _finite(defense.get("league__def_success"))
+    components = []
+    if off_epa is not None and pass_def is not None:
+        components.append(_clamp((off_epa - pass_def) / 0.30, -1, 1))
+    if off_success is not None and def_success is not None:
+        components.append(_clamp((off_success - def_success) / 12.0, -1, 1))
+    score = 50 + (float(np.mean(components)) * 18 if components else 0)
+    matchup_samples=[_finite(defense.get(key)) for key in ["league__plays","league__dropbacks","pressure_top4_opportunities"]]
+    matchup_sample=max([value for value in matchup_samples if value is not None] or [0])
+    matched = bool(offense.get("matched") and defense.get("matched"))
+    penalty_environment=_clamp(((_finite(offense.get("penalties"),0) or 0)+(_finite(defense.get("penalties"),0) or 0))/180.0,0.0,1.0)
+    return {
+        "off_team": normalize_savant_team(team), "def_team": normalize_savant_team(opp),
+        "off_epa": off_epa, "def_epa_allowed": _finite(defense.get("league__def_epa")),
+        "off_success": off_success, "def_success_allowed": def_success,
+        "pass_pressure_matchup": pressure, "rush_matchup": rush_def,
+        "explosive_pass_matchup": _finite(defense.get("league__explosive_pass_allowed")),
+        "explosive_rush_matchup": _finite(defense.get("league__explosive_rush_allowed")),
+        "matchup_score": round(score, 1), "matchup_reliability": 82 if matched else 52 if defense.get("matched") else 20,
+        "matchup_sample_size":int(matchup_sample),"penalty_environment":round(penalty_environment,3),
+        "source": "NFL_SAVANT", "matched": matched,
+        "consumed_factors": [key for key, value in {
+            "team_efficiency": off_epa, "defense_efficiency": pass_def,
+            "success_rate": def_success, "pressure": pressure, "rush_defense": rush_def,
+        }.items() if value is not None],
+    }
+
+
+def savant_data_readiness(savant_dir, season=None) -> dict:
+    root = Path(savant_dir)
+    manifest = load_savant_manifest(root)
+    entries = [entry for entry in manifest.get("files", []) if isinstance(entry, dict) and entry.get("parse_status") == "VALID"]
+    seasons = sorted({int(entry.get("season")) for entry in entries if entry.get("season") is not None})
+    selected = int(season) if season is not None else (seasons[-1] if seasons else None)
+    selected_entries = [entry for entry in entries if selected is not None and int(entry.get("season", -1)) == selected]
+    boards = {entry.get("board") for entry in selected_entries}
+    missing = sorted(SAVANT_REQUIRED_BOARDS - boards)
+    rows = sum(int(entry.get("rows", 0) or 0) for entry in selected_entries)
+    status = "FULL" if not missing else "PARTIAL" if boards else "MISSING"
+    return {"status": status, "season": selected, "boards": sorted(boards), "missing": missing,
+            "board_count": len(boards), "required_count": len(SAVANT_REQUIRED_BOARDS),
+            "rows": rows, "updated_at": manifest.get("updated_at")}
+
+
+def build_savant_feature_store(savant_dir, season=None) -> dict:
+    """Persist the normalized player/team banks used by projection lookups."""
+    root=Path(savant_dir)
+    readiness=savant_data_readiness(root,season)
+    selected=readiness.get("season")
+    if selected is None:
+        return {"status":"MISSING","season":None,"player_rows":0,"team_rows":0}
+    clear_savant_runtime_cache()
+    banks=_savant_banks(root,selected)
+    players=[]; seen=set()
+    for record in banks["players"]["by_exact"].values():
+        marker=(record.get("player_key"),record.get("team"),record.get("position"))
+        if marker in seen:
+            continue
+        seen.add(marker)
+        row=dict(record); row["boards"]="|".join(sorted(row.get("boards") or []))
+        row["sample_size"]=_sample_size(record,record.get("position"))
+        players.append(row)
+    teams=[{"team":team,**record} for team,record in sorted(banks["teams"].items())]
+    store_dir=root/"feature_store"/str(selected); store_dir.mkdir(parents=True,exist_ok=True)
+    player_path=store_dir/"savant_player_features.csv"; team_path=store_dir/"savant_team_features.csv"
+    pd.DataFrame(players).to_csv(player_path,index=False)
+    pd.DataFrame(teams).to_csv(team_path,index=False)
+    metadata={"status":"READY" if players else "PARTIAL","season":int(selected),"built_at":_now_iso(),
+              "player_rows":len(players),"team_rows":len(teams),"player_path":str(player_path),"team_path":str(team_path)}
+    (store_dir/"feature_store_manifest.json").write_text(json.dumps(metadata,indent=2),encoding="utf-8")
+    return metadata
+
+
+def attach_savant_context(row, savant_dir, season=None) -> dict:
+    out = dict(row or {})
+    player = savant_player_context(out.get("player"), out.get("team"), out.get("position"), savant_dir, season, out.get("player_id"))
+    team = savant_team_context(out.get("team"), savant_dir, season)
+    matchup = savant_matchup_context(out.get("team"), out.get("opp"), savant_dir, season)
+    readiness = savant_data_readiness(savant_dir, season)
+    out.update({
+        "savant_player_context": player, "savant_team_context": team,
+        "savant_matchup_context": matchup, "savant_readiness": readiness,
+        "savant_player_match": bool(player.get("matched")),
+        "savant_team_match": bool(team.get("matched")),
+        "savant_sample_size": int(player.get("sample_size", 0) or 0),
+        "savant_matchup_sample_size":int(matchup.get("matchup_sample_size",0) or 0),
+        "savant_reliability": int(player.get("reliability", 0) or 0),
+        "savant_season": readiness.get("season"),
+        "savant_updated_at":readiness.get("updated_at"),
+        "savant_status": "FULL" if player.get("matched") and matchup.get("matched") else "PARTIAL" if player.get("matched") or team.get("matched") else "MISSING",
+    })
+    return out
+
+
+def _shrunk(value, prior, sample, target):
+    value = _finite(value)
+    if value is None:
+        return prior, 0.0
+    weight = _clamp(float(sample) / max(1.0, float(sample) + float(target)), 0.0, 0.92)
+    return prior * (1 - weight) + value * weight, weight
+
+
+def _metric(record, *keys):
+    for key in keys:
+        value = _finite(record.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _route_profile(player):
+    routes = {key: _metric(player, f"route_tree__{key}") or 0.0 for key in [
+        "screen", "swing", "quick_out", "slant", "curl", "drag", "dig", "corner",
+        "deep_out", "post", "go", "wheel", "texas",
+    ]}
+    short = sum(routes[key] for key in ["screen", "swing", "quick_out", "slant", "curl", "drag", "texas"])
+    deep = sum(routes[key] for key in ["corner", "deep_out", "post", "go", "wheel"])
+    intermediate = max(0.0, 100.0 - short - deep)
+    return {"short_pct": round(short, 2), "intermediate_pct": round(intermediate, 2),
+            "deep_pct": round(deep, 2), "screen_yac_pct": round(routes["screen"] + routes["swing"], 2),
+            "vertical_pct": round(routes["post"] + routes["go"] + routes["corner"] + routes["deep_out"], 2)}
+
+
+def savant_shadow_projection(row, legacy_projection, season_mode="REGULAR") -> dict:
+    """Create a line-independent, bounded shadow projection from Savant composites."""
+    projection = max(0.0, _finite(legacy_projection, 0.0) or 0.0)
+    prop = str((row or {}).get("prop") or "")
+    player = dict((row or {}).get("savant_player_context") or {})
+    matchup = dict((row or {}).get("savant_matchup_context") or {})
+    sample = int(player.get("sample_size", 0) or 0)
+    reliability = int(player.get("reliability", 0) or 0)
+    mode = str(season_mode or "REGULAR").upper()
+    factor = 1.0
+    components = {}
+    profile = {}
+    notes = []
+    already_consumed = {
+        str(value).lower()
+        for value in ((row or {}).get("projection_consumed_factors") or [])
+    }
+    skipped_consumed = []
+    if not player.get("matched"):
+        return {"active": False, "status": "NO_PLAYER_MATCH", "legacy_projection": round(projection, 3),
+                "shadow_projection": round(projection, 3), "factor": 1.0, "reliability": 0,
+                "components": {}, "notes": ["Uploaded/cached Savant player match unavailable"]}
+
+    if prop in {"Passing Yards", "Completions"}:
+        attempts = max(sample, int(_metric(player, "passing__attempts", "ngs_passing__attempts") or 0))
+        ypa, wy = _shrunk(_metric(player, "passing__yards_per_attempt", "passing__ya"), 7.0, attempts, 220)
+        epa, we = _shrunk(_metric(player, "passing__epa_play", "passing__epa"), 0.02, attempts, 240)
+        success, ws = _shrunk(_metric(player, "passing__success_pct", "passing__succ"), 45.0, attempts, 220)
+        comp, wc = _shrunk(_metric(player, "passing__comp_pct", "ngs_passing__comp_pct"), 64.0, attempts, 200)
+        xcomp, wx = _shrunk(_metric(player, "ngs_passing__xcomp_pct"), 64.0, attempts, 220)
+        cpoe, wo = _shrunk(_metric(player, "passing__cpoe", "ngs_passing__cpoe"), 0.0, attempts, 220)
+        accuracy = _clamp(((comp - 64.0) / 10.0) * .35 + ((xcomp - 64.0) / 9.0) * .35 + (cpoe / 8.0) * .30, -1.5, 1.5)
+        efficiency = _clamp(((ypa - 7.0) / 1.4) * .42 + ((epa - .02) / .22) * .33 + ((success - 45.0) / 9.0) * .25, -1.5, 1.5)
+        pressure_vulnerability = _metric(player, "passing__pressure_pct", "ngs_passing__pressure_pct")
+        opponent_pressure = _finite(matchup.get("pass_pressure_matchup"))
+        pressure_score = 0.0
+        if pressure_vulnerability is not None and opponent_pressure is not None:
+            pressure_score = _clamp(((pressure_vulnerability - 16.0) / 10.0 + (opponent_pressure - 5.5) / 4.5) / 2.0, -1.2, 1.2)
+        use_pressure = not any("pressure" in value for value in already_consumed)
+        applied_pressure = pressure_score if use_pressure else 0.0
+        if pressure_score and not use_pressure:
+            skipped_consumed.append("pressure")
+        if prop == "Completions":
+            factor = 1.0 + accuracy * .028 - max(0.0, applied_pressure) * .012
+        else:
+            factor = 1.0 + efficiency * .034 + accuracy * .012 - max(0.0, applied_pressure) * .015
+        components = {"accuracy_composite": round(accuracy, 3), "efficiency_composite": round(efficiency, 3),
+                      "pressure_matchup_diagnostic": round(pressure_score, 3),
+                      "pressure_applied": round(applied_pressure, 3),
+                      "sample_weight": round(max(wy, we, ws, wc, wx, wo), 3)}
+        notes.append("QB accuracy and efficiency are one correlated composite")
+    elif prop in {"Receiving Yards", "Receptions"}:
+        targets = max(sample, int(_metric(player, "receiving__targets", "ngs_receiving__targets", "route_tree__targets") or 0))
+        ypt, wy = _shrunk(_metric(player, "receiving__yards_per_target", "ngs_receiving__yards_per_target"), 7.4, targets, 70)
+        epa, we = _shrunk(_metric(player, "receiving__epa_tgt", "receiving__epa"), 0.08, targets, 80)
+        catch, wc = _shrunk(_metric(player, "receiving__catch_pct", "ngs_receiving__catch_pct"), 65.0, targets, 65)
+        air, wa = _shrunk(_metric(player, "receiving__air_yards_per_target", "ngs_receiving__air_yards_per_target"), 8.5, targets, 70)
+        yac, wv = _shrunk(_metric(player, "receiving__yac_per_reception", "ngs_receiving__yac_per_reception"), 4.5, targets, 70)
+        efficiency = _clamp(((ypt - 7.4) / 2.4) * .55 + ((epa - .08) / .32) * .25 + ((catch - 65.0) / 15.0) * .20, -1.5, 1.5)
+        depth_yac = _clamp(((air - 8.5) / 5.0) * .58 + ((yac - 4.5) / 3.0) * .42, -1.4, 1.4)
+        factor = 1.0 + (efficiency * (.037 if prop == "Receiving Yards" else .018))
+        if prop == "Receptions":
+            factor += _clamp((catch - 65.0) / 100.0, -.025, .025)
+        components = {"receiving_efficiency_composite": round(efficiency, 3), "depth_yac_profile": round(depth_yac, 3),
+                      "sample_weight": round(max(wy, we, wc, wa, wv), 3)}
+        profile = _route_profile(player)
+        notes.append("Correlated receiving metrics are collapsed into one efficiency composite")
+    elif prop == "Rushing Yards":
+        carries = max(sample, int(_metric(player, "rushing__carries", "ngs_rushing__carries") or 0))
+        ypc, wy = _shrunk(_metric(player, "rushing__yards_per_carry", "ngs_rushing__yards_per_carry"), 4.25, carries, 110)
+        yoe, wo = _shrunk(_metric(player, "ngs_rushing__yoe_per_attempt"), 0.0, carries, 100)
+        epa, we = _shrunk(_metric(player, "rushing__epa_att", "rushing__epa"), -0.03, carries, 120)
+        talent = _clamp(((ypc - 4.25) / 1.1) * .38 + (yoe / 1.25) * .37 + ((epa + .03) / .20) * .25, -1.5, 1.5)
+        rush_matchup = _finite(matchup.get("rush_matchup"))
+        matchup_score = _clamp((-rush_matchup / .18), -1.0, 1.0) if rush_matchup is not None else 0.0
+        use_matchup = not any(value in {"legacy_matchup", "rush_matchup", "rush_defense"} for value in already_consumed)
+        applied_matchup = matchup_score if use_matchup else 0.0
+        if matchup_score and not use_matchup:
+            skipped_consumed.append("rush_matchup")
+        factor = 1.0 + talent * .035 + applied_matchup * .018
+        components = {"rushing_talent_composite": round(talent, 3),
+                      "rush_matchup_diagnostic": round(matchup_score, 3),
+                      "rush_matchup_applied": round(applied_matchup, 3),
+                      "sample_weight": round(max(wy, wo, we), 3)}
+        notes.append("YOE talent and opponent rush matchup remain separate")
+    else:
+        return {"active": False, "status": "WORKLOAD_PROP_UNCHANGED", "legacy_projection": round(projection, 3),
+                "shadow_projection": round(projection, 3), "factor": 1.0, "reliability": reliability,
+                "components": {}, "notes": ["Savant does not manufacture workload volume"]}
+
+    # In preseason, Savant is only a prior for per-opportunity efficiency. Workload is untouched.
+    cap = 0.035 if mode == "PRESEASON" else 0.075
+    if mode == "PRESEASON":
+        factor = 1.0 + (factor - 1.0) * 0.45
+        notes.append("Preseason Savant effect down-weighted; rotation remains workload source")
+    factor = _clamp(factor, 1.0 - cap, 1.0 + cap)
+    shadow = max(0.0, projection * factor)
+    if skipped_consumed:
+        notes.append("Already-consumed factors skipped: " + ", ".join(sorted(set(skipped_consumed))))
+    return {"active": True, "status": "SHADOW", "legacy_projection": round(projection, 3),
+            "shadow_projection": round(shadow, 3), "factor": round(factor, 4),
+            "reliability": reliability, "sample_size": sample, "components": components,
+            "route_profile": profile, "matchup": matchup, "notes": notes,
+            "market_inputs_used": False, "workload_adjusted": False,
+            "already_consumed_factors": sorted(already_consumed),
+            "skipped_consumed_factors": sorted(set(skipped_consumed))}
+
+
+def distribution_conflict_audit(expected_mean, p50, line, pick) -> dict:
+    mean = _finite(expected_mean)
+    median = _finite(p50)
+    line = _finite(line)
+    pick = str(pick or "").upper()
+    if mean is None or median is None or line is None:
+        return {"conflict": False, "status": "NO_LINE", "median_edge": None}
+    mean_side = "OVER" if mean > line else "UNDER" if mean < line else "PUSH"
+    median_side = "OVER" if median > line else "UNDER" if median < line else "PUSH"
+    conflict = (pick in {"OVER", "UNDER"} and mean_side != pick) or (mean_side != median_side and median_side != "PUSH")
+    return {"conflict": bool(conflict), "status": "DISTRIBUTION_CONFLICT" if conflict else "ALIGNED",
+            "mean_side": mean_side, "median_side": median_side, "pick_side": pick,
+            "median_edge": round(median - line, 3), "expected_mean": round(mean, 3),
+            "p50_fair_line": round(median, 3)}
+
+
+def side_distribution_audit(rows, season_mode=None) -> pd.DataFrame:
+    records = []
+    grouped = {}
+    for row in rows or []:
+        mode = str(row.get("season_mode") or season_mode or "REGULAR").upper()
+        grouped.setdefault((mode, str(row.get("prop") or "UNKNOWN")), []).append(row)
+    for (mode, prop), group in sorted(grouped.items()):
+        total = max(1, len(group))
+        picks = [str(row.get("pick") or "PASS").upper() for row in group]
+        passes = sum(1 for row, pick in zip(group, picks) if pick == "PASS" or str(row.get("action_tier") or "").upper() == "PASS")
+        edges = [_finite(row.get("edge")) for row in group]
+        ratios = [(_finite(row.get("projection")) / _finite(row.get("line"))) for row in group if _finite(row.get("projection")) is not None and (_finite(row.get("line")) or 0) > 0]
+        low_workload = sum(1 for row in group if str(row.get("preseason_workload_confidence") or (row.get("preseason_workload") or {}).get("confidence") or "").upper() in {"LOW", "UNKNOWN"})
+        partial = sum(1 for row in group if str(row.get("savant_status") or "").upper() in {"PARTIAL", "MISSING"} or str(row.get("audit_label") or "").upper() in {"PARTIAL", "STALE"})
+        conflicts = sum(1 for row in group if (row.get("distribution_conflict") or {}).get("conflict"))
+        records.append({"season_mode": mode, "prop": prop, "rows": len(group),
+                        "over_pct": round(100 * picks.count("OVER") / total, 1),
+                        "under_pct": round(100 * picks.count("UNDER") / total, 1),
+                        "pass_pct": round(100 * passes / total, 1),
+                        "median_edge": round(float(np.median([x for x in edges if x is not None])), 3) if any(x is not None for x in edges) else None,
+                        "median_projection_line_ratio": round(float(np.median(ratios)), 4) if ratios else None,
+                        "low_workload_rows": low_workload, "partial_data_rows": partial,
+                        "distribution_conflicts": conflicts,
+                        "warning": f"{round(100 * max(picks.count('OVER'), picks.count('UNDER')) / total):.0f}% {max(set(picks), key=picks.count) if picks else 'PASS'} - inspect workload/data priors" if max(picks.count("OVER"), picks.count("UNDER")) / total >= .84 else ""})
+    return pd.DataFrame(records)
+
+
+def build_savant_backup_zip(savant_dir) -> bytes:
+    root = Path(savant_dir)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(root.rglob("*")) if root.exists() else []:
+            if path.is_file() and path.suffix.lower() in {".csv", ".json"}:
+                archive.write(path, path.relative_to(root))
+    return buffer.getvalue()
 
 APP_VERSION = "NFL v7.32 — NFL SAVANT SHADOW INTEGRATION"
 MODEL_VERSION = "nfl-prop-engine-v7.32.0"
