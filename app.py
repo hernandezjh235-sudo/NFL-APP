@@ -967,8 +967,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.32 — NFL SAVANT SHADOW INTEGRATION"
-MODEL_VERSION = "nfl-prop-engine-v7.32.0"
+APP_VERSION = "NFL v7.33 — SAVANT + PRESEASON WORKLOAD FIX"
+MODEL_VERSION = "nfl-prop-engine-v7.33.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2042,6 +2042,57 @@ def projection_stability_score(p10, p90, mean, prop):
     score=100 - max(0,(ratio-1.0)*38)
     return int(clamp(score,0,100))
 
+def nfl_projection_reliability_score(row, usage_quality, stability, audit, model_fallback_used=False, injury_risk="LOW", game_script_risk="LOW", volatility="LOW"):
+    """0-100 input trust score, intentionally independent from pick probability.
+
+    Adapted from the MLB app's strongest transferable idea: confidence answers which
+    side the simulation likes; reliability answers whether the inputs are trustworthy
+    enough to make that confidence actionable.
+    """
+    row=row or {}; audit=audit or {}
+    usage=float(clamp(safe_float(usage_quality,0) or 0,0,100))
+    stable=float(clamp(safe_float(stability,0) or 0,0,100))
+    audit_score=safe_float(audit.get("score"),0) or 0
+    audit_max=max(1.0,safe_float(audit.get("max_score"),1) or 1)
+    audit_pct=float(clamp((audit_score/audit_max)*100.0,0,100))
+    score=0.35*usage + 0.22*stable + 0.18*audit_pct
+    readiness=row.get("database_readiness") or projection_database_readiness()
+    score += 10.0 if readiness.get("ready") else 1.0
+    score += 8.0 if not model_fallback_used else 0.0
+    if row.get("model_match_status")=="MATCHED" or row.get("model_match",True): score+=4.0
+    if str(injury_risk).upper()=="HIGH": score-=9.0
+    elif str(injury_risk).upper()=="EXTREME": score-=18.0
+    if str(game_script_risk).upper()=="HIGH": score-=4.0
+    if str(volatility).upper()=="HIGH": score-=7.0
+    elif str(volatility).upper()=="MED": score-=2.0
+    if audit.get("hard_blocks"): score-=12.0
+    score=float(clamp(score,0,99))
+    label="ELITE" if score>=90 else "STRONG" if score>=82 else "SOLID" if score>=72 else "RISKY" if score>=62 else "FADE"
+    return round(score,1),label
+
+def calibrate_nfl_decision_probabilities(over, under, push, reliability_score, volatility="LOW"):
+    """Reliability/noise shrink for regular-season decision probabilities.
+
+    Raw simulation probabilities remain available for audit. The actionable probabilities
+    are pulled toward 50% when input reliability is weak or simulation dispersion is high.
+    This changes selection confidence, not the raw projection mean.
+    """
+    over=float(clamp(safe_float(over,0.5) or 0.5,0,1))
+    under=float(clamp(safe_float(under,0.5) or 0.5,0,1))
+    push=float(clamp(safe_float(push,0.0) or 0.0,0,1))
+    rel=float(clamp(safe_float(reliability_score,65) or 65,0,100))
+    strength=float(clamp(0.68 + (rel-70.0)*0.0085,0.55,0.97))
+    if str(volatility).upper()=="HIGH": strength*=0.88
+    elif str(volatility).upper()=="MED": strength*=0.95
+    strength=float(clamp(strength,0.48,0.97))
+    cal_over=0.5+(over-0.5)*strength
+    cal_under=0.5+(under-0.5)*strength
+    total=cal_over+cal_under
+    cal_push=max(0.0,1.0-total)
+    if total>1.0:
+        cal_over/=total; cal_under/=total; cal_push=0.0
+    return float(cal_over),float(cal_under),float(cal_push),round(strength,3)
+
 def _hours_to_kickoff(row):
     row=row or {}
     for key in ["starts_at","start_time","event_time","scheduled_at","game_time","game_date"]:
@@ -2287,7 +2338,9 @@ def build_signal(p):
     edge_abs=abs(safe_float(p.get("edge"),0) or 0)
     req=edge_requirement_for_row(p)
 
-    if side in ["NO LINE", "PASS"] or safe_float(p.get("line")) is None:
+    if side == "PASS":
+        return "🚫 PASS", "PASS", reasons
+    if side == "NO LINE" or safe_float(p.get("line")) is None:
         return "🚫 NO LINE", "PASS", reasons
 
     preseason=season_mode_for_row(p)=="PRESEASON"
@@ -2302,6 +2355,10 @@ def build_signal(p):
         return f"🔥 {side}", "BET", reasons
     if strong:
         return f"✅ {side}", "BET", reasons
+
+    # Structural distribution disagreement is not a lean; it is a no-bet diagnostic.
+    if any("Mean/P50 distribution conflict" in str(r) for r in reasons):
+        return "🚫 PASS · DISTRIBUTION CONFLICT", "PASS", reasons
 
     # LEAN means there is enough direction to track, but not enough for official.
     if prob >= 0.57 or edge_abs >= req*0.55:
@@ -2432,7 +2489,7 @@ def prop_name_from_blob(blob):
 
 # v10.9 live-board safety: only accept realistic single-game NFL prop lines.
 # This blocks season-long totals like 3249.5 passing yards from being treated as a game prop line.
-MARKET_LINE_RANGES = {
+REGULAR_MARKET_LINE_RANGES = {
     "Passing Yards": (70.0, 430.0),
     "Passing TDs": (0.5, 5.5),
     "Interceptions": (0.5, 3.5),
@@ -2451,12 +2508,37 @@ MARKET_LINE_RANGES = {
     "Tackles + Assists": (0.5, 18.5),
     "Sacks": (0.5, 3.5),
 }
+PRESEASON_MARKET_LINE_RANGES = {
+    "Passing Yards": (5.0, 260.0),
+    "Pass Attempts": (0.5, 42.5),
+    "Completions": (0.5, 30.5),
+    "Rushing Yards": (0.5, 125.0),
+    "Rush Attempts": (0.5, 28.5),
+    "Receiving Yards": (0.5, 125.0),
+    "Receptions": (0.5, 10.5),
+}
+# Intake uses the union so low preseason full-game lines are not discarded before
+# season type is known. project_row/project_row_preseason apply strict mode ranges.
+MARKET_LINE_RANGES = {
+    prop: (
+        min(REGULAR_MARKET_LINE_RANGES.get(prop, (999, -999))[0], PRESEASON_MARKET_LINE_RANGES.get(prop, (999, -999))[0]),
+        max(REGULAR_MARKET_LINE_RANGES.get(prop, (-999, -999))[1], PRESEASON_MARKET_LINE_RANGES.get(prop, (-999, -999))[1]),
+    )
+    for prop in set(REGULAR_MARKET_LINE_RANGES) | set(PRESEASON_MARKET_LINE_RANGES)
+}
 
-def _valid_market_line(prop, line):
+def _valid_market_line(prop, line, season_mode=None):
     v = safe_float(line)
     if v is None:
         return False
-    lo, hi = MARKET_LINE_RANGES.get(str(prop or ""), (0.01, 999.0))
+    mode=str(season_mode or "").upper().strip()
+    if mode=="PRESEASON":
+        ranges=PRESEASON_MARKET_LINE_RANGES
+    elif mode in {"REGULAR","POSTSEASON"}:
+        ranges=REGULAR_MARKET_LINE_RANGES
+    else:
+        ranges=MARKET_LINE_RANGES
+    lo, hi = ranges.get(str(prop or ""), (0.01, 999.0))
     return lo <= float(v) <= hi
 
 def _extract_line_value_for_prop(prop, *objs):
@@ -6437,7 +6519,7 @@ def merge_nfl_context(row):
     if original_prop not in ACTIVE_NFL_MARKETS:
         raise ValueError(f"Unsupported/unmapped NFL prop: {original_identity.get('prop')!r}")
     original_line=safe_float(original_identity.get("line"))
-    if original_line is None or not _valid_market_line(original_prop, original_line):
+    if original_line is None or not _valid_market_line(original_prop, original_line, season_mode_for_row(row)):
         raise ValueError(f"Invalid {original_prop} line: {original_identity.get('line')!r}")
     row["prop"]=original_prop
     row["line"]=float(original_line)
@@ -8427,201 +8509,988 @@ def _market_line_sanity_projection(base, line, prop, source=None):
     return capped,{"active":abs(capped-base)>=0.01,"raw_before_cap":round(base,3),"cap_bounds":[lo,hi],"note":f"{prop} absolute realism guard"}
 
 def load_preseason_rotations():
+    """Dedicated preseason rotation/news file.
+
+    Expected shape:
+      {"players": {"KC|patrick mahomes": {...}}, "teams": {"KC": {...}}}
+    Player keys may also be just the normalized player name for backwards compatibility.
+    """
     data=load_json(PRESEASON_ROTATION_FILE,{})
     return data if isinstance(data,dict) else {}
 
-def _as_fraction(value, default=None):
-    number=safe_float(value)
-    if number is None:
-        return default
-    return float(clamp(number/100.0 if number>1.01 else number,0.0,1.0))
 
-def _preseason_room(position):
-    position=str(position or "").upper()
-    if position in {"RB","FB"}: return "RB"
-    if position in {"WR"}: return "WR"
-    if position in {"TE"}: return "TE"
-    return "QB" if position=="QB" else position
+def load_preseason_prior_bank():
+    """Optional player efficiency priors (manual/vendor/current preseason/college-adjusted)."""
+    df=_read_optional_csv(PRESEASON_PRIOR_FILE)
+    if df.empty:
+        return {}
+    bank={}
+    for _,r in df.iterrows():
+        d={k:r.get(k) for k in df.columns}
+        player=norm(d.get("player") or d.get("name"))
+        team=_normalize_nfl_team(d.get("team"))
+        if not player:
+            continue
+        bank[(player,team or "")]=d
+        bank.setdefault((player,""),d)
+    return bank
 
-PRESEASON_ROOM_BUDGETS={"QB":1.0,"RB":1.25,"WR":3.0,"TE":1.35}
-PRESEASON_DEPTH_SHARES={
-    "QB":{1:0.24,2:0.43,3:0.29,4:0.04},
-    "RB":{1:0.30,2:0.27,3:0.22,4:0.17,5:0.12},
-    "WR":{1:0.40,2:0.38,3:0.36,4:0.31,5:0.27,6:0.23},
-    "TE":{1:0.38,2:0.34,3:0.28,4:0.20},
+
+def _parse_preseason_rotation_note(text):
+    """Turn plain coach/beat-writer rotation language into workload hints.
+
+    This is deliberately conservative: it only parses explicit playing-time wording and
+    never tries to infer talent or a betting side from prose.
+    """
+    raw=str(text or "").strip()
+    t=raw.upper()
+    if not t:
+        return {}
+    out={}
+    # Strong no-play phrases first.
+    if any(x in t for x in ["WON'T PLAY","WILL NOT PLAY","NOT PLAYING","RESTING","REST STARTERS","SIT OUT","SITTING OUT"]):
+        out.update({"status":"RESTING","preseason_snap_share":0.0,"rotation_parse_confidence":0.98})
+        return out
+    # Explicit drives / series.
+    m=re.search(r"\b(\d+(?:\.\d+)?)\s*(?:DRIVES?|SERIES)\b",t)
+    if m:
+        out["preseason_expected_drives"]=float(m.group(1))
+        out["rotation_parse_confidence"]=0.94
+    word_map={"ONE":1,"TWO":2,"THREE":3,"FOUR":4,"FIVE":5,"SIX":6}
+    if "preseason_expected_drives" not in out:
+        for word,num in word_map.items():
+            if re.search(rf"\b{word}\s+(?:DRIVES?|SERIES)\b",t):
+                out["preseason_expected_drives"]=float(num); out["rotation_parse_confidence"]=0.92; break
+    # Quarters / halves.
+    if any(x in t for x in ["FIRST HALF","ONE HALF","THROUGH HALFTIME","UNTIL HALFTIME"]):
+        out["preseason_expected_quarters"]=2.0; out["rotation_parse_confidence"]=max(out.get("rotation_parse_confidence",0),0.92)
+    elif any(x in t for x in ["FIRST QUARTER","ONE QUARTER"]):
+        out["preseason_expected_quarters"]=1.0; out["rotation_parse_confidence"]=max(out.get("rotation_parse_confidence",0),0.92)
+    elif "THREE QUARTERS" in t:
+        out["preseason_expected_quarters"]=3.0; out["rotation_parse_confidence"]=max(out.get("rotation_parse_confidence",0),0.90)
+    # Generic limited wording should lower certainty, not invent a precise share.
+    if any(x in t for x in ["LIMITED","BRIEF APPEARANCE","SHORT STINT","FEW SNAPS"]):
+        out["status"]="LIMITED_WORKLOAD"
+        out.setdefault("limited_snap_risk",0.45)
+        out["rotation_parse_confidence"]=max(out.get("rotation_parse_confidence",0),0.78)
+    if any(x in t for x in ["FULL GAME","MOST OF THE GAME","EXTENDED WORK","EXTENDED RUN"]):
+        out["preseason_snap_floor"] = 0.58
+        out["rotation_parse_confidence"]=max(out.get("rotation_parse_confidence",0),0.82)
+    return out
+
+
+def _lookup_preseason_rotation(row):
+    data=load_preseason_rotations()
+    if not data:
+        return {}
+    player=norm((row or {}).get("player"))
+    team=_normalize_nfl_team((row or {}).get("team"))
+    prop=str((row or {}).get("prop") or "")
+    out={}
+    teams=data.get("teams") if isinstance(data.get("teams"),dict) else {}
+    team_ctx=teams.get(team) if team else None
+    if isinstance(team_ctx,dict):
+        out.update(team_ctx)
+    players=data.get("players") if isinstance(data.get("players"),dict) else {}
+    for key in [f"{team}|{player}" if team else "", player, str((row or {}).get("player") or "")]:
+        if key and isinstance(players.get(key),dict):
+            out.update(players.get(key))
+    props=data.get("player_props") if isinstance(data.get("player_props"),dict) else {}
+    for key in [f"{team}|{player}|{prop}" if team else "", f"{player}|{prop}"]:
+        if key and isinstance(props.get(key),dict):
+            out.update(props.get(key))
+    if not out:
+        return {}
+    parsed=_parse_preseason_rotation_note(out.get("note") or out.get("news") or out.get("coach_note"))
+    for k,v in parsed.items():
+        out.setdefault(k,v)
+    allowed={
+        "status","note","news","coach_note","confidence","depth_rank","preseason_depth_rank",
+        "preseason_snap_share","expected_snap_share","preseason_snap_floor",
+        "preseason_expected_drives","preseason_expected_quarters","preseason_expected_pass_attempts",
+        "preseason_expected_carries","preseason_expected_routes","preseason_expected_targets",
+        "limited_snap_risk","preseason_team_plays","preseason_pass_rate",
+        "preseason_prior_completion_rate","preseason_prior_ypa","preseason_prior_ypc",
+        "preseason_prior_catch_rate","preseason_prior_ypt","prior_sample_attempts",
+        "prior_sample_carries","prior_sample_targets","prior_source","prior_confidence",
+        "rotation_parse_confidence",
+    }
+    result={k:v for k,v in out.items() if k in allowed and v not in [None,""]}
+    if result:
+        result["has_preseason_rotation_context"]=True
+        result["preseason_rotation_updated_at"]=out.get("updated_at") or data.get("updated_at") or now_iso()
+    return result
+
+PRESEASON_ROOM_BUDGETS = {
+    # Player-snap equivalents per offensive snap.  QB is exactly one player; the
+    # skill-room budgets sum to ~5 eligible skill positions without pretending every
+    # WR/RB/TE room should sum to 100% individually.
+    "QB": 1.00,
+    "BACKFIELD": 1.15,
+    "WR": 2.65,
+    "TE": 1.20,
 }
 
-def _preseason_rotation_record(row):
-    data=load_preseason_rotations()
-    players=data.get("players") if isinstance(data.get("players"),dict) else {}
-    team=_normalize_nfl_team((row or {}).get("team"))
-    player=norm((row or {}).get("player"))
-    return dict(players.get(f"{team}|{player}") or players.get(player) or {})
+
+def _preseason_room_group(position):
+    pos=str(position or "").upper().strip()
+    if pos=="QB": return "QB"
+    if pos in {"RB","FB"}: return "BACKFIELD"
+    if pos=="WR": return "WR"
+    if pos=="TE": return "TE"
+    return "OTHER"
+
+
+def _preseason_default_room_weight(position, depth_rank=None, rookie=False, starter=False):
+    """Relative rotation weight only; final shares are zero-sum inside the room."""
+    pos=str(position or "").upper().strip()
+    d=int(max(1, safe_float(depth_rank, 9) or 9))
+    if pos=="QB":
+        table={1:0.22,2:0.44,3:0.38,4:0.28,5:0.18}
+        w=table.get(d,0.12)
+    elif pos in {"RB","FB"}:
+        table={1:0.20,2:0.31,3:0.40,4:0.43,5:0.37,6:0.29,7:0.20}
+        w=table.get(d,0.14)
+    elif pos=="WR":
+        table={1:0.18,2:0.27,3:0.37,4:0.46,5:0.49,6:0.45,7:0.37,8:0.29,9:0.20}
+        w=table.get(d,0.15)
+    elif pos=="TE":
+        table={1:0.20,2:0.35,3:0.43,4:0.38,5:0.27,6:0.18}
+        w=table.get(d,0.13)
+    else:
+        w=0.20
+    # Rookies/deep developmental players generally receive more preseason evaluation
+    # work, but keep the nudge small because coach news must remain the dominant input.
+    if rookie and d>=2:
+        w*=1.10
+    if starter and d<=1:
+        w*=0.96
+    return float(max(0.02,w))
+
+
+def _preseason_rotation_explicit_share(ctx, position):
+    """Return (share, locked, source) from explicit rotation/news context."""
+    ctx=dict(ctx or {})
+    text=" ".join(str(ctx.get(k) or "") for k in ["status","note","news","coach_note","manual_override_status","manual_note","role_note"])
+    parsed=_parse_preseason_rotation_note(text)
+    for k,v in parsed.items():
+        ctx.setdefault(k,v)
+    status=str(ctx.get("status") or ctx.get("manual_override_status") or "").upper()
+    if any(x in status for x in ["OUT","INACTIVE","RESTING","NOT_PLAYING"]):
+        return 0.0, True, "inactive/rest"
+    for key in ["preseason_snap_share","expected_snap_share","manual_expected_snap_share","projected_snap_share"]:
+        if ctx.get(key) not in [None,""]:
+            share=_as_fraction(ctx.get(key))
+            if share is not None:
+                return float(clamp(share,0.0,0.90)), True, key
+    if str(position or "").upper()=="QB":
+        drives=_preseason_first_num(ctx,["preseason_expected_drives","expected_drives","qb_expected_drives"],None)
+        quarters=_preseason_first_num(ctx,["preseason_expected_quarters","expected_quarters"],None)
+        if drives is not None and drives>=0:
+            return float(clamp(drives/10.0,0.0,0.90)), True, "expected_drives"
+        if quarters is not None and quarters>=0:
+            return float(clamp(quarters/4.0,0.0,0.90)), True, "expected_quarters"
+    return None, False, ""
+
+
+def _preseason_roster_metadata_bank():
+    """Small player metadata bank used by the rotation allocator."""
+    bank={}
+    cur=_read_optional_csv(CURRENT_USAGE_FILE)
+    if not cur.empty:
+        for _,r in cur.iterrows():
+            player=norm(r.get("player")); team=_normalize_nfl_team(r.get("team"))
+            if player:
+                bank[(player,team or "")]={k:r.get(k) for k in cur.columns}
+                bank.setdefault((player,""),bank[(player,team or "")])
+    return bank
+
 
 def apply_preseason_team_rotation_context(rows):
-    """Attach a zero-sum preseason room allocation without using season volume."""
-    output=[dict(row or {}) for row in (rows or [])]
-    unique={}
-    for row in output:
-        team=_normalize_nfl_team(row.get("team")); room=_preseason_room(row.get("position"))
-        key=(team,room,norm(row.get("player")))
-        unique.setdefault(key,row)
-    allocations={}
-    grouped={}
-    for key,row in unique.items():
-        grouped.setdefault(key[:2],[]).append((key,row))
-    for (team,room),members in grouped.items():
-        budget=PRESEASON_ROOM_BUDGETS.get(room,1.0)
-        working=[]
-        for key,row in members:
-            saved=_preseason_rotation_record(row)
-            status=str(saved.get("status") or row.get("preseason_status") or "ACTIVE").upper()
-            explicit=None
-            for field in ["preseason_snap_share","expected_snap_share","preseason_room_snap_share"]:
-                explicit=_as_fraction(saved.get(field),_as_fraction(row.get(field)))
-                if explicit is not None: break
-            drives=safe_float(saved.get("preseason_expected_drives"),safe_float(row.get("preseason_expected_drives")))
-            quarters=safe_float(saved.get("preseason_expected_quarters"),safe_float(row.get("preseason_expected_quarters")))
-            if status in {"RESTING","OUT","INACTIVE"}:
-                explicit=0.0
-            elif explicit is None and drives is not None:
-                explicit=clamp(drives/10.0,0.0,0.9)
-            elif explicit is None and quarters is not None:
-                explicit=clamp(quarters/4.0,0.0,0.9)
-            depth=max(1,int(safe_float(saved.get("depth_rank"),safe_float(row.get("preseason_depth_rank"),safe_float(row.get("depth_rank"),3))) or 3))
-            default=PRESEASON_DEPTH_SHARES.get(room,{1:0.35}).get(depth,0.08)
-            working.append({"key":key,"row":row,"saved":saved,"share":explicit if explicit is not None else default,"locked":explicit is not None,"status":status})
-        total=sum(item["share"] for item in working)
-        if total>budget and total>0:
-            locked_total=sum(item["share"] for item in working if item["locked"])
-            unlocked=[item for item in working if not item["locked"]]
-            remaining=max(0.0,budget-locked_total)
-            unlocked_total=sum(item["share"] for item in unlocked)
-            if locked_total>budget:
-                for item in working:
-                    item["share"]=(item["share"]*budget/locked_total) if item["locked"] else 0.0
-            elif unlocked_total>0:
-                for item in unlocked:
-                    item["share"]*=remaining/unlocked_total
-        room_total=sum(item["share"] for item in working)
-        for item in working:
-            saved=item["saved"]
-            confidence=safe_float(saved.get("confidence"),safe_float(item["row"].get("preseason_rotation_confidence")))
-            confidence_label="CONFIRMED" if item["locked"] and (confidence or 0)>=0.75 else "LIKELY" if item["locked"] else "UNKNOWN"
-            allocations[item["key"]]={
-                **saved,"preseason_room_snap_share":round(item["share"],4),
-                "preseason_room_locked":item["locked"],"preseason_room_total":round(room_total,4),
-                "preseason_room_reserve":round(max(0.0,budget-room_total),4),
-                "preseason_workload_confidence":confidence_label,
-                "preseason_workload_source":"COACH_ROTATION" if item["locked"] else "DEPTH_PRIOR",
-                "preseason_status":item["status"],"has_preseason_rotation_context":bool(item["locked"]),
-            }
-    for row in output:
-        key=(_normalize_nfl_team(row.get("team")),_preseason_room(row.get("position")),norm(row.get("player")))
-        row.update(allocations.get(key,{}))
-        row["season_mode"]="PRESEASON"
-    return output
+    """Allocate preseason playing time jointly across each team position room.
 
-def _preseason_workload(row, prop):
-    share=_as_fraction(row.get("preseason_room_snap_share"),0.0) or 0.0
-    source=str(row.get("preseason_workload_source") or "DEPTH_PRIOR")
-    confidence=str(row.get("preseason_workload_confidence") or "UNKNOWN").upper()
-    team_plays=62.0
-    pass_plays=team_plays*0.54
-    rush_plays=team_plays-pass_plays
-    attempts=safe_float(row.get("preseason_expected_pass_attempts"))
-    drives=safe_float(row.get("preseason_expected_drives"))
-    if attempts is None:
-        attempts=(drives*5.6) if drives is not None else pass_plays*share
-    routes=safe_float(row.get("preseason_expected_routes"))
-    if routes is None:
-        routes=pass_plays*share*0.84
-    targets=safe_float(row.get("preseason_expected_targets"))
-    if targets is None:
-        target_rate={"WR":0.18,"TE":0.17,"RB":0.13,"FB":0.09}.get(str(row.get("position") or "").upper(),0.16)
-        targets=routes*target_rate
-    carries=safe_float(row.get("preseason_expected_carries"))
+    Explicit coach/manual inputs are locked first.  The remaining room budget is shared
+    across the rest of the current depth chart, so QB2/QB3/RB/WR projections cannot all
+    independently assume large playing-time shares.  Only the returned live rows are
+    projected, but omitted depth-chart teammates still consume their share of the room.
+    """
+    rows=[dict(r) for r in (rows or [])]
+    if not rows:
+        return rows
+    active_teams={_normalize_nfl_team(r.get("team")) for r in rows if _normalize_nfl_team(r.get("team"))}
+    depth_df=_read_optional_csv(DEPTH_CHART_FILE)
+    meta_bank=_preseason_roster_metadata_bank()
+    candidates={}
+
+    def add_candidate(player,team,pos,depth=None,starter=None,base_row=None):
+        player_name=str(player or "").strip(); team_u=_normalize_nfl_team(team); pos_u=str(pos or "").upper().strip()
+        room=_preseason_room_group(pos_u)
+        if not player_name or not team_u or room=="OTHER" or (active_teams and team_u not in active_teams):
+            return
+        key=(team_u,room,norm(player_name))
+        d=candidates.setdefault(key,{"player":player_name,"team":team_u,"position":pos_u,"depth_rank":depth,"starter":starter,"row":{}})
+        if base_row:
+            d["row"].update(dict(base_row))
+        if d.get("depth_rank") in [None,""] and depth not in [None,""]:
+            d["depth_rank"]=depth
+        if d.get("starter") in [None,""] and starter not in [None,""]:
+            d["starter"]=starter
+
+    # Full depth chart first so players without an Underdog line still consume rotation.
+    if not depth_df.empty:
+        for _,d in depth_df.iterrows():
+            add_candidate(d.get("player"),d.get("team"),d.get("position"),d.get("depth_rank"),d.get("starter"),d.to_dict())
+    # Live-board rows win for identity/context.
+    for r in rows:
+        add_candidate(r.get("player"),r.get("team"),r.get("position"),r.get("depth_rank"),r.get("starter"),r)
+
+    groups={}
+    for key,c in candidates.items():
+        groups.setdefault((c["team"],_preseason_room_group(c["position"])),[]).append(c)
+
+    alloc_bank={}
+    for (team,room),members in groups.items():
+        budget=float(PRESEASON_ROOM_BUDGETS.get(room,1.0))
+        locked_total=0.0; open_members=[]
+        for c in members:
+            pseudo=dict(c.get("row") or {})
+            pseudo.update({"player":c["player"],"team":team,"position":c["position"],"depth_rank":c.get("depth_rank"),"starter":c.get("starter")})
+            # Dedicated preseason rotation plus generic manual news are both honored.
+            rot=_lookup_preseason_rotation(pseudo)
+            man=_lookup_manual_override(pseudo)
+            ctx={**pseudo,**rot,**man}
+            explicit_share,locked,source=_preseason_rotation_explicit_share(ctx,c["position"])
+            meta=meta_bank.get((norm(c["player"]),team)) or meta_bank.get((norm(c["player"]),"")) or {}
+            rookie=bool(int(safe_float(ctx.get("rookie_flag"), safe_float(ctx.get("split_rookie_flag"), safe_float(meta.get("rookie_flag"),0))) or 0))
+            depth=safe_float(ctx.get("preseason_depth_rank"), safe_float(ctx.get("depth_rank"), safe_float(c.get("depth_rank"),9)))
+            starter=bool(str(ctx.get("starter") or c.get("starter") or "").upper() in {"1","TRUE","YES"} or (depth is not None and depth==1))
+            c.update({"ctx":ctx,"rookie":rookie,"depth_rank":depth,"starter":starter,"locked":locked,"lock_source":source})
+            if locked:
+                c["allocated_share"]=float(max(0.0,explicit_share or 0.0)); locked_total+=c["allocated_share"]
+            else:
+                c["weight"]=_preseason_default_room_weight(c["position"],depth,rookie,starter)
+                open_members.append(c)
+
+        overbooked=locked_total>budget+1e-9
+        if overbooked and locked_total>0:
+            scale=budget/locked_total
+            for c in members:
+                if c.get("locked"):
+                    c["allocated_share"]*=scale
+            locked_total=budget
+        remaining=max(0.0,budget-locked_total)
+        weight_total=sum(c.get("weight",0.0) for c in open_members)
+        if open_members and remaining>0 and weight_total>0:
+            # First proportional allocation, with a realistic single-player cap.  Any
+            # tiny leftover after caps remains reserve instead of being forced onto a player.
+            for c in open_members:
+                share=remaining*c.get("weight",0.0)/weight_total
+                c["allocated_share"]=float(clamp(share,0.01,0.85))
+        group_total=sum(c.get("allocated_share",0.0) for c in members)
+        reserve=max(0.0,budget-group_total)
+        depth_known=sum(1 for c in members if safe_float(c.get("depth_rank")) is not None)
+        completeness=depth_known/max(1,len(members))
+        for c in members:
+            confidence="HIGH" if c.get("locked") else "MEDIUM" if completeness>=0.75 and len(members)>=2 else "LOW"
+            alloc_bank[(team,room,norm(c["player"]))]={
+                "preseason_room_snap_share":round(float(c.get("allocated_share",0.0)),4),
+                "preseason_room_group":room,
+                "preseason_room_budget":round(budget,3),
+                "preseason_room_total":round(group_total,3),
+                "preseason_room_reserve":round(reserve,3),
+                "preseason_room_locked":bool(c.get("locked")),
+                "preseason_room_source":c.get("lock_source") or "zero-sum depth allocation",
+                "preseason_room_confidence":confidence,
+                "preseason_room_members":len(members),
+                "preseason_room_overbooked":bool(overbooked),
+            }
+
+    out=[]
+    for r in rows:
+        rr=dict(r)
+        team=_normalize_nfl_team(rr.get("team")); room=_preseason_room_group(rr.get("position"))
+        ctx=alloc_bank.get((team,room,norm(rr.get("player"))))
+        if ctx:
+            rr.update(ctx)
+        out.append(rr)
+    return out
+
+
+def _preseason_first_num(row, keys, default=None):
+    for key in keys:
+        val=safe_float((row or {}).get(key))
+        if val is not None:
+            return val
+    return default
+
+def _as_fraction(value, default=None):
+    v=safe_float(value)
+    if v is None:
+        return default
+    if v > 1.0:
+        v/=100.0
+    return float(clamp(v,0.0,1.0))
+
+def _preseason_workload_model(row, prop, role):
+    """Estimate only *playing time/opportunity* for preseason.
+
+    Talent/efficiency comes later. This intentionally does not scale a full-game
+    projection by a generic constant. Explicit coach/manual workload information wins,
+    then depth-chart role, then conservative position defaults.
+    """
+    row=dict(row or {})
+    # Parse explicit coach/rotation wording from either the dedicated rotation file or
+    # the generic manual-news override before any default workload is considered.
+    rotation_text=" ".join(str(row.get(k) or "") for k in ["note","news","coach_note","manual_note","role_note","manual_override_status","injury_note"])
+    for k,v in _parse_preseason_rotation_note(rotation_text).items():
+        row.setdefault(k,v)
+    pos=str(row.get("position") or "").upper().strip()
+    depth=_preseason_first_num(row,["preseason_depth_rank","depth_rank","qb_depth_rank"],None)
+    starter_txt=" ".join(str(row.get(k) or "") for k in ["starter","role","role_note","manual_override_status","manual_note","injury_note","status","note","news","coach_note"]).upper()
+    notes=[]
+    explicit=False
+    source="DEPTH/ROLE DEFAULT"
+
+    # Explicit preseason opportunity inputs. expected_snap_share may be supplied through
+    # the existing Manual News Override panel, which is useful for coach rotation news.
+    snap_share=None
+    for key in ["preseason_snap_share","expected_snap_share","manual_expected_snap_share","projected_snap_share"]:
+        if row.get(key) not in [None,""]:
+            snap_share=_as_fraction(row.get(key))
+            if snap_share is not None:
+                explicit=True; source=key; notes.append(f"Explicit preseason snap share: {snap_share:.0%}")
+                break
+
+    expected_drives=_preseason_first_num(row,["preseason_expected_drives","expected_drives","qb_expected_drives"],None)
+    expected_quarters=_preseason_first_num(row,["preseason_expected_quarters","expected_quarters"],None)
+    if pos=="QB" and snap_share is None:
+        if expected_drives is not None and expected_drives>0:
+            # Roughly 10 offensive drives in a normal game; used only as a workload map.
+            snap_share=float(clamp(expected_drives/10.0,0.06,0.85))
+            explicit=True; source="expected_drives"; notes.append(f"Explicit QB drives: {expected_drives:g}")
+        elif expected_quarters is not None and expected_quarters>0:
+            snap_share=float(clamp(expected_quarters/4.0,0.06,0.85))
+            explicit=True; source="expected_quarters"; notes.append(f"Explicit QB quarters: {expected_quarters:g}")
+
+    # Joint team-room allocation is preferred over independent depth defaults.  It has
+    # already accounted for the other QBs/RBs/WRs/TEs on the roster.
+    if snap_share is None and row.get("preseason_room_snap_share") not in [None,""]:
+        snap_share=_as_fraction(row.get("preseason_room_snap_share"))
+        if snap_share is not None:
+            source="zero-sum team room"
+            notes.append(f"Zero-sum {row.get('preseason_room_group') or pos} room share: {snap_share:.0%}")
+            if row.get("preseason_room_overbooked"):
+                notes.append("Rotation room had explicit shares above budget; locked shares were normalized")
+
+    if snap_share is None:
+        is_starter=("STARTER" in starter_txt or str(row.get("starter") or "").upper() in {"TRUE","YES","1"})
+        if pos=="QB":
+            if is_starter or depth==1:
+                snap_share=0.24
+            elif depth==2:
+                snap_share=0.42
+            elif depth is not None and depth>=3:
+                snap_share=0.34
+            else:
+                snap_share=0.32
+        elif pos in {"RB","FB"}:
+            if is_starter or depth==1:
+                snap_share=0.22
+            elif depth==2:
+                snap_share=0.38
+            elif depth is not None and depth>=3:
+                snap_share=0.44
+            else:
+                snap_share=0.30
+        elif pos in {"WR","TE"}:
+            if is_starter or depth==1:
+                snap_share=0.24
+            elif depth==2:
+                snap_share=0.38
+            elif depth is not None and depth>=3:
+                snap_share=0.44
+            else:
+                snap_share=0.30
+        else:
+            snap_share=0.30
+
+    # Coach/role language can override the generic depth assumption.
+    if any(x in starter_txt for x in ["NOT PLAY","WON'T PLAY","WILL NOT PLAY","OUT","RESTING","REST STARTERS"]):
+        snap_share=min(snap_share,0.02); explicit=True; source="coach/status inactive"; notes.append("Preseason no-play/rest signal")
+    elif "ONE DRIVE" in starter_txt:
+        snap_share=min(snap_share,0.10); explicit=True; source="coach one-drive"; notes.append("One-drive workload")
+    elif "TWO DRIVE" in starter_txt:
+        snap_share=min(snap_share,0.18); explicit=True; source="coach two-drive"; notes.append("Two-drive workload")
+    elif "FIRST HALF" in starter_txt or "ONE HALF" in starter_txt:
+        snap_share=max(snap_share,0.46); explicit=True; source="coach first-half"; notes.append("First-half workload")
+    elif any(x in starter_txt for x in ["LIMITED","WORKLOAD LIMIT","LIMITED_WORKLOAD"]):
+        snap_share*=0.72; notes.append("Limited-workload tax")
+
+    snap_floor=_as_fraction(row.get("preseason_snap_floor"))
+    if snap_floor is not None and snap_floor>snap_share:
+        snap_share=min(0.85,snap_floor); explicit=True; source="preseason snap floor"; notes.append(f"Explicit extended-work floor: {snap_floor:.0%}")
+
+    limited_risk=_preseason_first_num(row,["limited_snap_risk","preseason_limited_snap_risk"],0.0) or 0.0
+    if limited_risk>0:
+        snap_share*=float(clamp(1-limited_risk*0.25,0.65,1.0))
+        notes.append(f"Limited snap risk {limited_risk:.0%}")
+
+    snap_share=float(clamp(snap_share,0.01,0.85))
+    team_plays=_preseason_first_num(row,["preseason_team_plays","pbp_plays_pg","plays_pg"],62.0) or 62.0
+    pass_rate=_preseason_first_num(row,["preseason_pass_rate","pbp_pass_rate","pass_rate"],56.0) or 56.0
+    if pass_rate<=1.0: pass_rate*=100.0
+    pass_rate=float(clamp(pass_rate,38.0,72.0))
+    expected_snaps=team_plays*snap_share
+    expected_team_passes=team_plays*(pass_rate/100.0)*snap_share
+
+    # Direct opportunity overrides are more authoritative than inferred snaps.
+    exp_pass_attempts=_preseason_first_num(row,["preseason_expected_pass_attempts","expected_pass_attempts","expected_attempts"],None)
+    exp_carries=_preseason_first_num(row,["preseason_expected_carries","expected_carries"],None)
+    exp_routes=_preseason_first_num(row,["preseason_expected_routes","expected_routes"],None)
+    exp_targets=_preseason_first_num(row,["preseason_expected_targets","expected_targets"],None)
+    if any(v is not None for v in [exp_pass_attempts,exp_carries,exp_routes,exp_targets]):
+        explicit=True
+        source="explicit opportunity override"
+
+    if exp_pass_attempts is None and pos=="QB":
+        exp_pass_attempts=expected_team_passes*0.98
+
+    room_conf=str(row.get("preseason_room_confidence") or "").upper()
+    confidence="HIGH" if explicit else room_conf if room_conf in {"HIGH","MEDIUM","LOW"} else "MEDIUM" if depth is not None else "LOW"
+    workload_score={"HIGH":92,"MEDIUM":78,"LOW":58}[confidence]
+    if row.get("preseason_room_overbooked"):
+        workload_score-=8
+    workload_score-=int(clamp(limited_risk*20,0,18))
+    if snap_share<=0.03:
+        workload_score=min(workload_score,45)
+
+    uncertainty_mult={"HIGH":1.12,"MEDIUM":1.34,"LOW":1.62}[confidence]
+    return {
+        "snap_share":round(snap_share,4),
+        "expected_snaps":round(expected_snaps,2),
+        "expected_team_passes_during_role":round(expected_team_passes,2),
+        "expected_pass_attempts":None if exp_pass_attempts is None else round(float(exp_pass_attempts),2),
+        "expected_carries":None if exp_carries is None else round(float(exp_carries),2),
+        "expected_routes":None if exp_routes is None else round(float(exp_routes),2),
+        "expected_targets":None if exp_targets is None else round(float(exp_targets),2),
+        "team_plays":round(team_plays,2),"pass_rate":round(pass_rate,2),
+        "depth_rank":depth,"confidence":confidence,"score":int(clamp(workload_score,0,99)),
+        "uncertainty_mult":uncertainty_mult,"source":source,"explicit":explicit,
+        "room_group":row.get("preseason_room_group"),"room_budget":row.get("preseason_room_budget"),
+        "room_total":row.get("preseason_room_total"),"room_reserve":row.get("preseason_room_reserve"),
+        "room_members":row.get("preseason_room_members"),"room_locked":row.get("preseason_room_locked"),
+        "inactive":snap_share<=0.03,"notes":notes,
+    }
+
+
+def _preseason_prior_row(row):
+    bank=load_preseason_prior_bank()
+    player=norm((row or {}).get("player")); team=_normalize_nfl_team((row or {}).get("team"))
+    return dict(bank.get((player,team or "")) or bank.get((player,"")) or {})
+
+
+def _shrink_efficiency(observed, baseline, sample_n, stabilizer, lo, hi):
+    obs=safe_float(observed); base=safe_float(baseline)
+    if base is None:
+        base=(lo+hi)/2.0
+    if obs is None:
+        return float(clamp(base,lo,hi)),0.0
+    n=max(0.0,safe_float(sample_n,0) or 0)
+    weight=float(clamp(n/max(1.0,n+stabilizer),0.0,0.88))
+    val=base*(1-weight)+obs*weight
+    return float(clamp(val,lo,hi)),weight
+
+
+def _preseason_efficiency_prior(row, workload=None):
+    """Hierarchical preseason efficiency prior.
+
+    Priority: explicit/vendor preseason prior -> NFL player evidence shrunk to role prior ->
+    conservative rookie/depth-chart prior.  This lets backups and rookies project from
+    realistic efficiency without pretending a tiny NFL sample is their true talent.
+    """
+    row=dict(row or {}); workload=workload or {}
+    pos=str(row.get("position") or "").upper().strip()
+    depth=int(max(1,safe_float(row.get("preseason_depth_rank"),safe_float(row.get("depth_rank"),9)) or 9))
+    rookie_raw=row.get("rookie_flag",row.get("split_rookie_flag",0))
+    rookie=str(rookie_raw).upper() in {"TRUE","YES","1"} or (safe_float(rookie_raw,0) or 0)>=1
+    years=safe_float(row.get("years_exp"),safe_float(row.get("years_of_experience")))
+    prior_file=_preseason_prior_row(row)
+
+    # Conservative role priors.  These are not projections by themselves; they are
+    # efficiency anchors that are multiplied by separately estimated opportunities.
+    if pos=="QB":
+        if depth<=1:
+            base_ypa,base_comp=7.15,0.648
+        elif depth==2:
+            base_ypa,base_comp=6.70,0.625
+        else:
+            base_ypa,base_comp=6.35,0.605
+        if rookie:
+            base_ypa-=0.18; base_comp-=0.012
+    else:
+        base_ypa,base_comp=7.0,0.64
+    if pos in {"RB","FB"}:
+        base_ypc=4.22 if depth<=2 else 4.08
+        base_ypt=6.45 if depth<=2 else 6.15
+        base_catch=0.715 if depth<=2 else 0.69
+    elif pos=="WR":
+        base_ypc=4.25
+        base_ypt=8.25 if depth<=3 else 7.75
+        base_catch=0.625 if depth<=3 else 0.595
+    elif pos=="TE":
+        base_ypc=4.15
+        base_ypt=7.35 if depth<=2 else 6.95
+        base_catch=0.675 if depth<=2 else 0.645
+    elif pos=="QB":
+        base_ypc=5.0 if depth<=2 else 4.6
+        base_ypt=4.0; base_catch=0.50
+    else:
+        base_ypc=4.15; base_ypt=7.2; base_catch=0.62
+    if rookie:
+        if pos in {"WR","TE"}: base_ypt-=0.20
+        if pos in {"RB","FB"}: base_ypc-=0.08
+
+    # Player NFL evidence.  If exact total samples are unavailable, per-game volume is
+    # converted to a deliberately conservative pseudo-sample instead of treated as full certainty.
+    games=max(0.0,_preseason_first_num(row,["current_games","games_played","games","player_games"],0.0) or 0.0)
+    att_pg=_preseason_first_num(row,["current_pass_attempts_pg","last5_pass_attempts_pg","pass_attempts_pg"],None)
+    pass_ypg=_preseason_first_num(row,["current_passing_yards_pg","last5_passing_yards_pg","passing_yards_pg"],None)
+    comp_pg=_preseason_first_num(row,["current_completions_pg","last5_completions_pg","completions_pg"],None)
+    obs_ypa=_preseason_first_num(row,["yards_per_attempt","passing_yards_per_attempt"],None)
+    if obs_ypa is None and pass_ypg is not None and att_pg and att_pg>0:
+        obs_ypa=pass_ypg/att_pg
+    obs_comp=_as_fraction(_preseason_first_num(row,["completion_rate","qb_completion_rate","current_completion_rate"],None))
+    if obs_comp is None and comp_pg is not None and att_pg and att_pg>0:
+        obs_comp=comp_pg/att_pg
+    att_total=_preseason_first_num(row,["pass_attempts","attempts","career_pass_attempts","prior_sample_attempts"],None)
+    if att_total is None and att_pg:
+        att_total=att_pg*(games if games>=2 else 4.5)
+
+    rush_pg=_preseason_first_num(row,["current_rush_attempts_pg","last5_rush_attempts_pg","rush_attempts_pg","carries_pg"],None)
+    rush_ypg=_preseason_first_num(row,["current_rushing_yards_pg","last5_rushing_yards_pg","rushing_yards_pg"],None)
+    obs_ypc=_preseason_first_num(row,["yards_per_carry"],None)
+    if obs_ypc is None and rush_ypg is not None and rush_pg and rush_pg>0:
+        obs_ypc=rush_ypg/rush_pg
+    carry_total=_preseason_first_num(row,["carries","rush_attempts","career_carries","prior_sample_carries"],None)
+    if carry_total is None and rush_pg:
+        carry_total=rush_pg*(games if games>=2 else 4.5)
+
+    targ_pg=_preseason_first_num(row,["current_targets_pg","last5_targets_pg","targets_pg"],None)
+    rec_pg=_preseason_first_num(row,["current_receptions_pg","last5_receptions_pg","receptions_pg"],None)
+    rec_ypg=_preseason_first_num(row,["current_receiving_yards_pg","last5_receiving_yards_pg","receiving_yards_pg"],None)
+    obs_catch=_as_fraction(_preseason_first_num(row,["catch_rate","reception_rate"],None))
+    if obs_catch is None and rec_pg is not None and targ_pg and targ_pg>0:
+        obs_catch=rec_pg/targ_pg
+    obs_ypt=_preseason_first_num(row,["yards_per_target"],None)
+    if obs_ypt is None and rec_ypg is not None and targ_pg and targ_pg>0:
+        obs_ypt=rec_ypg/targ_pg
+    target_total=_preseason_first_num(row,["targets","career_targets","prior_sample_targets"],None)
+    if target_total is None and targ_pg:
+        target_total=targ_pg*(games if games>=2 else 4.5)
+
+    # Optional current-preseason/college-adjusted/vendor file overrides observations and
+    # provides an explicit sample size/confidence.  Same fields may arrive via API/manual rotation.
+    explicit_sources=[]
+    def pick_explicit(field, file_field=None):
+        for src,label in [(row,"rotation/manual"),(prior_file,"prior file")]:
+            key=field if field in src else (file_field or field)
+            if src.get(key) not in [None,""]:
+                explicit_sources.append(label)
+                return safe_float(src.get(key))
+        return None
+    e_comp=pick_explicit("preseason_prior_completion_rate","completion_rate")
+    e_ypa=pick_explicit("preseason_prior_ypa","yards_per_attempt")
+    e_ypc=pick_explicit("preseason_prior_ypc","yards_per_carry")
+    e_catch=pick_explicit("preseason_prior_catch_rate","catch_rate")
+    e_ypt=pick_explicit("preseason_prior_ypt","yards_per_target")
+    if e_comp is not None: obs_comp=_as_fraction(e_comp); att_total=max(att_total or 0,_preseason_first_num(prior_file,["sample_attempts","prior_sample_attempts"],80) or 80)
+    if e_ypa is not None: obs_ypa=e_ypa; att_total=max(att_total or 0,_preseason_first_num(prior_file,["sample_attempts","prior_sample_attempts"],80) or 80)
+    if e_ypc is not None: obs_ypc=e_ypc; carry_total=max(carry_total or 0,_preseason_first_num(prior_file,["sample_carries","prior_sample_carries"],45) or 45)
+    if e_catch is not None: obs_catch=_as_fraction(e_catch); target_total=max(target_total or 0,_preseason_first_num(prior_file,["sample_targets","prior_sample_targets"],55) or 55)
+    if e_ypt is not None: obs_ypt=e_ypt; target_total=max(target_total or 0,_preseason_first_num(prior_file,["sample_targets","prior_sample_targets"],55) or 55)
+
+    ypa,w_ypa=_shrink_efficiency(obs_ypa,base_ypa,att_total,110,4.8,9.4)
+    comp,w_comp=_shrink_efficiency(obs_comp,base_comp,att_total,140,0.48,0.76)
+    ypc,w_ypc=_shrink_efficiency(obs_ypc,base_ypc,carry_total,65,2.8,6.8)
+    catch,w_catch=_shrink_efficiency(obs_catch,base_catch,target_total,80,0.42,0.84)
+    ypt,w_ypt=_shrink_efficiency(obs_ypt,base_ypt,target_total,90,4.2,11.8)
+
+    explicit_conf=_preseason_first_num(row,["prior_confidence"],_preseason_first_num(prior_file,["confidence","prior_confidence"],None))
+    if explicit_conf is not None:
+        explicit_conf=_as_fraction(explicit_conf,0.75)
+    evidence=max(w_ypa,w_comp,w_ypc,w_catch,w_ypt)
+    if explicit_sources:
+        score=88 if (explicit_conf or 0.75)>=0.8 else 82
+        source=" + ".join(sorted(set(explicit_sources)))
+    elif evidence>=0.55:
+        score=80; source="NFL player evidence + role shrinkage"
+    elif evidence>=0.25:
+        score=70; source="thin NFL evidence + role shrinkage"
+    else:
+        score=58 if rookie or depth>=3 else 64; source="role/depth prior"
+    if rookie and not explicit_sources and evidence<0.25:
+        score-=5
+    if years is not None and years>=3 and evidence<0.25:
+        score+=3
+    score=float(clamp(score,35,94))
+    label="STRONG" if score>=82 else "SOLID" if score>=72 else "PARTIAL" if score>=62 else "THIN"
+    return {
+        "completion_rate":round(comp,4),"yards_per_attempt":round(ypa,3),
+        "yards_per_carry":round(ypc,3),"catch_rate":round(catch,4),"yards_per_target":round(ypt,3),
+        "sample_attempts":round(att_total or 0,1),"sample_carries":round(carry_total or 0,1),"sample_targets":round(target_total or 0,1),
+        "weights":{"ypa":round(w_ypa,3),"completion":round(w_comp,3),"ypc":round(w_ypc,3),"catch":round(w_catch,3),"ypt":round(w_ypt,3)},
+        "source":source,"score":round(score,1),"label":label,"rookie":bool(rookie),"depth_rank":depth,
+    }
+
+
+def _preseason_projection_core(row, prop, role, workload):
+    """Opportunity-first preseason mean with hierarchical efficiency priors."""
+    pos=str(row.get("position") or "").upper().strip()
+    team_plays=safe_float(workload.get("team_plays"),62) or 62
+    pass_rate=(safe_float(workload.get("pass_rate"),56) or 56)/100.0
+    share=safe_float(workload.get("snap_share"),0.30) or 0.30
+    expected_snaps=safe_float(workload.get("expected_snaps"),team_plays*share) or team_plays*share
+    expected_team_passes=safe_float(workload.get("expected_team_passes_during_role"),team_plays*pass_rate*share) or team_plays*pass_rate*share
+    eff=_preseason_efficiency_prior(row,workload)
+
+    attempts=safe_float(workload.get("expected_pass_attempts"))
+    comp_rate=float(clamp(safe_float(eff.get("completion_rate"),0.64) or 0.64,0.48,0.78))
+    ypa=float(clamp(safe_float(eff.get("yards_per_attempt"),6.7) or 6.7,4.8,9.4))
+    if attempts is None and pos=="QB":
+        attempts=expected_team_passes*0.98
+
+    carries=safe_float(workload.get("expected_carries"))
+    regular_snap=_as_fraction(_preseason_first_num(row,["current_snap_share","last5_snap_share","snap_share"],None))
+    rush_pg=_preseason_first_num(row,["current_rush_attempts_pg","last5_rush_attempts_pg","rush_attempts_pg","carries_pg"],None)
     if carries is None:
-        carries=rush_plays*share*(0.88 if str(row.get("position") or "").upper() in {"RB","FB"} else 0.16)
-    attempts=max(0.0,attempts or 0.0); routes=max(0.0,routes or 0.0)
-    targets=max(0.0,min(targets or 0.0,routes)); carries=max(0.0,carries or 0.0)
-    return {"snap_share":share,"attempts":attempts,"routes":routes,"targets":targets,"carries":carries,
-            "confidence":confidence,"source":source,"team_plays":team_plays,"prop":prop}
+        if regular_snap and rush_pg is not None and regular_snap>0.08:
+            carry_per_snap=rush_pg/max(1.0,team_plays*regular_snap)
+        else:
+            # Usage priors are role-based, not regular-season full-game carry totals.
+            carry_per_snap=0.085 if pos=="QB" else 0.30 if pos in {"RB","FB"} else 0.03
+        if pos=="QB": carry_per_snap=float(clamp(carry_per_snap,0.015,0.17))
+        elif pos in {"RB","FB"}: carry_per_snap=float(clamp(carry_per_snap,0.14,0.46))
+        else: carry_per_snap=float(clamp(carry_per_snap,0.0,0.10))
+        carries=expected_snaps*carry_per_snap
+    ypc=float(clamp(safe_float(eff.get("yards_per_carry"),4.1) or 4.1,2.8,6.8))
+
+    targets=safe_float(workload.get("expected_targets"))
+    routes=safe_float(workload.get("expected_routes"))
+    target_share=_as_fraction(_preseason_first_num(row,["current_target_share","last5_target_share","target_share"],None))
+    if target_share is None:
+        # Route/opportunity uncertainty is separate from catch/yard efficiency.
+        target_share=0.115 if pos in {"RB","FB"} else 0.155 if pos=="TE" else 0.19 if pos=="WR" else 0.02
+    # Deep roster players can be featured against backups, but do not let regular-season
+    # target-share priors turn limited preseason snaps into unrealistic volume.
+    depth=safe_float(row.get("preseason_depth_rank"),safe_float(row.get("depth_rank")))
+    if depth is not None and depth>=4 and pos in {"WR","TE"}:
+        target_share*=0.94
+    target_share=float(clamp(target_share,0.01,0.36))
+    tprr=None
+    if targets is None and routes is not None and routes>0:
+        targets_pg=_preseason_first_num(row,["current_targets_pg","last5_targets_pg","targets_pg"],None)
+        route_part=_as_fraction(_preseason_first_num(row,["route_participation","current_route_participation"],None))
+        pass_att_pg=_preseason_first_num(row,["current_pass_attempts_pg","last5_pass_attempts_pg","pass_attempts_pg"],None)
+        if targets_pg is not None and route_part and pass_att_pg and pass_att_pg>0:
+            tprr=targets_pg/max(1.0,pass_att_pg*route_part)
+        if tprr is None:
+            tprr=0.17 if pos in {"RB","FB"} else 0.18 if pos=="TE" else 0.205 if pos=="WR" else 0.05
+        tprr=float(clamp(tprr,0.08,0.34))
+        targets=routes*tprr
+    elif targets is None:
+        targets=expected_team_passes*target_share
+    catch_rate=float(clamp(safe_float(eff.get("catch_rate"),0.62) or 0.62,0.42,0.84))
+    ypt=float(clamp(safe_float(eff.get("yards_per_target"),7.4) or 7.4,4.2,11.8))
+
+    if prop=="Passing Yards":
+        base=(attempts or 0)*ypa
+    elif prop=="Pass Attempts":
+        base=attempts or 0
+    elif prop=="Completions":
+        base=(attempts or 0)*comp_rate
+    elif prop=="Rushing Yards":
+        base=carries*ypc
+    elif prop=="Rush Attempts":
+        base=carries
+    elif prop=="Receiving Yards":
+        base=targets*ypt
+    elif prop=="Receptions":
+        base=targets*catch_rate
+    else:
+        base=PROP_CONFIG.get(prop,{}).get("base",0)
+
+    return float(max(0.0,base)), {
+        "expected_attempts":None if attempts is None else round(attempts,2),
+        "completion_rate":round(comp_rate,4),"yards_per_attempt":round(ypa,3),
+        "expected_carries":round(carries,2),"yards_per_carry":round(ypc,3),
+        "expected_targets":round(targets,2),"catch_rate":round(catch_rate,4),
+        "yards_per_target":round(ypt,3),"expected_snaps":round(expected_snaps,2),
+        "expected_routes":None if routes is None else round(routes,2),"targets_per_route":None if tprr is None else round(tprr,3),
+        "snap_share":round(share,4),"target_share":round(target_share,4),
+        "efficiency_prior":eff,"efficiency_prior_score":eff.get("score"),
+        "efficiency_prior_label":eff.get("label"),"efficiency_prior_source":eff.get("source"),
+    }
+
+def _preseason_market_workload_audit(row, core):
+    """Use the posted line only as a *role sanity check*, never to create the projection."""
+    prop=str((row or {}).get("prop") or "")
+    line=safe_float((row or {}).get("line"))
+    if line is None:
+        return {"status":"NO LINE","conflict":False,"ratio":None,"note":"No market workload audit"}
+    expected=None; implied=None; unit=""
+    if prop=="Passing Yards":
+        expected=safe_float(core.get("expected_attempts")); ypa=safe_float(core.get("yards_per_attempt"))
+        implied=(line/ypa) if ypa and ypa>0 else None; unit="pass attempts"
+    elif prop=="Pass Attempts":
+        expected=safe_float(core.get("expected_attempts")); implied=line; unit="pass attempts"
+    elif prop=="Completions":
+        expected=safe_float(core.get("expected_attempts")); cr=safe_float(core.get("completion_rate"))
+        implied=(line/cr) if cr and cr>0 else None; unit="pass attempts"
+    elif prop=="Rushing Yards":
+        expected=safe_float(core.get("expected_carries")); ypc=safe_float(core.get("yards_per_carry"))
+        implied=(line/ypc) if ypc and ypc>0 else None; unit="carries"
+    elif prop=="Rush Attempts":
+        expected=safe_float(core.get("expected_carries")); implied=line; unit="carries"
+    elif prop=="Receiving Yards":
+        expected=safe_float(core.get("expected_targets")); ypt=safe_float(core.get("yards_per_target"))
+        implied=(line/ypt) if ypt and ypt>0 else None; unit="targets"
+    elif prop=="Receptions":
+        expected=safe_float(core.get("expected_targets")); cr=safe_float(core.get("catch_rate"))
+        implied=(line/cr) if cr and cr>0 else None; unit="targets"
+    if expected is None or implied is None or expected<=0:
+        return {"status":"UNKNOWN","conflict":False,"ratio":None,"note":"Market-implied workload unavailable"}
+    ratio=implied/max(expected,0.1)
+    if ratio>1.80 or ratio<0.45:
+        status="CONFLICT"; conflict=True
+    elif ratio>1.50 or ratio<0.60:
+        status="WATCH"; conflict=False
+    else:
+        status="ALIGNED"; conflict=False
+    return {
+        "status":status,"conflict":conflict,"ratio":round(ratio,3),
+        "expected_opportunity":round(expected,2),"market_implied_opportunity":round(implied,2),
+        "unit":unit,
+        "note":f"Market workload {status}: model {expected:.1f} vs line-implied {implied:.1f} {unit}",
+    }
+
+def _preseason_reliability_score(row, workload, market_workload, usage_quality, volatility=None, efficiency_score=None):
+    """Independent 0-100 trust score for preseason information quality.
+
+    This is intentionally separate from projection edge/probability.  It mirrors the
+    useful MLB idea of asking "how much should I trust this estimate?" before asking
+    which side is favored.  Workload/coach certainty dominates because preseason
+    talent is much less important than knowing who will actually be on the field.
+    """
+    workload=workload or {}; market_workload=market_workload or {}; row=row or {}
+    wscore=safe_float(workload.get("score"),0) or 0
+    uscore=float(clamp(safe_float(usage_quality,0) or 0,0,100))
+    escore=float(clamp(safe_float(efficiency_score,65) or 65,0,100))
+    # Playing time remains dominant, but a thin rookie/backup efficiency prior now
+    # reduces actionable confidence instead of being treated like veteran evidence.
+    score=0.48*wscore + 0.17*uscore + 0.13*escore
+    score += 10.0 if row.get("model_match",True) else 2.0
+    market_status=str(market_workload.get("status") or "UNKNOWN").upper()
+    score += {"ALIGNED":10.0,"WATCH":5.0,"UNKNOWN":3.0,"CONFLICT":0.0}.get(market_status,3.0)
+    if workload.get("explicit"):
+        score += 8.0
+    conf=str(workload.get("confidence") or "LOW").upper()
+    if conf=="LOW": score-=8.0
+    if str(volatility or "").upper()=="HIGH": score-=8.0
+    elif str(volatility or "").upper()=="MED": score-=2.0
+    if market_workload.get("conflict"): score-=10.0
+    if workload.get("inactive"): score=min(score,28.0)
+    score=float(clamp(score,0,99))
+    label="ELITE" if score>=88 else "STRONG" if score>=80 else "PARTIAL" if score>=70 else "LOW"
+    return round(score,1),label
+
+def _preseason_calibrate_probabilities(over, under, push, reliability_score):
+    """Shrink noisy preseason simulation probabilities toward 50%.
+
+    The projection mean is untouched. Only decision confidence is damped when playing-
+    time/data reliability is weak, preventing a thin preseason estimate from displaying
+    fake 80-90% certainty. Raw simulation probabilities are retained separately.
+    """
+    over=float(clamp(safe_float(over,0.5) or 0.5,0,1))
+    under=float(clamp(safe_float(under,0.5) or 0.5,0,1))
+    push=float(clamp(safe_float(push,0.0) or 0.0,0,1))
+    rel=float(clamp(safe_float(reliability_score,50) or 50,0,100))
+    # 55 reliability => ~45% of raw conviction; 90+ => almost all of it survives.
+    strength=float(clamp(0.45 + (rel-55.0)*0.012,0.35,0.92))
+    cal_over=0.5 + (over-0.5)*strength
+    cal_under=0.5 + (under-0.5)*strength
+    # Preserve a coherent probability simplex after shrinkage.
+    total=cal_over+cal_under
+    cal_push=max(0.0,1.0-total)
+    if total>1.0:
+        cal_over/=total; cal_under/=total; cal_push=0.0
+    return float(cal_over),float(cal_under),float(cal_push),round(strength,3)
 
 def project_row_preseason(row, sims=12000):
-    """Rotation-first preseason projection; Savant remains a shadow efficiency prior."""
-    row=merge_nfl_context({**dict(row or {}),"season_mode":"PRESEASON"})
+    """Dedicated preseason projection engine.
+
+    The raw mean is opportunity-first and independent of the Underdog line. Regular-season
+    grades/calibration are isolated. Market-implied workload is used only to PASS on role
+    conflicts, which is especially important when coach rotations are uncertain.
+    """
+    raw_market_labels=" ".join(str((row or {}).get(key) or "") for key in ["raw_prop_label","line_title","raw_label"])
+    if raw_market_labels.strip() and not _is_full_game_market_label(raw_market_labels):
+        raise ValueError(f"Projection blocked: non-full-game market {raw_market_labels!r}")
+    row=dict(row or {})
+    row["season_mode"]="PRESEASON"
+    row=merge_nfl_context(row)
     row["season_mode"]="PRESEASON"
     prop=_canon_prop_label(row.get("prop"))
+    if prop not in ACTIVE_NFL_MARKETS or prop not in PROP_CONFIG:
+        raise ValueError(f"Projection blocked: unmapped prop {row.get('prop')!r}")
     if prop not in PRESEASON_SUPPORTED_MARKETS:
-        raise ValueError(f"Projection blocked: unsupported preseason prop {row.get('prop')!r}")
+        raise ValueError(f"Preseason model not enabled yet for {prop}; row PASS-blocked instead of using a regular-season baseline")
     row["prop"]=prop
     line=safe_float(row.get("line"))
-    if line is None or not _valid_market_line(prop,line):
-        raise ValueError(f"Projection blocked: invalid {prop} line {row.get('line')!r}")
-    workload=_preseason_workload(row,prop)
-    attempts=workload["attempts"]; routes=workload["routes"]; targets=workload["targets"]; carries=workload["carries"]
-    completion_rate=0.635; ypa=6.55; catch_rate=0.64 if str(row.get("position") or "").upper()!="TE" else 0.67
-    yards_per_target=7.15; ypc=4.10
-    if prop=="Pass Attempts": raw_mean=attempts
-    elif prop=="Completions": raw_mean=min(attempts,attempts*completion_rate)
-    elif prop=="Passing Yards": raw_mean=attempts*ypa
-    elif prop=="Rush Attempts": raw_mean=carries
-    elif prop=="Rushing Yards": raw_mean=carries*ypc
-    elif prop=="Receptions": raw_mean=min(targets,targets*catch_rate)
-    else: raw_mean=targets*yards_per_target
-    raw_mean=max(0.0,float(raw_mean))
-    # The Savant projection is calculated in parallel. It cannot create workload and
-    # is not promoted until a walk-forward validation explicitly whitelists the prop.
-    shadow_input={
+    if line is None or not _valid_market_line(prop,line,"PRESEASON"):
+        raise ValueError(f"Projection blocked: invalid preseason {prop} line {row.get('line')!r}")
+    if not _prop_allowed_for_model_position(prop,row.get("position")):
+        raise ValueError(f"Projection blocked: {prop} invalid for position {row.get('position')!r}")
+
+    cfg=PROP_CONFIG[prop]
+    role=apply_real_usage_to_role(row,player_role_defaults(row.get("position"),prop))
+    usage_quality,usage_flags=usage_data_quality(row,prop)
+    workload=_preseason_workload_model(row,prop,role)
+    base,core=_preseason_projection_core(row,prop,role,workload)
+
+    # Separate preseason learning/calibration. With no prior preseason grades these stay neutral.
+    learn=learning_scale(row.get("player"),prop,"PRESEASON")
+    if bool(st.session_state.get("smart_calibration_enabled",True)):
+        cal_scale,cal_note,smart_calibration=smart_calibration_scale(row,role,usage_quality)
+    else:
+        cal_scale,cal_note=calibration_scale(row.get("player"),prop,"PRESEASON")
+        smart_calibration={"active":cal_scale!=1.0,"level":"preseason_player_prop","scale":cal_scale}
+    cal_status=calibration_readiness(prop,"PRESEASON")
+    base*=learn*cal_scale
+
+    # Savant is allowed to refine per-opportunity efficiency only. It cannot create
+    # preseason snaps/drives/targets/carries. The Savant function already downweights
+    # preseason effects and caps them tightly; low-reliability rows remain shadow-only.
+    legacy_projection_pre_savant=float(base)
+    savant_input={
         key:value for key,value in row.items()
         if key not in {"line","odds","price","over_price","under_price","spread","game_total","team_total","implied_team_total"}
         and not str(key).startswith("market_")
     }
-    shadow_input["projection_consumed_factors"]=["preseason_rotation"]
-    savant_shadow=savant_shadow_projection(shadow_input,raw_mean,"PRESEASON")
-    mean_target=raw_mean
-    confidence=workload["confidence"]
-    uncertainty={"CONFIRMED":1.0,"LIKELY":1.22,"UNKNOWN":1.62}.get(confidence,1.62)
-    sigma=max(PRESEASON_SIGMA_FLOOR[prop],PROP_CONFIG[prop]["sigma"]*0.72,mean_target*0.24)*uncertainty
-    seed=stable_projection_seed(row.get("player"),prop,row.get("team"),row.get("opp"),"preseason_rotation_v732")
-    sim,distribution_meta=simulate_prop_distribution(mean_target,sigma,prop,sims,seed,0.18 if confidence=="CONFIRMED" else 0.28,0.08)
-    expected_mean=float(np.mean(sim)); p10,p50,p75,p90=[float(np.percentile(sim,q)) for q in [10,50,75,90]]
-    over=float(np.mean(sim>line)); under=float(np.mean(sim<line)); push=max(0.0,1.0-over-under)
-    side="OVER" if over>under else "UNDER" if under>over else "PASS"; prob=max(over,under)
-    conflict=distribution_conflict_audit(expected_mean,p50,line,side)
-    selected_price=selected_side_price(row,side); loss_prob=under if side=="OVER" else over if side=="UNDER" else None
-    reliability=int(clamp(88 if confidence=="CONFIRMED" else 76 if confidence=="LIKELY" else 54,0,99))
-    savant_rel=safe_float(row.get("savant_reliability"),0) or 0
-    data_score=int(clamp((reliability*0.78)+(savant_rel*0.12)+8,0,99))
-    audit_blocks=[]
-    if str(row.get("preseason_status") or "").upper() in {"RESTING","OUT","INACTIVE"}: audit_blocks.append("Player not scheduled for preseason work")
-    audit={"label":"Fresh" if confidence=="CONFIRMED" else "Partial","score":5 if confidence=="CONFIRMED" else 3,"max_score":6,"hard_blocks":audit_blocks,
-           "consumed_factors":["preseason_rotation","preseason_efficiency_prior"],"regular_season_volume_used":False}
-    out={**row,"projection":round(expected_mean,2),"expected_mean":round(expected_mean,2),"edge":round(expected_mean-line,2),"pick":side,
-         "fair_prob":round(prob,3),"over_prob":round(over,3),"under_prob":round(under,3),"push_prob":round(push,3),
-         "selected_price":selected_price,"ev":None if loss_prob is None else round(expected_value(prob,selected_price,loss_prob=loss_prob),4),
-         "kelly":0.0 if loss_prob is None else round(kelly_fraction(prob,selected_price,loss_prob=loss_prob),4),
-         "p10":round(p10,2),"p50":round(p50,2),"p50_fair_line":conflict.get("p50_fair_line"),"median_edge":conflict.get("median_edge"),
-         "p75":round(p75,2),"p90":round(p90,2),"distribution_conflict":conflict,"distribution_meta":distribution_meta,
-         "pure_upside":round(max(0.0,p90-line),2),"volatility":"HIGH" if confidence=="UNKNOWN" else "MED",
-         "stability_score":projection_stability_score(p10,p90,expected_mean,prop),"reliability_score":reliability,"data_score":data_score,
-         "usage_quality":reliability,"opportunity_score":reliability,"preseason_workload":workload,"preseason_workload_confidence":confidence,
-         "preseason_workload_source":workload["source"],"expected_opportunity":workload,"projection_audit":audit,"audit_label":audit["label"],
-         "audit_score":audit["score"],"model_fallback_used":confidence=="UNKNOWN","injury_risk":"LOW","game_script_risk":"LOW","defense_risk":"LOW",
-         "collapse_prob":0.18 if confidence=="CONFIRMED" else 0.28,"ceiling_prob":0.08,"savant_shadow":savant_shadow,
-         "legacy_projection_pre_savant":round(raw_mean,3),"savant_shadow_projection":savant_shadow.get("shadow_projection"),
-         "savant_projection_mode":"SHADOW_ONLY","model_version":MODEL_VERSION,"notes":[
-             f"Preseason workload: {workload['source']} ({confidence})",
-             "Regular-season volume was not used as preseason workload",
-             "Savant efficiency calculated in shadow mode only",
-         ],"sim_samples":sims}
-    out["market_compare"]=_market_compare_text(out); out["recent_form"]=""
-    signal,tier,rejections=build_signal(out)
-    out.update({"signal":signal,"action_tier":tier,"official_rejections":rejections,"bettable":tier=="BET"})
+    savant_input["prop"]=prop
+    savant_input["projection_consumed_factors"]=["preseason_rotation","preseason_efficiency_prior"]
+    savant_shadow=savant_shadow_projection(savant_input,legacy_projection_pre_savant,"PRESEASON")
+    savant_reliability=safe_float(savant_shadow.get("reliability"),0) or 0
+    savant_applied=bool(savant_shadow.get("active") and savant_reliability>=55)
+    if savant_applied:
+        base*=safe_float(savant_shadow.get("factor"),1.0) or 1.0
+        savant_shadow["status"]="PRESEASON_EFFICIENCY_ASSIST"
+
+    bounds={
+        "Passing Yards":(1,330),"Pass Attempts":(0.5,48),"Completions":(0.2,34),
+        "Receiving Yards":(0,165),"Receptions":(0,12),"Rushing Yards":(0,155),"Rush Attempts":(0,32),
+    }
+    lo,hi=bounds.get(prop,(0,999))
+    base=float(clamp(base,lo,hi))
+
+    market_workload=_preseason_market_workload_audit(row,core)
+    sigma_base=safe_float(cfg.get("sigma"),1.0) or 1.0
+    share=safe_float(workload.get("snap_share"),0.30) or 0.30
+    sigma=max(safe_float(PRESEASON_SIGMA_FLOOR.get(prop),0.5) or 0.5,
+              sigma_base*math.sqrt(max(0.12,share))*safe_float(workload.get("uncertainty_mult"),1.4))
+    efficiency_score=safe_float(core.get("efficiency_prior_score"),65) or 65
+    if efficiency_score < 60:
+        sigma*=1.12
+    elif efficiency_score < 70:
+        sigma*=1.07
+    limited=safe_float(row.get("limited_snap_risk"),0) or 0
+    thin_eff_tax=0.04 if efficiency_score<60 else 0.02 if efficiency_score<70 else 0.0
+    collapse_prob=clamp(0.12 + (0.10 if workload.get("confidence")=="LOW" else 0.04 if workload.get("confidence")=="MEDIUM" else 0) + limited*0.12 + thin_eff_tax,0.10,0.40)
+    ceiling_prob=0.09 if workload.get("confidence")!="LOW" else 0.07
+    seed=stable_projection_seed(row.get("player","x"),prop,line,row.get("team",""),row.get("opp",""),"PRESEASON")
+    sim,distribution_meta=simulate_prop_distribution(base,sigma,prop,sims,seed,collapse_prob,ceiling_prob,empirical_values=None)
+    mean=float(np.mean(sim)); p10,p50,p75,p90=[float(np.percentile(sim,q)) for q in [10,50,75,90]]
+    raw_over=float(np.mean(sim>line)); raw_under=float(np.mean(sim<line)); raw_push=max(0.0,1.0-raw_over-raw_under)
+
+    vol=(p90-p10)/max(1,mean)
+    volatility="HIGH" if vol>1.25 else "MED" if vol>0.78 else "LOW"
+    stability=projection_stability_score(p10,p90,mean,prop)
+    reliability_score,reliability_label=_preseason_reliability_score(row,workload,market_workload,usage_quality,volatility,efficiency_score)
+    over,under,push,prob_strength=_preseason_calibrate_probabilities(raw_over,raw_under,raw_push,reliability_score)
+    side="OVER" if over>under else "UNDER" if under>over else "PASS"
+    prob=max(over,under)
+    raw_prob=max(raw_over,raw_under)
+    edge=mean-line
+    conflict=distribution_conflict_audit(mean,p50,line,side)
+    # A mean/median/probability disagreement is a structural uncertainty signal,
+    # not a betting side. Preserve the diagnostics but force PASS.
+    if conflict.get("conflict"):
+        side="PASS"
+    selected_price=selected_side_price(row,side) if side in {"OVER","UNDER"} else None
+    loss_prob=under if side=="OVER" else over if side=="UNDER" else None
+    ev=None if loss_prob is None else expected_value(prob,selected_price,loss_prob=loss_prob)
+    kelly=0.0 if loss_prob is None else kelly_fraction(prob,selected_price,loss_prob=loss_prob)
+    score=int(clamp(12 + 0.48*(safe_float(workload.get("score"),0) or 0) + 0.18*usage_quality + 0.16*efficiency_score,0,94))
+    if market_workload.get("status")=="WATCH": score-=7
+    if market_workload.get("conflict"): score-=18
+    if not row.get("model_match",True): score-=8
+    if workload.get("inactive"): score=min(score,35)
+    score=int(clamp(score,0,94))
+
+    model_fallback_used=(not row.get("model_match",True)) or workload.get("confidence")=="LOW"
+    notes=list(workload.get("notes") or [])
+    notes.extend(["Usage data: "+x for x in usage_flags[:3]])
+    notes.append(cal_note)
+    notes.append(market_workload.get("note",""))
+    notes.append(f"Efficiency prior: {core.get('efficiency_prior_label')} {efficiency_score:.0f}/100 · {core.get('efficiency_prior_source')}")
+    notes.append(f"Preseason reliability: {reliability_score:.1f}/100 ({reliability_label}); raw probability conviction shrunk {prob_strength:.0%} toward 50%.")
+    notes.append("Preseason engine: opportunity first; regular-season volume not reused as full-game workload.")
+    notes.append(f"NFL Savant preseason efficiency: {savant_shadow.get('status','MISSING')} · reliability {savant_reliability:.0f}")
+    if conflict.get("conflict"):
+        notes.append("DISTRIBUTION_CONFLICT: expected mean and P50/pick direction disagree; forced PASS")
+    audit_label="Preseason Ready" if workload.get("confidence")=="HIGH" and not market_workload.get("conflict") else "Preseason Partial"
+    audit_preview={
+        "label":audit_label,"score":score,
+        "hard_blocks":(["Preseason workload conflict with market"] if market_workload.get("conflict") else []) +
+                      (["Player expected to rest/not play"] if workload.get("inactive") else []),
+        "layers":{"preseason_workload":workload.get("confidence"),"market_workload":market_workload.get("status"),"efficiency_prior":core.get("efficiency_prior_label"),"reliability":reliability_label},
+    }
+    model_meta={"model_version":MODEL_VERSION,"app_version":APP_VERSION,"generated_at":now_iso(),"prop":prop,"source":row.get("source"),"season_mode":"PRESEASON","calibration_status":cal_status}
+    out={**row,
+        "season_mode":"PRESEASON","game_phase":"PRESEASON",
+        "projection":round(mean,2),"expected_mean":round(mean,2),"edge":round(edge,2),"pick":side,
+        "fair_prob":round(prob,3),"over_prob":round(over,3),"under_prob":round(under,3),"push_prob":round(push,3),
+        "raw_fair_prob":round(raw_prob,3),"raw_over_prob":round(raw_over,3),"raw_under_prob":round(raw_under,3),"raw_push_prob":round(raw_push,3),
+        "reliability_score":reliability_score,"reliability_label":reliability_label,
+        "probability_calibration":{"preseason_reliability_shrink":prob_strength,"raw_fair_prob":round(raw_prob,3),"calibrated_fair_prob":round(prob,3)},
+        "selected_price":selected_price,"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),
+        "p10":round(p10,2),"p50":round(p50,2),"p50_fair_line":conflict.get("p50_fair_line"),"median_edge":conflict.get("median_edge"),"distribution_conflict":conflict,"p75":round(p75,2),"p90":round(p90,2),
+        "pure_upside":"GOOD" if p90-line>sigma*0.55 else "NORMAL",
+        "volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,
+        "opportunity_score":safe_float(workload.get("score"),0) or 0,
+        "expected_opportunity":core,"preseason_workload":workload,"preseason_market_workload":market_workload,
+        "projection_breakdown":core,"factor_stack":{"preseason_workload_share":share,"efficiency_prior_score":efficiency_score,"learning":learn,"calibration":cal_scale,"sigma":round(sigma,3),"probability_reliability_shrink":prob_strength},
+        "model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,
+        "smart_calibration":smart_calibration,"role_bucket":projection_role_bucket(row,role),
+        "data_quality_bucket":projection_data_quality_bucket(row,usage_quality),
+        "market_intelligence":market_intelligence_engine(row,projection=base,line=line),
+        "distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_label,"audit_score":score,
+        "model_fallback_used":model_fallback_used,"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),
+        "data_score":score,"injury_risk":"LOW","game_script_risk":"LOW","defense_risk":"LOW",
+        "savant_shadow":savant_shadow,"legacy_projection_pre_savant":round(legacy_projection_pre_savant,3),
+        "savant_shadow_projection":savant_shadow.get("shadow_projection"),
+        "savant_projection_mode":"PRESEASON_EFFICIENCY_ASSIST" if savant_applied else "SHADOW_ONLY",
+        "line_delta":update_clv_snapshot(row.get("player"),prop,row.get("source"),line),
+        "true_line_delta":track_line_delta(row.get("player"),prop,row.get("source"),line),
+        "role":role,"notes":notes,"sim_samples":sims,
+    }
+    out["market_compare"]=_market_compare_text(out)
+    out["recent_form"]=_recent_form_text(out)
+    signal,action_tier,rejections=build_signal(out)
+    out["signal"]=signal; out["action_tier"]=action_tier; out["official_rejections"]=rejections; out["bettable"]=action_tier=="BET"
     return out
 
 def project_row(row, sims=12000):
+    row={**dict(row or {}),"season_mode":"REGULAR"}
     raw_market_labels=" ".join(str((row or {}).get(key) or "") for key in ["raw_prop_label","line_title","raw_label"])
     if raw_market_labels.strip() and not _is_full_game_market_label(raw_market_labels):
         raise ValueError(f"Projection blocked: non-full-game market {raw_market_labels!r}")
@@ -8634,7 +9503,7 @@ def project_row(row, sims=12000):
     row["prop"]=prop
     market_row["prop"]=prop
     line_check=safe_float(market_row.get("line"))
-    if line_check is None or not _valid_market_line(prop, line_check):
+    if line_check is None or not _valid_market_line(prop, line_check,"REGULAR"):
         raise ValueError(f"Projection blocked: invalid {prop} line {market_row.get('line')!r}")
     if not _prop_allowed_for_model_position(prop, row.get("position")):
         raise ValueError(f"Projection blocked: {prop} is not valid for position {row.get('position')!r}")
@@ -8736,7 +9605,7 @@ def project_row(row, sims=12000):
     cal_status=calibration_readiness(prop)
     base*=learn*cal_scale
     line=safe_float(market_row.get("line"))
-    if line is not None and prop in ACTIVE_NFL_MARKETS and not _valid_market_line(prop, line):
+    if line is not None and prop in ACTIVE_NFL_MARKETS and not _valid_market_line(prop, line,"REGULAR"):
         # Never project off a corrupted/season-long line. This row should normally
         # be filtered earlier, but this final guard prevents 3000+ yard cards.
         line = None
@@ -8792,12 +9661,13 @@ def project_row(row, sims=12000):
 
     mean=float(np.mean(sim)); p50=float(np.percentile(sim,50)); p75=float(np.percentile(sim,75)); p90=float(np.percentile(sim,90)); p10=float(np.percentile(sim,10))
     if line is None:
-        over=None; under=None; push=None; prob=None; side="NO LINE"; edge=None; ev=None; kelly=0.0; selected_price=None
+        raw_over=None; raw_under=None; raw_push=None; over=None; under=None; push=None; prob=None; side="NO LINE"; edge=None; ev=None; kelly=0.0; selected_price=None
     else:
-        over=float(np.mean(sim>line)); under=float(np.mean(sim<line))
-        push=max(0.0, 1.0-over-under)
-        # For half-point NFL props pushes are normally zero.  If a whole-number market
-        # can push, compare the actual win probabilities instead of forcing an OVER.
+        raw_over=float(np.mean(sim>line)); raw_under=float(np.mean(sim<line))
+        raw_push=max(0.0, 1.0-raw_over-raw_under)
+        over,under,push=raw_over,raw_under,raw_push
+        # Direction starts from raw simulation. Reliability calibration below changes
+        # conviction only; it never moves the projection mean.
         side="OVER" if over>under else "UNDER" if under>over else "PASS"
         prob=max(over,under)
         edge=mean-line
@@ -8848,6 +9718,27 @@ def project_row(row, sims=12000):
         score=min(score,74)
     score=int(clamp(score,0,99))
 
+    # Keep regular-season input reliability separate from simulation direction.
+    # This prevents partial/fallback rows from displaying fake 80-90% certainty.
+    reliability_score,reliability_label=nfl_projection_reliability_score(
+        market_row,usage_quality,stability,audit_preview,model_fallback_used,injury_risk,game_script_risk,volatility
+    )
+    decision_prob_strength=None
+    raw_prob=None if line is None else max(raw_over,raw_under)
+    if line is not None:
+        over,under,push,decision_prob_strength=calibrate_nfl_decision_probabilities(
+            raw_over,raw_under,raw_push,reliability_score,volatility
+        )
+        side="OVER" if over>under else "UNDER" if under>over else "PASS"
+        prob=max(over,under)
+        selected_price=selected_side_price(market_row,side)
+        loss_prob=under if side=="OVER" else over if side=="UNDER" else None
+        ev=None if loss_prob is None else expected_value(prob,selected_price,loss_prob=loss_prob)
+        kelly=0.0 if loss_prob is None else kelly_fraction(prob,selected_price,loss_prob=loss_prob)
+        distribution_conflict=distribution_conflict_audit(mean,p50,line,side)
+        if distribution_conflict.get("conflict"):
+            side="PASS"; selected_price=None; ev=None; kelly=0.0
+
     line_delta=update_clv_snapshot(market_row.get("player"), prop, market_row.get("source"), line) if line is not None else None
     true_line_delta=track_line_delta(market_row.get("player"), prop, market_row.get("source"), line) if line is not None else None
 
@@ -8855,6 +9746,9 @@ def project_row(row, sims=12000):
     if usage_flags:
         notes.extend(["Usage data: "+x for x in usage_flags[:3]])
     notes.append(cal_note)
+    notes.append(f"Decision reliability: {reliability_score:.1f}/100 ({reliability_label})" + (f" · probability conviction retained {decision_prob_strength:.0%}" if decision_prob_strength is not None else ""))
+    if distribution_conflict.get("conflict"):
+        notes.append("DISTRIBUTION_CONFLICT: expected mean and P50/pick direction disagree; forced PASS")
     if xgb_info.get("enabled"):
         notes.append(f"XGBoost Assist: {xgb_info.get('status')}" + (f" · blend {xgb_info.get('blend')}" if xgb_info.get('blend') else ""))
     if bayes_markov_info.get("enabled"):
@@ -8936,7 +9830,7 @@ def project_row(row, sims=12000):
     factor_stack={"role":round(role_factor,3),"current_week_role":round(current_role_factor,3),"game_env":round(game_factor,3),"defense":round(defense_factor,3),"offense_defense_rank":round(rank_factor,3),"opportunity":round(opportunity.get("factor",1.0),3),"pace":round(pace_factor,3),"vegas":round(vegas_factor,3),"script":round(script_factor,3),"blowout":round(blowout_factor,3),"advanced":round(advanced_factor,3),"splits_personnel":round(split_factor,3),"learning":round(learn,3),"calibration":round(cal_scale,3),"sigma":round(sigma,3),"line_sanity_active":bool(line_sanity_info.get("active"))}
     factor_stack["savant_production_active"]=savant_shadow.get("status")=="PRODUCTION_VALIDATED"
     model_meta={"model_version":MODEL_VERSION,"app_version":APP_VERSION,"generated_at":now_iso(),"active_market_count":len(ACTIVE_NFL_MARKETS),"prop":prop,"source":row.get("source"),"context_layers":audit_preview.get("layers",{}),"staleness":context_staleness(market_row),"calibration_status":cal_status,"projection_consumed_factors":savant_input.get("projection_consumed_factors",[])}
-    out={**market_row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"over_prob":None if over is None else round(over,3),"under_prob":None if under is None else round(under,3),"push_prob":None if push is None else round(push,3),"selected_price":selected_price,"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"split_personnel_factor":round(split_factor,3),"split_personnel_context":split_context,"advanced_context":advanced_context,"offense_defense_rank_context":rank_context,"offense_defense_rank_factor":round(rank_factor,3),"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"rushing_yards_model":rushing_yards_model_info,"pass_attempts_model":pass_attempts_model_info,"completions_model":completions_model_info,"receptions_model":receptions_model_info,"rush_attempts_model":rush_attempts_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"factor_stack":factor_stack,"model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,"smart_calibration":smart_calibration,"role_bucket":current_week_role.get("role_bucket") or projection_role_bucket(row,role),"data_quality_bucket":projection_data_quality_bucket(row,usage_quality),"current_week_role":current_week_role,"market_intelligence":market_intelligence,"distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_preview.get("label"),"audit_score":audit_preview.get("score"),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"model_fallback_used":model_fallback_used,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**market_row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"over_prob":None if over is None else round(over,3),"under_prob":None if under is None else round(under,3),"push_prob":None if push is None else round(push,3),"raw_fair_prob":None if raw_prob is None else round(raw_prob,3),"raw_over_prob":None if raw_over is None else round(raw_over,3),"raw_under_prob":None if raw_under is None else round(raw_under,3),"raw_push_prob":None if raw_push is None else round(raw_push,3),"reliability_score":reliability_score,"reliability_label":reliability_label,"probability_calibration":{"decision_probability_strength":decision_prob_strength,"raw_fair_prob":None if raw_prob is None else round(raw_prob,3),"calibrated_fair_prob":None if prob is None else round(prob,3)},"selected_price":selected_price,"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"split_personnel_factor":round(split_factor,3),"split_personnel_context":split_context,"advanced_context":advanced_context,"offense_defense_rank_context":rank_context,"offense_defense_rank_factor":round(rank_factor,3),"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"rushing_yards_model":rushing_yards_model_info,"pass_attempts_model":pass_attempts_model_info,"completions_model":completions_model_info,"receptions_model":receptions_model_info,"rush_attempts_model":rush_attempts_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"factor_stack":factor_stack,"model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,"smart_calibration":smart_calibration,"role_bucket":current_week_role.get("role_bucket") or projection_role_bucket(row,role),"data_quality_bucket":projection_data_quality_bucket(row,usage_quality),"current_week_role":current_week_role,"market_intelligence":market_intelligence,"distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_preview.get("label"),"audit_score":audit_preview.get("score"),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"model_fallback_used":model_fallback_used,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     out.update({
         "expected_mean":round(mean,2),
         "p50_fair_line":distribution_conflict.get("p50_fair_line"),
@@ -11091,7 +11985,7 @@ if projection_errors:
         st.dataframe(pd.DataFrame(projection_errors), use_container_width=True, hide_index=True)
 
 # Final board integrity audit: no unknown prop can reach the UI.
-invalid_board_rows=[p for p in projected if p.get("prop") not in ACTIVE_NFL_MARKETS or not _valid_market_line(p.get("prop"),p.get("line"))]
+invalid_board_rows=[p for p in projected if p.get("prop") not in ACTIVE_NFL_MARKETS or not _valid_market_line(p.get("prop"),p.get("line"),season_mode_for_row(p))]
 if invalid_board_rows:
     st.error(f"Blocked {len(invalid_board_rows)} invalid market rows before display.")
     projected=[p for p in projected if p not in invalid_board_rows]
