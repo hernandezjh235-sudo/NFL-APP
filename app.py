@@ -1445,6 +1445,84 @@ def build_signal(p):
         return f"⚠️ LEAN {side}", "LEAN", reasons
     return "🚫 PASS", "PASS", reasons
 
+def get_secret(key, default=""):
+    try: return st.secrets[key]
+    except Exception: return os.getenv(key, default)
+
+@st.cache_data(ttl=120, show_spinner=False)
+def safe_get_json(url, cache_bust=0):
+    try:
+        headers={
+            "User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "Accept":"application/json,text/plain,*/*",
+            "Cache-Control":"no-cache",
+            "Pragma":"no-cache",
+            "Referer":"https://underdogfantasy.com/",
+            "Origin":"https://underdogfantasy.com",
+        }
+        # cache_bust is part of the Streamlit cache key, so a manual refresh forces
+        # a real request without changing Underdog's endpoint URL.
+        r=requests.get(
+            url,
+            headers=headers,
+            timeout=(UNDERDOG_CONNECT_TIMEOUT_SECONDS, UNDERDOG_READ_TIMEOUT_SECONDS),
+        )
+        if r.status_code!=200:
+            request_log(url,f"HTTP {r.status_code}",r.text[:240]); return None
+        data=r.json()
+        request_log(url,"HTTP 200",f"bytes={len(r.content)} refresh={cache_bust}")
+        return data
+    except Exception as e:
+        request_log(url,"REQUEST_ERROR",e); return None
+
+# ---------- live prop intake helpers ----------
+def _blob(item):
+    try:
+        return json.dumps(item, default=str).lower()
+    except Exception:
+        return str(item).lower()
+
+def _deep_get(obj, keys):
+    cur = obj
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+def _first_existing(obj, keys):
+    for k in keys:
+        if isinstance(obj, dict) and obj.get(k) not in [None, "", []]:
+            return obj.get(k)
+    return None
+
+def _collect_player_bank(objects):
+    """Build id -> player metadata from Underdog included objects/appearances."""
+    bank = {}
+    for o in objects:
+        if not isinstance(o, dict):
+            continue
+        oid = o.get("id") or o.get("player_id") or o.get("appearance_id")
+        first = o.get("first_name") or _deep_get(o, ["player", "first_name"])
+        last = o.get("last_name") or _deep_get(o, ["player", "last_name"])
+        full = o.get("player_name") or o.get("display_name") or o.get("full_name") or o.get("name")
+        if first and last:
+            full = f"{first} {last}"
+        if full and oid:
+            bank[str(oid)] = {
+                "player": str(full),
+                "team": o.get("team_abbr") or o.get("team") or _deep_get(o, ["team", "abbr"]) or _deep_get(o, ["team", "abbreviation"]),
+                "position": o.get("position") or _deep_get(o, ["player", "position"]),
+            }
+    return bank
+
+def looks_nfl(item):
+    b = _blob(item)
+    if any(term in b for term in NON_NFL_BLOCK_TERMS) and not any(term in b for term in NFL_SPORT_TERMS):
+        return False
+    # NFL props may not explicitly say NFL, so recognized NFL market names count too.
+    return any(term in b for term in NFL_SPORT_TERMS) or prop_name_from_blob(b) is not None
+
 def _normalized_market_text(value):
     text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii").lower()
     text = re.sub(r"[^a-z0-9+]+", " ", text)
