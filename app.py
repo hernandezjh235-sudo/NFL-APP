@@ -38,12 +38,14 @@ SAVANT_BOARD_ENDPOINTS = {
     "league": "/api/league",
 }
 SAVANT_REQUIRED_BOARDS = {
-    "receiving", "ngs-receiving", "route-tree", "passing", "ngs-passing",
+    "receiving", "ngs-receiving", "passing", "ngs-passing",
     "rushing", "ngs-rushing", "pressure", "penalties",
 }
-# Accepted supplemental football files. These are valid inputs but do not replace
-# the nine NFL Savant boards used by the shadow/readiness gate.
-SAVANT_SUPPLEMENTAL_BOARDS = {"ftn-charting"}
+# route-tree is useful when a real export exists, but NFL Savant currently does not
+# expose a stable route-tree endpoint/schema. Do not falsely hold the whole pack at
+# 8/9 or ask the user for a fabricated ninth file. FTN, movers and league are also
+# supplemental context.
+SAVANT_SUPPLEMENTAL_BOARDS = {"ftn-charting", "route-tree", "movers", "league"}
 
 BOARD_FILENAME_HINTS = {
     "ftn-charting": ("ftn-charting", "ftn_charting", "ftn-chart", "ftncharting"),
@@ -662,7 +664,13 @@ def refresh_nfl_savant_data(season, savant_dir, force=False, ttl_hours=12, sessi
             entries.append(entry)
             results.append({"board": board, "season": season, "status": "SAVED", "rows": len(frame), "detail": url})
         except Exception as exc:
-            fallback = "LAST_GOOD" if existing and Path(str(existing.get("normalized_path") or "")).exists() else "UPLOAD_REQUIRED"
+            has_last_good = bool(existing and Path(str(existing.get("normalized_path") or "")).exists())
+            if has_last_good:
+                fallback = "LAST_GOOD"
+            elif board in SAVANT_REQUIRED_BOARDS:
+                fallback = "UPLOAD_REQUIRED"
+            else:
+                fallback = "OPTIONAL_UNAVAILABLE"
             results.append({"board": board, "season": season, "status": fallback, "rows": existing.get("rows", 0), "detail": str(exc)[:180]})
     save_savant_manifest(root, entries)
     clear_savant_runtime_cache()
@@ -1179,8 +1187,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.34 — MOBILE UI + PRESEASON GUARDRAILS"
-MODEL_VERSION = "nfl-prop-engine-v7.34.0"
+APP_VERSION = "NFL v7.35 — SAVANT READINESS + PRESEASON ML"
+MODEL_VERSION = "nfl-prop-engine-v7.35.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -6592,11 +6600,58 @@ def _moneyline_games_from_rows(moneyline_rows, prop_rows):
                     break
     return list(games.values())
 
+def _preseason_moneyline_rotation_snapshot(game_rows, team):
+    """Summarize how much real preseason rotation context exists for one team.
+
+    This affects uncertainty/data quality, not the betting side directly.  The point is
+    to avoid pretending preseason workload is as stable as a regular-season starter
+    workload while still allowing a preseason Money Line model to run.
+    """
+    team=_normalize_nfl_team(team)
+    rows=[dict(r or {}) for r in (game_rows or []) if _normalize_nfl_team((r or {}).get("team"))==team]
+    if not rows:
+        return {"players":0,"qb_players":0,"explicit":0,"confidence":0.0,"coverage":0.0}
+    try:
+        rows=apply_preseason_team_rotation_context(rows)
+    except Exception:
+        pass
+    unique={}
+    explicit=0
+    conf_values=[]
+    for row in rows:
+        player=norm(row.get("player"))
+        if not player:
+            continue
+        key=(player,str(row.get("position") or "").upper())
+        prev=unique.get(key)
+        if prev is None:
+            unique[key]=row
+        if row.get("preseason_room_locked") or row.get("has_preseason_rotation_context"):
+            explicit+=1
+        label=str(row.get("preseason_room_confidence") or "").upper()
+        if label=="HIGH": conf_values.append(1.0)
+        elif label=="MEDIUM": conf_values.append(0.7)
+        elif label=="LOW": conf_values.append(0.4)
+    players=len(unique)
+    qb_players=sum(1 for _,pos in unique if pos=="QB")
+    coverage=min(1.0,players/8.0)
+    explicit_ratio=min(1.0,explicit/max(1,len(rows)))
+    base_conf=float(np.mean(conf_values)) if conf_values else 0.35
+    confidence=clamp(0.45*base_conf+0.35*coverage+0.20*explicit_ratio,0.0,1.0)
+    return {
+        "players":players,"qb_players":qb_players,"explicit":explicit,
+        "confidence":round(float(confidence),3),"coverage":round(float(coverage),3),
+    }
+
+
 def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=15000, rng_seed=7717):
     """Create honest NFL game cards from the real slate and saved team database.
 
-    The win/score model never needs a sportsbook line. Exact market odds and totals
-    are attached only when supplied by the feed or current matchup context.
+    Regular season and preseason are deliberately separate.  Regular season keeps the
+    existing stable-starter model.  Preseason uses the same football database only as a
+    heavily regressed team-strength prior, adds rotation uncertainty, reduces home-field
+    weight, and widens the score distribution.  Exact market odds/totals remain display
+    and audit inputs only; no sportsbook price is fabricated.
     """
     bank=_moneyline_team_context_bank(team_bank)
     cards=[]
@@ -6607,9 +6662,8 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
         away_rating=_moneyline_team_rating(away_ctx)
         home_rating=_moneyline_team_rating(home_ctx)
         phase=nfl_game_phase(game)
+        preseason=(phase=="PRESEASON")
         blocks=[]
-        if phase == "PRESEASON":
-            blocks.append("Preseason game blocked from the regular-season moneyline model")
         if not away_rating.get("ready"):
             blocks.append(f"{away} offense/defense database incomplete")
         if not home_rating.get("ready"):
@@ -6654,6 +6708,8 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
                     home_spread=spread if team==home else -spread
             weather_risk=weather_risk or str(ctx.get("weather_risk") or "").upper()
 
+        away_rotation=_preseason_moneyline_rotation_snapshot(game_rows,away) if preseason else {}
+        home_rotation=_preseason_moneyline_rotation_snapshot(game_rows,home) if preseason else {}
         base={
             **game,"phase":phase,"blocked":bool(blocks),"blocks":blocks,
             "away_market_odds":market_odds.get(away),"home_market_odds":market_odds.get(home),
@@ -6661,6 +6717,7 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
             "away_payout":payouts.get(away),"home_payout":payouts.get(home),
             "market_total":market_total,"home_market_spread":home_spread,
             "price_status":"LIVE MARKET" if market_odds else "MODEL ONLY",
+            "away_rotation":away_rotation,"home_rotation":home_rotation,
         }
         if blocks:
             cards.append(base)
@@ -6668,22 +6725,38 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
 
         away_pace=away_rating.get("pace"); home_pace=home_rating.get("pace")
         known_pace=[x for x in [away_pace,home_pace] if x is not None]
-        projected_plays=float(np.mean(known_pace)) if known_pace else 63.0
-        pace_points=clamp((projected_plays-63.0)*0.16,-1.5,1.5)
-        away_mean=22.4+3.4*away_rating["offense"]-2.9*home_rating["defense"]+pace_points-0.65
-        home_mean=22.4+3.4*home_rating["offense"]-2.9*away_rating["defense"]+pace_points+0.85
+        if preseason:
+            # Preseason has fewer stable starter snaps and more end-of-roster variance.
+            projected_plays=float(np.mean(known_pace)) if known_pace else 61.0
+            projected_plays=clamp(projected_plays-1.5,56.0,66.0)
+            pace_points=clamp((projected_plays-61.0)*0.12,-1.0,1.0)
+            away_mean=19.6+1.85*away_rating["offense"]-1.55*home_rating["defense"]+pace_points-0.25
+            home_mean=19.6+1.85*home_rating["offense"]-1.55*away_rating["defense"]+pace_points+0.40
+            score_sd=11.4
+            common_sd=3.5
+        else:
+            projected_plays=float(np.mean(known_pace)) if known_pace else 63.0
+            pace_points=clamp((projected_plays-63.0)*0.16,-1.5,1.5)
+            away_mean=22.4+3.4*away_rating["offense"]-2.9*home_rating["defense"]+pace_points-0.65
+            home_mean=22.4+3.4*home_rating["offense"]-2.9*away_rating["defense"]+pace_points+0.85
+            score_sd=9.2
+            common_sd=3.0
+
         if weather_risk in ["SEVERE","WIND","SNOW"]:
             away_mean-=1.25; home_mean-=1.25
         elif weather_risk in ["RAIN","COLD"]:
             away_mean-=0.55; home_mean-=0.55
-        away_mean=clamp(away_mean,11.0,36.0); home_mean=clamp(home_mean,11.0,36.0)
+        if preseason:
+            away_mean=clamp(away_mean,10.0,31.0); home_mean=clamp(home_mean,10.0,31.0)
+        else:
+            away_mean=clamp(away_mean,11.0,36.0); home_mean=clamp(home_mean,11.0,36.0)
 
-        stable_seed=int(hashlib.sha256(f"{rng_seed}|{game['matchup']}".encode("utf-8")).hexdigest()[:8],16)
+        stable_seed=int(hashlib.sha256(f"{rng_seed}|{phase}|{game['matchup']}".encode("utf-8")).hexdigest()[:8],16)
         rng=np.random.default_rng(stable_seed)
         sim_n=max(3000,int(sims))
-        common=rng.normal(0,3.0,sim_n)
-        away_scores=np.maximum(0,away_mean+common+rng.normal(0,9.2,sim_n))
-        home_scores=np.maximum(0,home_mean+common+rng.normal(0,9.2,sim_n))
+        common=rng.normal(0,common_sd,sim_n)
+        away_scores=np.maximum(0,away_mean+common+rng.normal(0,score_sd,sim_n))
+        home_scores=np.maximum(0,home_mean+common+rng.normal(0,score_sd,sim_n))
         away_wins=float(np.mean(away_scores>home_scores)+0.5*np.mean(away_scores==home_scores))
         home_wins=1.0-away_wins
         totals=away_scores+home_scores
@@ -6703,9 +6776,17 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
                 total_pick="PASS"
 
         total_inputs=away_rating["inputs"]+home_rating["inputs"]
-        data_score=int(clamp(66+min(24,total_inputs*1.5)+(4 if market_total is not None else 0)+(4 if len(market_odds)>=2 else 0),0,99))
+        if preseason:
+            rotation_conf=(safe_float(away_rotation.get("confidence"),0) or 0)+(safe_float(home_rotation.get("confidence"),0) or 0)
+            data_score=int(clamp(54+min(20,total_inputs*1.15)+rotation_conf*5.0+(3 if market_total is not None else 0)+(3 if len(market_odds)>=2 else 0),0,88))
+            status="PRESEASON MODEL READY"
+            model_note="Preseason-only model: completed-season strength is heavily regressed; rotation uncertainty and wider score variance are applied. Regular-season starter workload assumptions are not used."
+        else:
+            data_score=int(clamp(66+min(24,total_inputs*1.5)+(4 if market_total is not None else 0)+(4 if len(market_odds)>=2 else 0),0,99))
+            status="MODEL READY"
+            model_note="Completed-season offense/defense efficiency plus current pace; market line is display-only"
         base.update({
-            "blocked":False,"status":"MODEL READY","away_projection":round(away_mean,1),
+            "blocked":False,"status":status,"away_projection":round(away_mean,1),
             "home_projection":round(home_mean,1),"away_win_prob":round(away_wins,4),
             "home_win_prob":round(home_wins,4),"away_model_odds":_probability_to_american(away_wins),
             "home_model_odds":_probability_to_american(home_wins),"favorite":favorite,
@@ -6717,7 +6798,7 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
             "home_offense":round(home_rating["offense"],3),"away_off_epa":away_rating.get("off_epa"),
             "home_off_epa":home_rating.get("off_epa"),"blowout_prob":round(blowout,4),
             "data_score":data_score,"sim_samples":sim_n,"weather_risk":weather_risk or "NORMAL",
-            "model_note":"Completed-season offense/defense efficiency plus current pace; market line is display-only",
+            "model_note":model_note,
         })
         cards.append(base)
     return sorted(cards,key=lambda card:(str(card.get("scheduled_at") or "9999"),card.get("matchup","")))
@@ -11891,7 +11972,7 @@ def _render_nfl_savant_admin():
     if readiness.get("supplemental_boards"):
         st.caption("Accepted supplemental files: "+", ".join(readiness.get("supplemental_boards") or []))
     if readiness.get("missing"):
-        st.caption("NFL Savant board fallback still needed for: "+", ".join(readiness.get("missing") or []))
+        st.caption("Required NFL Savant board fallback still needed for: "+", ".join(readiness.get("missing") or []))
 
 def _render_preseason_rotation_panel():
     st.caption("Coach-plan inputs own preseason workload. Saved shares are reconciled within each position room.")
