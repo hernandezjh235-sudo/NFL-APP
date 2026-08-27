@@ -9,7 +9,7 @@ This is a live-only game-day build. It never substitutes synthetic lines for a m
 Underdog feed, and it only projects markets with dedicated player-stat models.
 """
 
-import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile, html
+import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile, gzip, html
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -41,8 +41,12 @@ SAVANT_REQUIRED_BOARDS = {
     "receiving", "ngs-receiving", "route-tree", "passing", "ngs-passing",
     "rushing", "ngs-rushing", "pressure", "penalties",
 }
+# Accepted supplemental football files. These are valid inputs but do not replace
+# the nine NFL Savant boards used by the shadow/readiness gate.
+SAVANT_SUPPLEMENTAL_BOARDS = {"ftn-charting"}
 
 BOARD_FILENAME_HINTS = {
+    "ftn-charting": ("ftn-charting", "ftn_charting", "ftn-chart", "ftncharting"),
     "ngs-receiving": ("ngs-receiving", "receiving-air-yds", "air-yds-tgt"),
     "route-tree": ("route-tree", "route_tree", "target-share-route"),
     "ngs-passing": ("ngs-passing", "passing-cpoe"),
@@ -57,10 +61,11 @@ BOARD_FILENAME_HINTS = {
 }
 
 BOARD_REQUIRED_COLUMN_GROUPS = {
+    "ftn-charting": (("ftn_play_id",), ("nflverse_play_id",), ("ftn_game_id", "nflverse_game_id")),
     "passing": (("player", "name"), ("epa_play", "epa", "epa_per_play"), ("att", "attempts")),
     "ngs-passing": (("player", "name"), ("cpoe",), ("xcomp_pct", "xcomp")),
     "receiving": (("player", "name"), ("epa_tgt", "epa", "epa_target"), ("tgt", "targets")),
-    "ngs-receiving": (("player", "name"), ("air_yards_per_target", "ayds_tgt", "air_yards_target", "air_yds_tgt"), ("tgt", "targets")),
+    "ngs-receiving": (("player", "name"), ("air_yards_per_target", "avg_intended_air_yards", "ayds_tgt", "air_yards_target", "air_yds_tgt"), ("tgt", "targets")),
     "route-tree": (("player", "name"), ("tgt", "targets"), ("screen",), ("go",)),
     "rushing": (("player", "name"), ("epa_att", "epa", "epa_attempt"), ("carries", "att")),
     "ngs-rushing": (("player", "name"), ("yoe_per_attempt", "yoe_att", "rush_yoe_att"), ("carries", "att")),
@@ -115,18 +120,33 @@ def _canonical_column(value) -> str:
     text = re.sub(r"[^a-z0-9]+", "_", text).strip("_")
     aliases = {
         "rank": "rank", "player": "player", "name": "player", "pos": "position",
-        "position": "position", "team": "team", "epa_play": "epa_play",
+        "position": "position", "team": "team",
+        # nflverse Next Gen Stats identity aliases
+        "player_display_name": "player", "player_position": "position",
+        "team_abbr": "team", "player_gsis_id": "id",
+        "epa_play": "epa_play",
         "epa_tgt": "epa_tgt", "epa_att": "epa_att", "epa_target": "epa_tgt",
         "epa_attempt": "epa_att", "success_pct": "success_pct", "comp_pct": "comp_pct",
         "success": "success_pct", "succ": "success_pct", "xcomp": "xcomp_pct",
-        "xcomp_pct": "xcomp_pct", "pressure_pct": "pressure_pct", "tgt_pct": "target_share",
+        "xcomp_pct": "xcomp_pct",
+        # nflverse NGS passing aliases
+        "completion_percentage": "comp_pct",
+        "expected_completion_percentage": "xcomp_pct",
+        "completion_percentage_above_expectation": "cpoe",
+        "avg_time_to_throw": "time_to_throw", "aggressiveness": "aggression_pct",
+        "pressure_pct": "pressure_pct", "tgt_pct": "target_share",
         "target_pct": "target_share", "rztgt": "rz_targets", "rztgt_pct": "rz_target_share",
         "gltgt": "goal_line_targets", "gltgt_pct": "goal_line_target_share",
         "rz_carry_pct": "rz_carry_share", "gl_carry_pct": "goal_line_carry_share",
         "yds_tgt": "yards_per_target", "y_tgt": "yards_per_target",
         "y_rec": "yards_per_reception", "yac_rec": "yac_per_reception",
+        "catch_percentage": "catch_pct", "avg_yac": "yac_per_reception",
+        "avg_yac_above_expectation": "yac_above_expectation",
         "ayds_tgt": "air_yards_per_target", "air_yds_tgt": "air_yards_per_target",
-        "y_a": "yards_per_attempt", "ya": "yards_per_attempt", "ypc": "yards_per_carry", "yoe_att": "yoe_per_attempt",
+        "y_a": "yards_per_attempt", "ya": "yards_per_attempt", "ypc": "yards_per_carry",
+        # nflverse NGS rushing aliases
+        "rush_attempts": "carries", "avg_rush_yards": "yards_per_carry",
+        "rush_yards_over_expected_per_att": "yoe_per_attempt", "yoe_att": "yoe_per_attempt",
         "opp_db": "opportunities", "qb_hits": "qb_hits", "ttt": "time_to_throw",
         "aggr_pct": "aggression_pct", "aiay": "intended_air_yards", "tgt": "targets",
         "att": "attempts", "comp": "completions", "rec": "receptions", "yds": "yards",
@@ -216,7 +236,7 @@ def _frame_is_valid(frame: pd.DataFrame, board: str) -> tuple[bool, str]:
     missing = ["/".join(group) for group in groups if not any(col in frame.columns for col in group)]
     if missing:
         return False, "missing schema: " + ", ".join(missing)
-    if board != "league" and "player" not in frame.columns:
+    if board not in {"league", "ftn-charting"} and "player" not in frame.columns:
         return False, "missing player column"
     return True, "ok"
 
@@ -230,6 +250,37 @@ def _normalized_frame(frame: pd.DataFrame, board: str, season: int) -> pd.DataFr
         out["team"] = out["team"].map(normalize_savant_team)
     if "position" in out.columns:
         out["position"] = out["position"].astype(str).str.upper().str.strip()
+    # Official nflverse NGS files use slightly different metric names than the
+    # compact NFL Savant exports. Keep both raw columns and bridge the metrics
+    # consumed by the projection engine.
+    if board == "ngs-passing":
+        for src, dst in {
+            "completion_percentage": "comp_pct",
+            "expected_completion_percentage": "xcomp_pct",
+            "completion_percentage_above_expectation": "cpoe",
+            "avg_time_to_throw": "time_to_throw",
+            "aggressiveness": "aggression_pct",
+        }.items():
+            if src in out.columns and dst not in out.columns:
+                out[dst] = out[src]
+    elif board == "ngs-receiving":
+        for src, dst in {
+            "avg_intended_air_yards": "air_yards_per_target",
+            "catch_percentage": "catch_pct",
+            "avg_yac": "yac_per_reception",
+        }.items():
+            if src in out.columns and dst not in out.columns:
+                out[dst] = out[src]
+        if "yards_per_target" not in out.columns and {"yards", "targets"}.issubset(out.columns):
+            out["yards_per_target"] = pd.to_numeric(out["yards"], errors="coerce") / pd.to_numeric(out["targets"], errors="coerce").replace(0, np.nan)
+    elif board == "ngs-rushing":
+        for src, dst in {
+            "rush_attempts": "carries",
+            "avg_rush_yards": "yards_per_carry",
+            "rush_yards_over_expected_per_att": "yoe_per_attempt",
+        }.items():
+            if src in out.columns and dst not in out.columns:
+                out[dst] = out[src]
     out["savant_board"] = board
     out["savant_season"] = int(season)
     return out
@@ -244,30 +295,164 @@ def _iter_payloads(uploaded_files):
             raw = _raw_bytes(item)
         name = Path(str(name)).name
         raw = bytes(raw)
-        if name.lower().endswith(".zip"):
+        lower = name.lower()
+        if lower.endswith(".zip"):
             try:
                 with zipfile.ZipFile(io.BytesIO(raw)) as archive:
                     for member in archive.infolist():
-                        if member.is_dir() or not member.filename.lower().endswith(".csv"):
+                        if member.is_dir() or not member.filename.lower().endswith((".csv", ".csv.gz")):
                             continue
-                        yield Path(member.filename).name, archive.read(member)
+                        member_name = Path(member.filename).name
+                        member_raw = archive.read(member)
+                        if member_name.lower().endswith(".csv.gz"):
+                            try:
+                                member_raw = gzip.decompress(member_raw)
+                                member_name = member_name[:-3]
+                            except Exception as exc:
+                                yield member_name, exc
+                                continue
+                        yield member_name, member_raw
             except zipfile.BadZipFile as exc:
+                yield name, exc
+        elif lower.endswith(".csv.gz") or lower.endswith(".gz"):
+            try:
+                yield name[:-3] if lower.endswith(".gz") else name, gzip.decompress(raw)
+            except Exception as exc:
                 yield name, exc
         else:
             yield name, raw
 
 
+def _prepare_uploaded_board_frame(frame: pd.DataFrame, board: str, season: int) -> pd.DataFrame:
+    """Normalize whole-history nflverse NGS exports to one requested season.
+
+    nflverse Next Gen Stats files contain all seasons and include week=0 season
+    aggregates. For projection priors we want the selected regular-season aggregate,
+    not every weekly row duplicated together. NFL Savant board exports do not have
+    these columns and therefore pass through unchanged.
+    """
+    out = frame.copy()
+    if "season" in out.columns:
+        numeric = pd.to_numeric(out["season"], errors="coerce")
+        mask = numeric.eq(int(season))
+        if mask.any():
+            out = out.loc[mask].copy()
+    if "season_type" in out.columns:
+        values = out["season_type"].astype(str).str.upper().str.strip()
+        reg = values.isin(["REG", "REGULAR", "REGULAR_SEASON", "R"])
+        if reg.any():
+            out = out.loc[reg].copy()
+    if board in {"ngs-passing", "ngs-receiving", "ngs-rushing"} and "week" in out.columns:
+        week = pd.to_numeric(out["week"], errors="coerce")
+        aggregate = week.eq(0)
+        if aggregate.any():
+            out = out.loc[aggregate].copy()
+
+    # Board-specific metric bridges from official nflverse NGS names to the
+    # compact field names already consumed by the projection engine.
+    if board == "ngs-passing":
+        bridges = {
+            "completion_percentage": "comp_pct",
+            "expected_completion_percentage": "xcomp_pct",
+            "completion_percentage_above_expectation": "cpoe",
+            "avg_time_to_throw": "time_to_throw",
+            "aggressiveness": "aggression_pct",
+        }
+    elif board == "ngs-receiving":
+        bridges = {
+            "avg_intended_air_yards": "air_yards_per_target",
+            "catch_percentage": "catch_pct",
+            "avg_yac": "yac_per_reception",
+        }
+    elif board == "ngs-rushing":
+        bridges = {
+            "rush_attempts": "carries",
+            "avg_rush_yards": "yards_per_carry",
+            "rush_yards_over_expected_per_att": "yoe_per_attempt",
+        }
+    else:
+        bridges = {}
+    for src, dst in bridges.items():
+        if src in out.columns and dst not in out.columns:
+            out[dst] = out[src]
+
+    if board == "ngs-receiving" and "yards_per_target" not in out.columns and {"yards", "targets"}.issubset(out.columns):
+        yards = pd.to_numeric(out["yards"], errors="coerce")
+        targets = pd.to_numeric(out["targets"], errors="coerce").replace(0, np.nan)
+        out["yards_per_target"] = yards / targets
+    return out.dropna(how="all")
+
+
+def _first_nonblank(series):
+    for value in series:
+        try:
+            if pd.isna(value):
+                continue
+        except Exception:
+            pass
+        text = str(value).strip()
+        if text and text.lower() not in {"nan", "none", "null"}:
+            return value
+    return np.nan
+
+
+def _coalesce_uploaded_board_frames(frames: list[pd.DataFrame], board: str, season: int) -> pd.DataFrame:
+    frames = [f.copy() for f in frames if isinstance(f, pd.DataFrame) and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    normalized = [_normalized_frame(f, board, season) for f in frames]
+    combined = pd.concat(normalized, ignore_index=True, sort=False)
+    if board == "ftn-charting":
+        # Play IDs are only unique inside a game, so never dedupe FTN charting on
+        # play_id alone. Use the game+play compound key to preserve the full file.
+        if {"nflverse_game_id", "nflverse_play_id"}.issubset(combined.columns):
+            return combined.drop_duplicates(subset=["nflverse_game_id", "nflverse_play_id"], keep="last")
+        if {"ftn_game_id", "ftn_play_id"}.issubset(combined.columns):
+            return combined.drop_duplicates(subset=["ftn_game_id", "ftn_play_id"], keep="last")
+        return combined.drop_duplicates()
+    if "player" not in combined.columns:
+        return combined.drop_duplicates()
+    if "player_key" not in combined.columns:
+        combined["player_key"] = combined["player"].map(normalize_savant_player_name)
+    if "team" not in combined.columns:
+        combined["team"] = ""
+    if "position" not in combined.columns:
+        combined["position"] = ""
+    combined["team"] = combined["team"].fillna("").map(normalize_savant_team)
+    combined["position"] = combined["position"].fillna("").astype(str).str.upper().str.strip()
+    keys = ["player_key", "team", "position"]
+    rows = []
+    for key, group in combined.groupby(keys, dropna=False, sort=False):
+        row = {k: v for k, v in zip(keys, key if isinstance(key, tuple) else (key,))}
+        for col in combined.columns:
+            if col in keys:
+                continue
+            row[col] = _first_nonblank(group[col])
+        rows.append(row)
+    out = pd.DataFrame(rows)
+    out["savant_board"] = board
+    out["savant_season"] = int(season)
+    return out
+
+
 def import_savant_payloads(uploaded_files, savant_dir, default_season=None) -> list[dict]:
-    """Import ZIP/multi-CSV payloads, preserving originals and normalized boards."""
+    """Import NFL Savant, nflverse NGS, and FTN charting files in one pass.
+
+    Multiple files that feed the same logical board (for example the compact
+    nflsavant CPOE export plus the full nflverse ngs_passing.csv) are merged
+    instead of one silently replacing the other.
+    """
     root = Path(savant_dir)
     root.mkdir(parents=True, exist_ok=True)
     results = []
-    selected: dict[tuple[int, str], tuple[str, bytes, pd.DataFrame, str]] = {}
+    selected: dict[tuple[int, str], list[tuple[str, bytes, pd.DataFrame, str]]] = {}
+    result_slots: dict[tuple[int, str, str], list[int]] = {}
+
     for order, (name, payload) in enumerate(_iter_payloads(uploaded_files)):
         result = {"filename": name, "detected_board": "", "season": default_season,
-                  "rows": 0, "columns": 0, "valid": False, "saved_path": ""}
+                  "source_rows": 0, "rows": 0, "columns": 0, "valid": False, "saved_path": ""}
         if isinstance(payload, Exception):
-            result["detail"] = f"ZIP read failed: {payload}"
+            result["detail"] = f"File read failed: {payload}"
             results.append(result)
             continue
         try:
@@ -275,53 +460,76 @@ def import_savant_payloads(uploaded_files, savant_dir, default_season=None) -> l
             board = detect_savant_board(name, frame)
             season = _season_from_name(name, default_season)
             result.update({"detected_board": board or "UNKNOWN", "season": season,
-                           "rows": len(frame), "columns": len(frame.columns)})
+                           "source_rows": len(frame), "columns": len(frame.columns)})
             if board is None or season is None:
                 result["detail"] = "board or season could not be detected"
                 results.append(result)
                 continue
-            valid, detail = _frame_is_valid(frame, board)
+            prepared = _prepare_uploaded_board_frame(frame, board, int(season))
+            result["rows"] = len(prepared)
+            valid, detail = _frame_is_valid(prepared, board)
             result.update({"valid": valid, "detail": detail})
-            if valid:
-                selected[(int(season), board)] = (name, payload, frame, f"upload_order_{order}")
+            slot = len(results)
             results.append(result)
+            if valid:
+                key = (int(season), board)
+                selected.setdefault(key, []).append((name, payload, prepared, f"upload_order_{order}"))
+                result_slots.setdefault((int(season), board, name), []).append(slot)
         except Exception as exc:
             result["detail"] = str(exc)[:180]
             results.append(result)
 
     manifest = load_savant_manifest(root)
     entries = [entry for entry in manifest.get("files", []) if isinstance(entry, dict)]
-    for (season, board), (name, raw, frame, selection) in selected.items():
+    for (season, board), sources in selected.items():
         raw_dir = root / "raw" / str(season)
         norm_dir = root / "normalized" / str(season)
         raw_dir.mkdir(parents=True, exist_ok=True)
         norm_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = raw_dir / Path(name).name
+        raw_paths = []
+        frames = []
+        source_names = []
+        checksums = []
+        for name, raw, frame, _selection in sources:
+            raw_path = raw_dir / Path(name).name
+            # Duplicate filenames are safe: identical uploads simply refresh the same raw copy.
+            raw_path.write_bytes(raw)
+            raw_paths.append(str(raw_path))
+            source_names.append(name)
+            checksums.append(hashlib.sha256(raw).hexdigest())
+            frames.append(frame)
+        normalized = _coalesce_uploaded_board_frames(frames, board, season)
+        if normalized.empty:
+            continue
         norm_path = norm_dir / f"{board}.csv"
-        raw_path.write_bytes(raw)
-        normalized = _normalized_frame(frame, board, season)
         normalized.to_csv(norm_path, index=False)
-        checksum = hashlib.sha256(raw).hexdigest()
+        checksum = hashlib.sha256("|".join(checksums).encode("utf-8")).hexdigest()
         entries = [e for e in entries if not (e.get("season") == season and e.get("board") == board)]
         entries.append({
-            "board": board, "season": season, "source_filename": name,
-            "source_url": "UPLOAD", "pulled_at": _now_iso(), "checksum": checksum,
-            "rows": int(len(normalized)), "columns": int(len(normalized.columns)),
-            "parse_status": "VALID", "raw_path": str(raw_path),
-            "normalized_path": str(norm_path), "selection": selection,
+            "board": board, "season": season, "source_filename": " | ".join(source_names),
+            "source_filenames": source_names, "source_url": "UPLOAD", "pulled_at": _now_iso(),
+            "checksum": checksum, "rows": int(len(normalized)), "columns": int(len(normalized.columns)),
+            "parse_status": "VALID", "raw_path": raw_paths[0] if raw_paths else "",
+            "raw_paths": raw_paths, "normalized_path": str(norm_path), "selection": "MERGED_UPLOADS",
+            "supplemental": board in SAVANT_SUPPLEMENTAL_BOARDS,
         })
-        for result in results:
-            if result.get("filename") == name and result.get("detected_board") == board and result.get("season") == season:
-                result["saved_path"] = str(norm_path)
-                result["valid"] = True
+        for name in source_names:
+            for slot in result_slots.get((season, board, name), []):
+                results[slot]["saved_path"] = str(norm_path)
+                results[slot]["valid"] = True
+                if len(source_names) > 1:
+                    results[slot]["detail"] = f"accepted + merged into {board} ({len(normalized)} season rows)"
+                elif results[slot].get("source_rows", 0) != results[slot].get("rows", 0):
+                    results[slot]["detail"] = f"accepted; filtered to {season} REG season aggregate ({len(normalized)} rows)"
+                else:
+                    results[slot]["detail"] = "accepted"
+
     save_savant_manifest(root, entries)
     clear_savant_runtime_cache()
     for selected_season in sorted({season for season, _board in selected}):
         try:
             build_savant_feature_store(root, selected_season)
         except Exception:
-            # The normalized source pack remains valid even if a derived cache cannot
-            # be written. The explicit UI rebuild action can retry it later.
             pass
     return results
 
@@ -721,12 +929,15 @@ def savant_data_readiness(savant_dir, season=None) -> dict:
     selected = int(season) if season is not None else (seasons[-1] if seasons else None)
     selected_entries = [entry for entry in entries if selected is not None and int(entry.get("season", -1)) == selected]
     boards = {entry.get("board") for entry in selected_entries}
-    missing = sorted(SAVANT_REQUIRED_BOARDS - boards)
+    required_present = boards & SAVANT_REQUIRED_BOARDS
+    supplemental = sorted(boards - SAVANT_REQUIRED_BOARDS)
+    missing = sorted(SAVANT_REQUIRED_BOARDS - required_present)
     rows = sum(int(entry.get("rows", 0) or 0) for entry in selected_entries)
-    status = "FULL" if not missing else "PARTIAL" if boards else "MISSING"
+    status = "FULL" if not missing else "PARTIAL" if required_present or supplemental else "MISSING"
     return {"status": status, "season": selected, "boards": sorted(boards), "missing": missing,
-            "board_count": len(boards), "required_count": len(SAVANT_REQUIRED_BOARDS),
-            "rows": rows, "updated_at": manifest.get("updated_at")}
+            "required_boards": sorted(required_present), "supplemental_boards": supplemental,
+            "board_count": len(required_present), "required_count": len(SAVANT_REQUIRED_BOARDS),
+            "supplemental_count": len(supplemental), "rows": rows, "updated_at": manifest.get("updated_at")}
 
 
 def build_savant_feature_store(savant_dir, season=None) -> dict:
@@ -4042,7 +4253,7 @@ def fetch_nflverse_pbp(season=NFL_LAST_SEASON, force_refresh=False):
             request_log("NFLVERSE_PBP_REDUCED", "LOCAL_CACHE", f"rows={len(cached)}")
             return cached
     keep_cols = {
-        "season","season_type","game_type","game_id","week","posteam","defteam",
+        "season","season_type","game_type","game_id","play_id","week","posteam","defteam",
         "pass_attempt","rush_attempt","penalty","fumble_lost","fumble","sack","qb_hit",
         "touchdown","epa","success","yards_gained","air_yards","complete_pass","down",
         "yardline_100","qtr","rusher_player_name","receiver_player_name","passer_player_name"
@@ -11643,9 +11854,9 @@ def _render_nfl_savant_admin():
     c1.metric("Status",readiness.get("status","MISSING"))
     c2.metric("Boards",f"{readiness.get('board_count',0)}/{readiness.get('required_count',9)}")
     c3.metric("Rows",readiness.get("rows",0))
-    st.caption("Supplemental player efficiency and matchup context. Production picks remain on the V7.32 baseline while Savant runs in shadow mode.")
+    st.caption("Supplemental player efficiency and matchup context. Accepts NFL Savant exports, full nflverse NGS passing/receiving/rushing files, and FTN charting in one upload. Production picks remain on the V7.32 baseline while Savant runs in shadow mode.")
     uploads=st.file_uploader(
-        "Savant ZIP or CSV files",type=["zip","csv"],accept_multiple_files=True,
+        "Savant / NGS / FTN ZIP, CSV, or CSV.GZ files",type=["zip","csv","gz"],accept_multiple_files=True,
         key="nfl_savant_pack_upload",
     )
     if st.button("Import NFL Savant Data Pack",use_container_width=True,key="import_nfl_savant_pack"):
@@ -11655,7 +11866,8 @@ def _render_nfl_savant_admin():
             results=import_savant_payloads(uploads,SAVANT_DIR,NFL_LAST_SEASON)
             st.session_state["nfl_savant_import_results"]=results
             clear_projection_result_cache()
-            st.success(f"Processed {len(results)} Savant files.")
+            accepted=sum(1 for r in results if r.get("valid"))
+            st.success(f"Processed {len(results)} football data files · accepted {accepted}/{len(results)}.")
     import_results=st.session_state.get("nfl_savant_import_results") or []
     if import_results:
         st.dataframe(pd.DataFrame(import_results),use_container_width=True,hide_index=True)
@@ -11676,8 +11888,10 @@ def _render_nfl_savant_admin():
         st.dataframe(pd.DataFrame(refresh_results),use_container_width=True,hide_index=True)
     backup=build_savant_backup_zip(SAVANT_DIR)
     st.download_button("Download Current Savant Pack",data=backup,file_name=f"nfl_savant_pack_{NFL_LAST_SEASON}.zip",mime="application/zip",use_container_width=True,key="download_savant_pack")
+    if readiness.get("supplemental_boards"):
+        st.caption("Accepted supplemental files: "+", ".join(readiness.get("supplemental_boards") or []))
     if readiness.get("missing"):
-        st.caption("Upload fallback still needed for: "+", ".join(readiness.get("missing") or []))
+        st.caption("NFL Savant board fallback still needed for: "+", ".join(readiness.get("missing") or []))
 
 def _render_preseason_rotation_panel():
     st.caption("Coach-plan inputs own preseason workload. Saved shares are reconciled within each position room.")
