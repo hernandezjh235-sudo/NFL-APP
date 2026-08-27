@@ -698,10 +698,15 @@ def savant_matchup_context(team, opp, savant_dir, season=None) -> dict:
     return {
         "off_team": normalize_savant_team(team), "def_team": normalize_savant_team(opp),
         "off_epa": off_epa, "def_epa_allowed": _finite(defense.get("league__def_epa")),
+        "def_pass_epa_allowed": pass_def,
         "off_success": off_success, "def_success_allowed": def_success,
-        "pass_pressure_matchup": pressure, "rush_matchup": rush_def,
-        "explosive_pass_matchup": _finite(defense.get("league__explosive_pass_allowed")),
-        "explosive_rush_matchup": _finite(defense.get("league__explosive_rush_allowed")),
+        "pass_pressure_matchup": pressure,
+        "def_pressure_rate": _finite(defense.get("league__pressure_rate"), _finite(defense.get("league__def_pressure_rate"), pressure)),
+        "time_to_pressure": _finite(defense.get("league__time_to_pressure"), _finite(defense.get("league__ttp"))),
+        "coverage_success_rate": _finite(defense.get("league__coverage_success_rate"), _finite(defense.get("league__coverage_sr"))),
+        "rush_matchup": rush_def,
+        "explosive_pass_matchup": _finite(defense.get("league__explosive_pass_allowed"), _finite(defense.get("league__explosive_pass_rate_allowed"))),
+        "explosive_rush_matchup": _finite(defense.get("league__explosive_rush_allowed"), _finite(defense.get("league__explosive_rush_rate_allowed"))),
         "matchup_score": round(score, 1), "matchup_reliability": 82 if matched else 52 if defense.get("matched") else 20,
         "matchup_sample_size":int(matchup_sample),"penalty_environment":round(penalty_environment,3),
         "source": "NFL_SAVANT", "matched": matched,
@@ -967,8 +972,16 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.33 — SAVANT + PRESEASON WORKLOAD FIX"
-MODEL_VERSION = "nfl-prop-engine-v7.33.0"
+APP_VERSION = "NFL v7.36 — FOOTBALL CORE + OL/QB/DEFENSE MATCHUP"
+MODEL_VERSION = "nfl-prop-engine-v7.36.0"
+# v7.36 regular-season football-core update:
+# - keeps V7.35 player/team/matchup identity validation and line-integrity gates
+# - fixes duplicate use of current QB attempts and low game totals in Passing Yards
+# - game-level spread/total remain legitimate context; player prop line stays isolated
+# - QB Passing Yards = projected attempts x adjusted YPA with one OL/pass-rush composite
+# - adds QB pressure-to-sack tendency + coverage/air-depth matchup when data exists
+# - QB name tiers may change uncertainty/confidence, never the raw projection mean
+# Protected XGB/Bayesian/Smart-role/Team-volume/RF controls are unchanged.
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1435,11 +1448,13 @@ def qb_tier_context(player, position=""):
     if str(position or "").upper() != "QB":
         return {"tier": "NON_QB", "factor": 1.0, "sigma_factor": 1.0, "confidence_boost": 0, "note": ""}
     tier = ELITE_QB_TIERS.get(norm(player), "STANDARD_STARTER")
+    # Tier labels are uncertainty priors only. A player's name/reputation must never
+    # manufacture passing-yard mean. Raw mean comes from workload + efficiency + matchup.
     cfg = {
-        "ELITE_VETERAN": (1.012, 0.92, 8, "Elite/veteran QB stability boost"),
-        "GREAT_STABLE": (1.006, 0.95, 5, "Great/stable QB profile"),
-        "VETERAN_STABLE": (1.000, 0.96, 4, "Veteran QB stability"),
-        "YOUNG_UPSIDE": (1.004, 1.04, 2, "Young/upside QB volatility"),
+        "ELITE_VETERAN": (1.000, 0.92, 8, "Elite/veteran QB stability prior"),
+        "GREAT_STABLE": (1.000, 0.95, 5, "Great/stable QB variance prior"),
+        "VETERAN_STABLE": (1.000, 0.96, 4, "Veteran QB stability prior"),
+        "YOUNG_UPSIDE": (1.000, 1.04, 2, "Young/upside QB volatility prior"),
         "VOLATILE_UPSIDE": (1.000, 1.10, -2, "Volatile QB profile"),
         "STANDARD_STARTER": (1.000, 1.00, 0, "Standard QB profile"),
     }.get(tier, (1.0, 1.0, 0, "Standard QB profile"))
@@ -2309,8 +2324,19 @@ def official_rejection_reasons(p):
     if p.get("injury_risk") in ["HIGH", "EXTREME"]: reasons.append(f"Injury/role risk: {p.get('injury_risk')}")
     if safe_float(p.get("usage_quality"),100) < 68: reasons.append("Usage data/role quality too weak")
     if p.get("model_fallback_used"): reasons.append("Player/stat model data fallback used")
+    if prop == "Passing Yards":
+        football_q=safe_float((p.get("passing_yards_model") or {}).get("formula_quality"))
+        if football_q is not None and football_q < 56:
+            reasons.append(f"QB football-core context incomplete ({football_q:.0f}/100)")
     if (p.get("distribution_conflict") or {}).get("conflict"):
         reasons.append("Mean/P50 distribution conflict")
+    gate=p.get("decision_gate") or {}
+    if gate.get("thin_pass"):
+        reasons.append("Thin/near-zero decision edge")
+    integrity=p.get("market_integrity_audit") or {}
+    reasons.extend(integrity.get("hard_blocks") or [])
+    if p.get("market_line_collision"):
+        reasons.append(p.get("market_line_collision_reason") or "Cross-market line collision")
     if p.get("defense_risk") == "HIGH" and prob < 0.66: reasons.append("Tough defensive role matchup")
     if safe_float(p.get("collapse_prob"),0) >= 0.24 and prob < 0.69: reasons.append("High collapse-branch risk")
     if p.get("game_script_risk") == "HIGH" and prob < 0.67: reasons.append("Game-script risk on non-elite edge")
@@ -2682,6 +2708,95 @@ def _canonical_matchup(value="", team="", opp="", home_away=""):
         return f"{team} vs {opp}"
     return ""
 
+
+
+def _market_event_key(row):
+    """Stable game key used for dedupe/integrity checks without trusting display text."""
+    row=row or {}
+    direct=str(row.get("event_id") or row.get("game_id") or row.get("match_id") or "").strip()
+    if direct:
+        return direct
+    matchup=_canonical_matchup(row.get("matchup"), row.get("team"), row.get("opp"), row.get("home_away"))
+    return matchup or f"{_normalize_nfl_team(row.get('team'))}|{_normalize_nfl_team(row.get('opp'))}"
+
+
+def _row_market_integrity_audit(row):
+    """Audit live identity before a projection can become actionable.
+
+    This is intentionally independent of model math.  A strong formula cannot rescue
+    a line attached to the wrong player/team/game/market, so identity conflicts are
+    blocked rather than 'corrected' with a projection adjustment.
+    """
+    row=dict(row or {})
+    reasons=[]
+    team=_normalize_nfl_team(row.get("team"))
+    opp=_normalize_nfl_team(row.get("opp"))
+    prop=_canon_prop_label(row.get("prop")) or str(row.get("prop") or "")
+    matchup=_canonical_matchup(row.get("matchup"), team, opp, row.get("home_away"))
+    m1,m2=_teams_from_matchup_text(matchup)
+    if team and opp and team==opp:
+        reasons.append("Team and opponent are identical")
+    if m1 and m2 and team and team not in {m1,m2}:
+        reasons.append(f"Player team {team} is not in matchup {matchup}")
+    if m1 and m2 and opp and opp not in {m1,m2}:
+        reasons.append(f"Opponent {opp} is not in matchup {matchup}")
+    if prop and row.get("position") and not _prop_allowed_for_model_position(prop,row.get("position")):
+        reasons.append(f"{prop} invalid for position {row.get('position')}")
+    if row.get("market_line_collision"):
+        reasons.append(str(row.get("market_line_collision_reason") or "Same numeric line attached to multiple player markets"))
+    return {
+        "ok": not reasons,
+        "hard_blocks": list(dict.fromkeys(reasons)),
+        "team": team, "opp": opp, "matchup": matchup, "prop": prop,
+    }
+
+
+def _annotate_cross_market_line_collisions(rows):
+    """Mark exact same-player/game line collisions across different yardage markets.
+
+    Exact numeric coincidences can happen, so the row is not deleted.  Instead the
+    projection may be calculated for audit purposes but the final decision is forced
+    to PASS.  This catches feed/join errors such as an RB rushing line being attached
+    to Receiving Yards while preserving the raw board for debugging.
+    """
+    rows=[dict(r or {}) for r in (rows or [])]
+    yardage={"Passing Yards","Rushing Yards","Receiving Yards"}
+    groups={}
+    for idx,row in enumerate(rows):
+        prop=_canon_prop_label(row.get("prop")) or row.get("prop")
+        line=safe_float(row.get("line"))
+        if prop not in yardage or line is None:
+            continue
+        key=(_market_event_key(row), norm(row.get("player")), round(float(line),3))
+        groups.setdefault(key,[]).append((idx,prop))
+    for key,items in groups.items():
+        props=sorted({prop for _,prop in items})
+        if len(props) < 2:
+            continue
+        reason=f"Market-line collision: {key[2]:g} appears for {', '.join(props)}"
+        for idx,_ in items:
+            rows[idx]["market_line_collision"]=True
+            rows[idx]["market_line_collision_reason"]=reason
+    return rows
+
+
+def _regular_thin_decision_gate(prop, mean, line, over, under):
+    """Return PASS for near-coin-flip / near-zero-edge regular-season rows.
+
+    This changes only the displayed/action direction, never the raw projection.
+    It prevents cards such as 271.5 projection vs 271.5 line from showing UNDER.
+    """
+    if line is None or mean is None or over is None or under is None:
+        return False, ""
+    prob=max(float(over),float(under))
+    edge_abs=abs(float(mean)-float(line))
+    req=float(edge_requirement(prop))
+    # Conservative audit floor; official BET thresholds remain unchanged.
+    if prob < 0.535:
+        return True, f"Thin decision probability {prob:.1%}"
+    if edge_abs < max(0.15, req*0.18):
+        return True, f"Near-zero edge {edge_abs:.2f} < audit floor {max(0.15, req*0.18):.2f}"
+    return False, ""
 
 def _infer_home_away_from_matchup(row):
     """Infer HOME/AWAY from an oriented ``AWAY @ HOME`` matchup when the feed omits it."""
@@ -3589,13 +3704,18 @@ def _infer_position_from_prop(prop, position=""):
 
 
 def _filter_live_board_to_phase6_model(rows):
-    """Normalize NFL rows, reject malformed league/timestamp records, and deduplicate safely."""
+    """Normalize NFL rows, reject malformed identities, and deduplicate safely.
+
+    v7.34 adds a hard player-team-game check. Historical Phase 6 metadata is never
+    allowed to put a player on a team that is not actually present in the live game.
+    """
     if not rows:
         return []
     lookup = _phase6_player_lookup()
     model_filter_available = bool(lookup.get("exact") or lookup.get("by_last"))
+    current_usage_bank = load_current_usage_bank()
     clean = []
-    dropped = {"not_in_model": 0, "bad_position_market": 0, "bad_team": 0, "duplicate": 0}
+    dropped = {"not_in_model": 0, "bad_position_market": 0, "bad_team": 0, "team_matchup_conflict":0, "duplicate": 0}
     seen = set()
     for r in rows:
         row = dict(r or {})
@@ -3609,62 +3729,86 @@ def _filter_live_board_to_phase6_model(rows):
             continue
         row["line"] = float(line)
 
-        meta = _resolve_model_player_strict(row.get("player"), row.get("team"), row.get("position")) if model_filter_available else None
+        # Preserve the live identity before historical/context matching.
+        live_team = _normalize_nfl_team(row.get("team"))
+        live_pos = str(row.get("position") or "").upper().strip()
+        matchup_team, matchup_opp = _teams_from_matchup_text(row.get("matchup"))
+        matchup_teams={x for x in [matchup_team,matchup_opp] if x}
+
+        # Current-season usage is a better team resolver than last-season Phase 6.
+        current_rec=_lookup_player_record(current_usage_bank,row.get("player"),live_team,live_pos)
+        current_team=_normalize_nfl_team(current_rec.get("team") or current_rec.get("recent_team")) if current_rec else ""
+        if matchup_teams and current_team in matchup_teams:
+            live_team=current_team
+            row["team_identity_source"]="CURRENT_USAGE_MATCHUP"
+
+        meta = _resolve_model_player_strict(row.get("player"), live_team, live_pos) if model_filter_available else None
         if meta:
             row["player"] = meta.get("player") or row.get("player")
-            row["position"] = str(meta.get("position") or row.get("position") or "").upper().strip()
-            row["team"] = meta.get("team") or row.get("team")
+            row["position"] = str(live_pos or meta.get("position") or "").upper().strip()
+            # Never replace a current/live team with last-season team metadata.
+            meta_team=_normalize_nfl_team(meta.get("team"))
+            candidate_team=live_team or current_team or meta_team
+            if matchup_teams and candidate_team not in matchup_teams:
+                # If historical metadata conflicts with the live matchup, do not guess.
+                dropped["team_matchup_conflict"] += 1
+                continue
+            row["team"] = candidate_team or row.get("team")
             row["model_match"] = True
         else:
-            # Do not delete a valid live NFL line merely because the optional Phase 6
-            # database is incomplete. The projection remains available but its data
-            # score/audit will reflect partial context until the database is repaired.
             if model_filter_available:
                 dropped["not_in_model"] += 1
-            row["position"] = _infer_position_from_prop(prop, row.get("position"))
+            row["position"] = _infer_position_from_prop(prop, live_pos)
             row["model_match"] = False
             row["model_filter_disabled"] = True
+            row["team"] = live_team or current_team or row.get("team")
 
         if not _prop_allowed_for_model_position(prop, row.get("position")):
             dropped["bad_position_market"] += 1
             continue
 
         team = _normalize_nfl_team(row.get("team"))
-        matchup_team, matchup_opp = _teams_from_matchup_text(row.get("matchup"))
-        if not team:
-            team = matchup_team or matchup_opp
+        if not team and len(matchup_teams)==1:
+            team=next(iter(matchup_teams))
         if not team:
             dropped["bad_team"] += 1
             continue
+        if matchup_teams and team not in matchup_teams:
+            dropped["team_matchup_conflict"] += 1
+            continue
 
         opp = _normalize_nfl_team(row.get("opp"))
-        if not opp:
-            if matchup_team and matchup_team != team:
-                opp = matchup_team
-            elif matchup_opp and matchup_opp != team:
-                opp = matchup_opp
+        if matchup_teams:
+            opponents=[t for t in matchup_teams if t != team]
+            if len(opponents)==1:
+                opp=opponents[0]
+        if opp and opp==team:
+            dropped["team_matchup_conflict"] += 1
+            continue
+
         row["team"] = team
         row["opp"] = opp
         row["prop"] = prop
         row["matchup"] = _canonical_matchup(row.get("matchup"), team, opp, row.get("home_away"))
         row["matchup_status"] = "VALID" if row["matchup"] else "OPPONENT_PENDING"
 
-        event_key = str(row.get("event_id") or row.get("game_id") or row.get("match_id") or row.get("matchup") or team)
-        key = (event_key, norm(row.get("player")), row.get("prop"), safe_float(row.get("line")))
+        # Canonical dedupe ignores parser/source-id differences. One player/game/prop/line.
+        event_key = _market_event_key(row)
+        key = (event_key, norm(row.get("player")), row.get("prop"), round(float(row.get("line")),3), team, opp)
         if key in seen:
             dropped["duplicate"] += 1
             continue
         seen.add(key)
         clean.append(row)
 
+    clean=_annotate_cross_market_line_collisions(clean)
     request_log(
         "NFL_MODEL_BOARD_FILTER", "FILTERED",
         f"kept={len(clean)} partial_not_model={dropped['not_in_model']} "
         f"dropped_bad_market={dropped['bad_position_market']} dropped_bad_team={dropped['bad_team']} "
-        f"duplicates={dropped['duplicate']}"
+        f"team_matchup_conflict={dropped['team_matchup_conflict']} duplicates={dropped['duplicate']}"
     )
     return clean
-
 
 
 def _line_variant_text(row):
@@ -3871,12 +4015,16 @@ def parse_manual_underdog_board(text="", uploaded_file=None):
 
 
 def _dedupe_board_rows(rows):
+    """Canonical one-row-per player/game/prop/line dedupe across parser variants."""
     seen, clean = set(), []
-    for r in rows or []:
-        key = (norm(r.get("player")), r.get("prop"), safe_float(r.get("line")), norm(r.get("matchup")))
+    for raw in rows or []:
+        r=dict(raw or {})
+        team=_normalize_nfl_team(r.get("team")); opp=_normalize_nfl_team(r.get("opp"))
+        matchup=_canonical_matchup(r.get("matchup"),team,opp,r.get("home_away"))
+        key=(_market_event_key({**r,"matchup":matchup}), norm(r.get("player")), _canon_prop_label(r.get("prop")) or r.get("prop"), safe_float(r.get("line")), team, opp)
         if key not in seen:
             seen.add(key); clean.append(r)
-    return clean
+    return _annotate_cross_market_line_collisions(clean)
 
 
 # ---------- MLB-style stable seeds + Phase 6 NFL database ----------
@@ -6577,14 +6725,19 @@ def merge_nfl_context(row):
     if not current_team_ctx and team in current_bank.get("teams",{}):
         current_team_ctx=current_bank["teams"].get(team,{})
     opp_ctx=teams.get(opp,{}) if isinstance(teams.get(opp,{}),dict) else {}
+    opp_current_team_ctx=current_teams.get(opp,{}) if isinstance(current_teams.get(opp,{}),dict) else {}
+    if not opp_current_team_ctx and opp in current_bank.get("teams",{}):
+        opp_current_team_ctx=current_bank["teams"].get(opp,{})
     # Team offense / pace / Vegas / coach-style context.  These are NFL-specific
     # equivalents of the MLB environment and lineup context layers.
     team_keys = [
         "pace","pass_rate","rush_rate","plays_pg","spread","game_total","team_total",
         "weather_risk","pbp_plays_pg","pbp_pass_rate","pbp_rush_rate",
         "epa_per_play","success_rate","early_down_pass_rate","early_down_success_rate",
+        "neutral_pass_rate","neutral_pass_pct","proe","pass_rate_over_expected","play_action_rate","shotgun_rate",
         "red_zone_pass_rate","goal_line_rush_rate","penalties_pg","fumbles_pg",
-        "sacks_allowed_pg","qb_hits_allowed_pg","explosive_pass_rate","explosive_rush_rate",
+        "sacks_allowed_pg","qb_hits_allowed_pg","sack_rate_allowed","quick_pressure_rate_allowed",
+        "explosive_pass_rate","explosive_rush_rate",
         "ot_rate","team_identity","coach_pace_proxy","seconds_per_play","no_huddle_rate",
         "offense_rank","off_pass_rank","off_run_rank","off_scoring_rank","off_pace_rank",
         "off_success_rank","off_epa_rank","off_explosive_pass_rank","off_explosive_run_rank",
@@ -6609,13 +6762,26 @@ def merge_nfl_context(row):
             row[k]=current_team_ctx.get(k)
             row["has_current_team_context"] = True
 
+    # Opponent offensive pace is useful for projected game possessions. It is kept
+    # separate from opponent defense so we do not confuse pace with matchup quality.
+    for src,dst in [
+        ("current_plays_pg","opp_plays_pg"),("plays_pg","opp_plays_pg"),("pbp_plays_pg","opp_pbp_plays_pg"),
+        ("seconds_per_play","opp_seconds_per_play"),("no_huddle_rate","opp_no_huddle_rate"),
+        ("current_pass_rate","opp_pass_rate"),("pass_rate","opp_pass_rate"),
+    ]:
+        value=opp_current_team_ctx.get(src) if _usable_context_value(opp_current_team_ctx.get(src)) else opp_ctx.get(src)
+        if _usable_context_value(value) and not _usable_context_value(row.get(dst)):
+            row[dst]=value
+
     # Opponent defensive context.  Prefix advanced fields with opp_ so we never
     # accidentally confuse offense and defense.
     opp_keys = [
         "def_pass_rank","def_run_rank","def_slot_rank","def_te_rank","def_rb_rec_rank",
         "def_role_rank","coverage_grade","pressure_rate","def_pressure_rate",
         "pass_yards_allowed_pg","rush_yards_allowed_pg","rec_yards_allowed_pg","receptions_allowed_pg",
-        "def_epa_allowed_per_play","def_success_allowed_rate","def_sacks_pg",
+        "def_epa_allowed_per_play","def_pass_epa_allowed","def_success_allowed_rate","def_pass_success_allowed_rate",
+        "def_sacks_pg","def_sack_rate","def_pressure_rate","def_time_to_pressure","def_coverage_success_rate",
+        "def_comp_pct_allowed","def_air_yards_per_attempt_allowed",
         "def_qb_hits_pg","def_fumbles_forced_pg","explosive_pass_allowed_rate",
         "explosive_rush_allowed_rate","def_explosive_pass_rank","def_explosive_run_rank",
         "def_pressure_rank","def_run_stop_rank"
@@ -6833,7 +6999,13 @@ def current_week_role_engine(row, role, prop):
     }
     volumes={k:_weighted_current_metric(row,*spec) for k,spec in volume_specs.items()}
     metrics.update({k:round(v,2) for k,v in volumes.items() if v is not None})
-    if prop in ["Passing Yards","Passing TDs","Interceptions","Pass Attempts","Completions"]:
+    if prop == "Passing Yards":
+        # passing_yards_stat_projection already blends current/L3 attempts directly.
+        # Keep this engine diagnostic-only for pass-volume trend to avoid counting it twice.
+        season=_first_numeric(row,["current_pass_attempts_pg","pass_attempts_pg"])
+        if volumes.get("pass") is not None and season and season>0 and abs(volumes["pass"]-season)>=1.5:
+            notes.append("Current QB attempt trend routed to QB football-core model")
+    elif prop in ["Passing TDs","Interceptions","Pass Attempts","Completions"]:
         season=_first_numeric(row,["current_pass_attempts_pg","pass_attempts_pg"])
         if volumes.get("pass") is not None and season and season>0:
             factor*=clamp(volumes["pass"]/season,0.90,1.10)
@@ -6862,7 +7034,11 @@ def current_week_role_engine(row, role, prop):
         if any(x in qb_change for x in ["HIGH","BACKUP","CHANGE","UNCERTAIN"]): factor*=0.94; risk="HIGH"; notes.append("Starting-QB change tax")
     ol_out=max(safe_float(row.get("starting_ol_out"),0) or 0,safe_float(row.get("ol_starters_out"),0) or 0)
     if ol_out and prop in ["Passing Yards","Pass Attempts","Completions","Rushing Yards","Rush Attempts"]:
-        factor*=clamp(1-0.025*ol_out,0.90,1.0); notes.append(f"Offensive-line availability tax ({int(ol_out)} starters out)")
+        if prop == "Passing Yards":
+            # Consumed directly by the QB trench model so it is not multiplied twice.
+            notes.append(f"OL availability routed to QB trench model ({int(ol_out)} starters out)")
+        else:
+            factor*=clamp(1-0.025*ol_out,0.90,1.0); notes.append(f"Offensive-line availability tax ({int(ol_out)} starters out)")
         if ol_out>=2: risk="HIGH"
     limited=safe_float(row.get("limited_snap_risk"),0) or 0
     if limited>0: factor*=clamp(1-limited*0.18,0.84,1.0)
@@ -7307,17 +7483,24 @@ def role_risk_adjustments(row, role, prop):
         risk_factor*=0.92; notes.append("Route participation below safe threshold")
     if prop in ["Rushing Yards","Rush Attempts","Longest Rush"] and carry < 38:
         risk_factor*=0.90; notes.append("Carry share below safe threshold")
-    if prop in ["Passing Yards","Passing TDs","Pass Attempts","Completions"] and role.get("pressure",0) >= 32:
+    if prop in ["Passing TDs","Pass Attempts","Completions"] and role.get("pressure",0) >= 32:
         risk_factor*=0.96; notes.append("Pass-rush pressure tax")
+    elif prop == "Passing Yards" and role.get("pressure",0) >= 32:
+        notes.append("Pass-rush pressure routed to QB football-core model")
 
     if spread is not None and abs(spread) >= 7.5:
         script_risk="HIGH"
-        if prop in ["Passing Yards","Receiving Yards","Receptions","Pass Attempts","Completions","Longest Reception"] and spread < -7.5:
+        if prop in ["Receiving Yards","Receptions","Pass Attempts","Completions","Longest Reception"] and spread < -7.5:
             risk_factor*=0.96; notes.append("Blowout/low pass-volume risk")
+        elif prop == "Passing Yards" and spread < -7.5:
+            notes.append("Blowout pass-volume handled in QB football-core model")
         elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"] and spread > 7.5:
             risk_factor*=0.96; notes.append("Negative game-script rush risk")
-    if total is not None and total <= 39 and prop in ["Passing Yards","Receiving Yards","Receptions","Passing TDs","Fantasy Points"]:
+    if total is not None and total <= 39 and prop in ["Receiving Yards","Receptions","Passing TDs","Fantasy Points"]:
         risk_factor*=0.97; notes.append("Low game-total environment tax")
+    elif total is not None and total <= 39 and prop == "Passing Yards":
+        # Already consumed by total_factor in passing_yards_stat_projection.
+        notes.append("Low game total handled in QB football-core model")
 
     return clamp(risk_factor,0.70,1.05), injury_risk, script_risk, notes
 
@@ -7713,10 +7896,15 @@ def advanced_context_engine(row, prop):
     opp_pressure=safe_float(row.get("opp_def_pressure_rank"), safe_float(row.get("def_pressure_rank")))
     if protection is not None and opp_pressure is not None:
         ctx["protection_pressure_matchup"] = {"pass_pro_rank": protection, "opp_pressure_rank": opp_pressure}
-        if protection >= 24 and opp_pressure <= 8 and prop in ["Passing Yards","Receiving Yards"]:
+        if protection >= 24 and opp_pressure <= 8 and prop == "Receiving Yards":
             factor*=0.974; risk="MED"; notes.append("Protection mismatch: weak OL vs strong pressure")
-        elif protection <= 8 and opp_pressure >= 24 and prop in ["Passing Yards","Receiving Yards"]:
+        elif protection <= 8 and opp_pressure >= 24 and prop == "Receiving Yards":
             factor*=1.012; notes.append("Protection edge: strong OL vs weak pressure")
+        elif prop == "Passing Yards":
+            if protection >= 24 and opp_pressure <= 8:
+                risk="MED"; notes.append("Protection mismatch routed to QB football-core model")
+            elif protection <= 8 and opp_pressure >= 24:
+                notes.append("Protection edge routed to QB football-core model")
 
     qb_status=str(row.get("qb_status") or row.get("qb_injury_status") or "").upper()
     qb_change=str(row.get("qb_change_risk") or row.get("qb_qb_change_risk") or "").upper()
@@ -7984,167 +8172,376 @@ def ensemble_ml_assist_projection(row, rule_projection):
 
 
 def passing_yards_stat_projection(row, role, cfg):
-    """Passing Yards projection built from QB history + opportunity + matchup.
+    """Regular-season QB Passing Yards — football-first opportunity × efficiency core.
 
-    Uses the saved Phase 6/nflverse database when available:
-    - last season passing yards per game
-    - pass attempts per game
-    - estimated yards per attempt
-    - team pass rate / expected plays
-    - opponent pass defense rank
-    - spread / total / stadium/weather
+    V7.36 design:
+      A) project offensive plays / pass tendency / expected dropbacks;
+      B) convert dropbacks to pass attempts using sack/protection context;
+      C) estimate QB efficiency from YPA + CPOE/aDOT with opponent pass defense;
+      D) explicitly model OL pass block vs opponent pressure/quick pressure;
+      E) apply spread, total, weather and venue once (not again downstream);
+      F) blend the opportunity model with a volume-adjusted historical anchor.
 
-    The sportsbook line is not used to create the raw projection. It is compared only after simulation to determine OVER/UNDER.
+    The player's sportsbook prop line never enters the raw projection.
     """
     row = enrich_passing_yards_context(dict(row or {}))
-    notes = []
-    breakdown = {}
+    notes=[]; breakdown={}; missing=[]
 
-    player_ypg = safe_float(row.get("passing_yards_pg"))
-    attempts_pg = safe_float(row.get("pass_attempts_pg"))
-    completions_pg = safe_float(row.get("completions_pg"))
-    team_pass_att = safe_float(row.get("team_pass_attempts_pg"), safe_float(row.get("pass_attempts_team_pg")))
-    team_plays = safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
-    pass_rate = safe_float(row.get("pbp_pass_rate"), safe_float(row.get("pass_rate"), 56)) or 56
-    spread = safe_float(row.get("spread"), 0) or 0
-    total = safe_float(row.get("game_total"), 44) or 44
-    line = safe_float(row.get("line"))
-    if row.get("model_match_status") == "NO_MODEL_MATCH":
-        notes.append("NO MODEL MATCH: using capped fallback until QB exists in Phase 6/context bank")
+    def _pct(value, default=None):
+        v=safe_float(value)
+        if v is None:
+            return default
+        # Accept both proportions and percentage-point storage.
+        if -1.5 <= v <= 1.5:
+            return v*100.0
+        return v
+
+    def _first(*values):
+        for value in values:
+            v=safe_float(value)
+            if v is not None:
+                return v
+        return None
+
+    player_ypg=safe_float(row.get("passing_yards_pg"))
+    attempts_pg=safe_float(row.get("pass_attempts_pg"))
+    team_pass_att=safe_float(row.get("team_pass_attempts_pg"),safe_float(row.get("pass_attempts_team_pg")))
+    team_plays=safe_float(row.get("pbp_plays_pg"),safe_float(row.get("plays_pg"),62)) or 62
+    opp_plays=_first(row.get("opp_pbp_plays_pg"), row.get("opp_plays_pg"))
+    pass_rate=_pct(_first(row.get("pbp_pass_rate"),row.get("pass_rate")),56) or 56
+    spread=safe_float(row.get("spread"),0) or 0
+    total=safe_float(row.get("game_total"),44) or 44
+    team_total=safe_float(row.get("team_total"))
+
+    sav=dict(row.get("savant_player_context") or {})
+    sav_team=dict(row.get("savant_team_context") or {})
+    sav_match=dict(row.get("savant_matchup_context") or {})
+
+    def _sav_team_num(*keys):
+        for key in keys:
+            value=safe_float(sav_team.get(key))
+            if value is not None:
+                return value
+        return None
+
+    if row.get("model_match_status")=="NO_MODEL_MATCH":
+        notes.append("NO MODEL MATCH: capped QB fallback context")
     elif row.get("model_player_match"):
         notes.append(f"Model match: {row.get('model_player_match')} ({row.get('passing_context_bank_source')})")
 
-    # Phase 6 player summary is the preferred base. Fallbacks keep the app usable
-    # when the QB is missing a prior sample, but the card will show that clearly.
-    if player_ypg is None or player_ypg <= 0:
-        player_ypg = safe_float(row.get("avg_pass_yards_pg"), None)
-    if attempts_pg is None or attempts_pg <= 0:
-        attempts_pg = safe_float(row.get("attempts_pg"), None)
-    if attempts_pg is None or attempts_pg <= 0:
-        attempts_pg = team_pass_att if team_pass_att and team_pass_att > 0 else 33.5
-        notes.append("QB pass attempts fallback used")
-    if player_ypg is None or player_ypg <= 0:
-        # Fallback is intentionally near market but not equal to market; this prevents
-        # blind 300+ projections when historical data is missing.
-        player_ypg = cfg.get("base", 235)
-        notes.append("QB pass yards fallback used")
-    current_games=safe_float(row.get("current_games"), 0) or 0
-    cur_ypg=safe_float(row.get("current_passing_yards_pg"))
-    last3_ypg=safe_float(row.get("last3_passing_yards_pg"))
-    cur_att=safe_float(row.get("current_pass_attempts_pg"))
-    last3_att=safe_float(row.get("last3_pass_attempts_pg"))
-    if current_games >= 2 and cur_ypg and cur_ypg > 0:
-        recent_blend=0.22 if current_games < 5 else 0.34
-        form_ypg=(cur_ypg*0.65 + (last3_ypg or cur_ypg)*0.35)
-        player_ypg=(player_ypg*(1-recent_blend))+(form_ypg*recent_blend)
-        notes.append(f"Current-season QB form blend active ({int(current_games)} games)")
-    if current_games >= 2 and cur_att and cur_att > 0:
-        recent_blend=0.24 if current_games < 5 else 0.36
-        form_att=(cur_att*0.65 + (last3_att or cur_att)*0.35)
-        attempts_pg=(attempts_pg*(1-recent_blend))+(form_att*recent_blend)
+    if player_ypg is None or player_ypg<=0:
+        player_ypg=safe_float(row.get("avg_pass_yards_pg"),cfg.get("base",235)) or cfg.get("base",235)
+        notes.append("QB pass yards fallback used"); missing.append("QB pass yards history")
+    if attempts_pg is None or attempts_pg<=0:
+        attempts_pg=safe_float(row.get("attempts_pg"),team_pass_att if team_pass_att and team_pass_att>0 else 33.5) or 33.5
+        notes.append("QB pass attempts fallback used"); missing.append("QB attempts history")
 
-    ypa = safe_float(row.get("yards_per_attempt"), None)
-    if ypa is None or ypa <= 0:
-        ypa = player_ypg / max(1.0, attempts_pg)
-    ypa = clamp(ypa, 5.0, 9.4)
+    # ----- Current form: shrink toward established role early in the year. -----
+    current_games=int(safe_float(row.get("current_games"),0) or 0)
+    cur_ypg=safe_float(row.get("current_passing_yards_pg")); l3_ypg=safe_float(row.get("last3_passing_yards_pg"))
+    cur_att=safe_float(row.get("current_pass_attempts_pg")); l3_att=safe_float(row.get("last3_pass_attempts_pg"))
+    if current_games>=2 and cur_ypg and cur_ypg>0:
+        w=0.22 if current_games<5 else 0.36 if current_games<9 else 0.48
+        form=cur_ypg*0.65+(l3_ypg or cur_ypg)*0.35
+        player_ypg=player_ypg*(1-w)+form*w
+        notes.append(f"Current QB yardage blend active ({current_games} games)")
+    if current_games>=2 and cur_att and cur_att>0:
+        w=0.24 if current_games<5 else 0.38 if current_games<9 else 0.50
+        form=cur_att*0.65+(l3_att or cur_att)*0.35
+        attempts_pg=attempts_pg*(1-w)+form*w
 
-    # Project attempts from team pace/pass rate and QB baseline attempts.
-    pace_attempts = team_plays * pass_rate / 100.0
-    expected_attempts = (attempts_pg * 0.62) + (pace_attempts * 0.38)
+    # ----- Baseline QB efficiency. -----
+    base_ypa=safe_float(row.get("yards_per_attempt"))
+    if base_ypa is None or base_ypa<=0:
+        base_ypa=player_ypg/max(1.0,attempts_pg)
+        missing.append("explicit YPA")
+    if current_games>=2 and cur_ypg and cur_att and cur_att>0:
+        cur_ypa=cur_ypg/cur_att
+        ypa_w=0.18 if current_games<5 else 0.30 if current_games<9 else 0.42
+        base_ypa=base_ypa*(1-ypa_w)+cur_ypa*ypa_w
+    base_ypa=clamp(base_ypa,5.0,9.4)
 
-    # Game script: underdogs throw more; large favorites may lose late pass volume.
-    script_attempt_factor = 1.0
-    if spread >= 6:
-        script_attempt_factor += 0.055
-        notes.append("Passing volume boost: projected trailing script")
-    elif spread >= 3:
-        script_attempt_factor += 0.025
-    elif spread <= -9:
-        script_attempt_factor -= 0.060
-        notes.append("Passing volume tax: blowout/favorite script")
-    elif spread <= -5.5:
-        script_attempt_factor -= 0.025
+    # ----- A) Team play volume + pass tendency. -----
+    # Game play count uses both offenses when available; opponent pace influences how
+    # many possessions/snaps this offense is likely to see.
+    game_plays=team_plays
+    if opp_plays is not None and opp_plays>0:
+        game_plays=team_plays*0.72+opp_plays*0.28
+    else:
+        missing.append("opponent pace")
 
-    total_factor = clamp(1 + (total - 44) * 0.006, 0.94, 1.07)
-    pass_rate_factor = clamp(1 + (pass_rate - 56) * 0.0045, 0.93, 1.08)
+    neutral_pass=_pct(_first(
+        row.get("neutral_pass_rate"),row.get("neutral_pass_pct"),row.get("early_down_pass_rate"),
+        _sav_team_num("league__neutral_pass_rate","league__neutral_pass_pct")
+    ))
+    proe=_first(row.get("proe"),row.get("pass_rate_over_expected"),
+                _sav_team_num("league__proe","league__pass_rate_over_expected"))
+    proe_pp=None
+    pass_tendency=pass_rate
+    if neutral_pass is not None:
+        pass_tendency=pass_rate*0.68+neutral_pass*0.32
+        notes.append(f"Neutral-script pass tendency {neutral_pass:.1f}%")
+    else:
+        missing.append("neutral pass rate/PROE")
+    if proe is not None:
+        proe_pp=proe*100.0 if -0.35<=proe<=0.35 else proe
+        pass_tendency += clamp(proe_pp,-12,12)*0.35
+        notes.append(f"PROE tendency {proe_pp:+.1f} pts")
+    pass_tendency=clamp(pass_tendency,45.0,70.0)
+    projected_dropbacks=game_plays*pass_tendency/100.0
 
-    env = environment_for(row)
-    stadium_factor = 1.0
-    if env.get("roof") in ["Dome", "Retractable"]:
-        stadium_factor *= 1.018
-        notes.append("Dome/retractable roof passing nudge")
-    if str(row.get("weather_risk") or "").upper() in ["HIGH", "SEVERE", "WIND", "RAIN", "SNOW"]:
-        stadium_factor *= 0.925
-        notes.append("Weather passing tax")
+    # ----- B) OL / sack conversion: dropbacks are not the same as pass attempts. -----
+    ol_rank=safe_float(row.get("ol_pass_pro_rank"),safe_float(row.get("qb_pass_protection_rank")))
+    pressure_rank=safe_float(row.get("opp_def_pressure_rank"),safe_float(row.get("def_pressure_rank")))
+    pressure_rate=_pct(_first(row.get("opp_def_pressure_rate"),row.get("def_pressure_rate"),sav_match.get("def_pressure_rate"),sav_match.get("pass_pressure_matchup")))
+    sacks_allowed=safe_float(row.get("sacks_allowed_pg"))
+    qb_hits_allowed=safe_float(row.get("qb_hits_allowed_pg"))
+    ol_out=max(safe_float(row.get("starting_ol_out"),0) or 0,safe_float(row.get("ol_starters_out"),0) or 0)
+    pass_block_grade=_sav_team_num("league__pass_block","league__pass_block_grade","league__ol_pass_block","league__ol_pass_block_grade")
+    quick_pressure_allowed=_pct(_sav_team_num("league__quick_pressure_rate_allowed","league__quick_pressure_pct_allowed","league__quick_pressure_rate"))
+    sav_sack_rate_allowed=_pct(_sav_team_num("league__sack_rate_allowed","league__sack_rate"))
+    time_to_pressure=safe_float(sav_match.get("time_to_pressure"))
+
+    # QB-specific pressure-to-sack tendency. Team sack rate is partly OL/scheme/QB; the
+    # Savant quick-pressure grade gives the line-only anchor, while this small modifier
+    # captures whether this QB historically turns pressure into sacks at an unusual rate.
+    qb_sacks=_first(sav.get("passing__sacks"),sav.get("sacks"))
+    qb_pressure_pct=_pct(_first(sav.get("passing__pressure_pct"),sav.get("pressure_pct")))
+    qb_savant_attempts=_first(sav.get("passing__attempts"),sav.get("passing__att"),sav.get("ngs_passing__attempts"))
+    qb_pressure_to_sack=None
+    if qb_sacks is not None and qb_pressure_pct is not None and qb_savant_attempts is not None and qb_savant_attempts>=80:
+        qb_dropbacks=max(1.0,qb_savant_attempts+qb_sacks)
+        pressured_dropbacks=max(1.0,qb_dropbacks*qb_pressure_pct/100.0)
+        qb_pressure_to_sack=clamp(qb_sacks/pressured_dropbacks,0.05,0.45)
+
+    # Estimate the share of passing plays lost to sacks before they become attempts.
+    if sav_sack_rate_allowed is not None:
+        base_sack_rate=clamp(sav_sack_rate_allowed/100.0,0.02,0.13)
+    elif sacks_allowed is not None:
+        base_sack_rate=clamp(sacks_allowed/max(1.0,attempts_pg+sacks_allowed),0.02,0.13)
+    else:
+        base_sack_rate=0.065; missing.append("OL sack rate")
+    sack_context=1.0
+    if pressure_rate is not None:
+        sack_context*=clamp(1+(pressure_rate-24.0)*0.010,0.84,1.22)
+    if pass_block_grade is not None:
+        sack_context*=clamp(1-(pass_block_grade-100.0)*0.006,0.82,1.20)
+    if quick_pressure_allowed is not None:
+        sack_context*=clamp(1+(quick_pressure_allowed-10.0)*0.015,0.85,1.20)
+    if qb_pressure_to_sack is not None:
+        # League-ish pressure-to-sack baseline ~20%; deliberately modest influence.
+        sack_context*=clamp(1+(qb_pressure_to_sack-0.20)*0.55,0.90,1.12)
+    if ol_out:
+        sack_context*=1+min(0.24,0.07*ol_out)
+    expected_sack_rate=clamp(base_sack_rate*sack_context,0.018,0.145)
+    pace_attempts=projected_dropbacks*(1.0-expected_sack_rate)
+
+    explicit_att=safe_float(row.get("expected_attempts"))
+    if explicit_att and explicit_att>0:
+        expected_attempts=attempts_pg*0.52+pace_attempts*0.30+explicit_att*0.18
+        notes.append("Explicit expected-attempts role input active")
+    else:
+        expected_attempts=attempts_pg*0.62+pace_attempts*0.38
+
+    # Spread changes volume, not QB talent. Positive team spread = expected underdog.
+    script_attempt_factor=1.0
+    if spread>=7:
+        script_attempt_factor+=0.060; notes.append("Trailing-script pass-volume boost")
+    elif spread>=3:
+        script_attempt_factor+=0.028
+    elif spread<=-9:
+        script_attempt_factor-=0.060; notes.append("Large-favorite late pass-volume tax")
+    elif spread<=-5.5:
+        script_attempt_factor-=0.028
+    projected_attempts=clamp(expected_attempts*script_attempt_factor,18.0,49.0)
+
+    # ----- C) Opponent pass-defense composite. -----
+    opp_rank=safe_float(row.get("def_pass_rank"),safe_float(row.get("opp_def_pass_rank")))
+    pass_allowed=safe_float(row.get("pass_yards_allowed_pg"),safe_float(row.get("opp_pass_yards_allowed_pg")))
+    def_pass_epa=_first(row.get("opp_def_pass_epa_allowed"),row.get("def_pass_epa_allowed"),sav_match.get("def_pass_epa_allowed"),row.get("opp_def_epa_allowed_per_play"))
+    def_success=_pct(_first(row.get("opp_def_pass_success_allowed_rate"),row.get("def_pass_success_allowed_rate"),row.get("opp_def_success_allowed_rate"),sav_match.get("def_success_allowed")))
+    explosive_allowed=_pct(_first(row.get("opp_explosive_pass_allowed_rate"),row.get("explosive_pass_allowed_rate"),sav_match.get("explosive_pass_matchup")))
+    coverage_success=_pct(_first(row.get("opp_def_coverage_success_rate"),row.get("def_coverage_success_rate"),sav_match.get("coverage_success_rate")))
+    air_yards_allowed=_first(row.get("opp_def_air_yards_per_attempt_allowed"),row.get("def_air_yards_per_attempt_allowed"))
+
+    # Defense is one composite, not a stack of repeated multipliers. Higher values of
+    # pass EPA/success/yards/explosives allowed help the offense; higher coverage success
+    # helps the defense, so its sign is intentionally inverted.
+    defense_components=[]
+    if opp_rank is not None:
+        defense_components.append((clamp((opp_rank-16.5)/15.5,-1,1),0.22,"rank"))
+    if pass_allowed is not None:
+        defense_components.append((clamp((pass_allowed-220.0)/65.0,-1,1),0.12,"yards allowed"))
+    if def_pass_epa is not None:
+        defense_components.append((clamp(def_pass_epa/0.18,-1,1),0.28,"pass EPA allowed"))
+    if def_success is not None:
+        defense_components.append((clamp((def_success-45.0)/10.0,-1,1),0.12,"pass success allowed"))
+    if explosive_allowed is not None:
+        defense_components.append((clamp((explosive_allowed-8.0)/5.0,-1,1),0.08,"explosive pass allowed"))
+    if coverage_success is not None:
+        defense_components.append((-clamp((coverage_success-50.0)/10.0,-1,1),0.10,"coverage success"))
+    if air_yards_allowed is not None:
+        defense_components.append((clamp((air_yards_allowed-8.0)/3.0,-1,1),0.08,"air yards/att allowed"))
+    if defense_components:
+        wsum=sum(w for _,w,_ in defense_components)
+        defense_score=sum(score*w for score,w,_ in defense_components)/max(wsum,1e-9)
+        defense_factor=clamp(1+defense_score*0.050,0.945,1.055)
+    else:
+        defense_score=0.0; defense_factor=1.0; missing.append("opponent pass-defense composite")
+
+    # ----- D) Trench composite. Each input contributes once; weights renormalize. -----
+    trench_components=[]
+    if ol_rank is not None and pressure_rank is not None:
+        trench_edge=pressure_rank-ol_rank
+        trench_components.append((clamp(trench_edge/16.0,-1,1),0.22,"OL rank vs pressure rank"))
+    else:
+        trench_edge=None
+    if pass_block_grade is not None:
+        trench_components.append((clamp((pass_block_grade-100.0)/30.0,-1,1),0.28,"Savant pass block"))
+    if quick_pressure_allowed is not None:
+        trench_components.append((clamp((10.0-quick_pressure_allowed)/8.0,-1,1),0.24,"quick pressure allowed"))
+    if pressure_rate is not None:
+        trench_components.append((clamp((24.0-pressure_rate)/12.0,-1,1),0.16,"opponent pressure"))
+    if ol_out:
+        trench_components.append((-min(1.0,ol_out/2.0),0.10,"OL availability"))
+    if trench_components:
+        wsum=sum(w for _,w,_ in trench_components)
+        trench_score=sum(score*w for score,w,_ in trench_components)/max(wsum,1e-9)
+        trench_factor=clamp(1+trench_score*0.045,0.94,1.055)
+    else:
+        trench_score=0.0; trench_factor=1.0; missing.append("OL vs pass-rush context")
+    if trench_score<=-0.50: notes.append("OL vs pass rush mismatch")
+    elif trench_score>=0.50: notes.append("OL protection advantage")
+    if pass_block_grade is not None: notes.append(f"NFL Savant OL pass-block grade {pass_block_grade:.1f}")
+    if quick_pressure_allowed is not None: notes.append(f"Quick-pressure allowed {quick_pressure_allowed:.1f}%")
+    if ol_out: notes.append(f"Offensive-line starters out: {int(ol_out)}")
+
+    # ----- E) QB skill / throw profile. xComp is difficulty context, not a raw boost. -----
+    cpoe=_first(sav.get("passing__cpoe"),sav.get("ngs_passing__cpoe"))
+    xcomp=_pct(sav.get("ngs_passing__xcomp_pct"))
+    comp_pct=_pct(_first(sav.get("passing__comp_pct"),sav.get("ngs_passing__comp_pct")))
+    ttt=_first(sav.get("ngs_passing__time_to_throw"),sav.get("passing__time_to_throw"))
+    adot=_first(sav.get("passing__adot"),sav.get("ngs_passing__intended_air_yards"),sav.get("ngs_passing__aiay"))
+    epa_play=_first(sav.get("passing__epa_play"),sav.get("passing__epa"))
+    success_pct=_pct(sav.get("passing__success_pct"))
+    sav_rel=safe_float(sav.get("reliability"),0) or 0
+    sample=max(safe_float(sav.get("sample_size"),0) or 0,safe_float(sav.get("passing__attempts"),0) or 0,safe_float(sav.get("ngs_passing__attempts"),0) or 0)
+    qb_eff_factor=1.0
+    cpoe_shrunk=None
+    if sav_rel>=55 and cpoe is not None:
+        cpoe_weight=clamp(sample/(sample+260.0),0.18,0.82)
+        cpoe_shrunk=cpoe*cpoe_weight
+        qb_eff_factor*=clamp(1+cpoe_shrunk*0.0020,0.978,1.026)
+    elif cpoe is None:
+        missing.append("QB CPOE")
+
+    # Deep throw profile only matters as an interaction with explosive-pass defense.
+    vertical_match_factor=1.0
+    if adot is not None and explosive_allowed is not None:
+        vertical_score=clamp((adot-8.0)/4.0,-1,1)
+        explosive_score=clamp((explosive_allowed-8.0)/5.0,-1,1)
+        vertical_match_factor=clamp(1+vertical_score*explosive_score*0.016,0.985,1.018)
+    if ttt is not None and pressure_rate is not None and ttt>=2.9 and pressure_rate>=27:
+        qb_eff_factor*=0.982; notes.append("Long time-to-throw vs pressure tax")
+    if time_to_pressure is not None and ttt is not None and time_to_pressure<=2.75 and ttt>=2.85:
+        qb_eff_factor*=0.988; notes.append("Fast opponent time-to-pressure vs slower release")
+    if xcomp is not None and xcomp<61 and pressure_rate is not None and pressure_rate>=27:
+        qb_eff_factor*=0.992; notes.append("Difficult throw profile + pressure interaction")
+    qb_eff_factor=clamp(qb_eff_factor,0.96,1.035)
+
+    # Game environment. Team total is only a small efficiency/context nudge.
+    total_factor=clamp(1+(total-44)*0.0035,0.958,1.045)
+    if team_total is not None:
+        total_factor*=clamp(1+(team_total-22.0)*0.0018,0.985,1.018)
+    env=environment_for(row); stadium_factor=1.0
+    if env.get("roof") in ["Dome","Retractable","Canopy"]:
+        stadium_factor*=1.008
+    weather=str(row.get("weather_risk") or "").upper()
+    if weather in ["HIGH","SEVERE","WIND","RAIN","SNOW"]:
+        stadium_factor*=0.94; notes.append("Adverse-weather passing tax")
     weather_pass_factor=safe_float(row.get("weather_pass_factor"))
     if weather_pass_factor is not None:
-        stadium_factor *= clamp(weather_pass_factor,0.86,1.03)
+        stadium_factor*=clamp(weather_pass_factor,0.88,1.025)
         notes.extend(row.get("weather_notes") or [])
-    if (str(row.get("home_away") or "").upper() == "AWAY") and env.get("crowd") in ["LOUD", "EXTREME"]:
-        stadium_factor *= 0.988
-        notes.append("Road crowd communication tax")
+    if str(row.get("home_away") or "").upper()=="AWAY" and env.get("crowd") in ["LOUD","EXTREME"]:
+        stadium_factor*=0.993
 
-    # Opponent pass defense: rank 1 is tough, rank 32 is weak. Raw yards
-    # allowed is a fallback when a current feed has not supplied the rank yet.
-    opp_rank = safe_float(row.get("def_pass_rank"), safe_float(row.get("opp_def_pass_rank")))
-    pass_allowed = safe_float(row.get("pass_yards_allowed_pg"), safe_float(row.get("opp_pass_yards_allowed_pg")))
-    if opp_rank is None:
-        if pass_allowed is None:
-            matchup_factor = 1.0
-            notes.append("Opponent pass defense rank/yards allowed missing")
-        else:
-            matchup_factor = clamp(1 + (pass_allowed - 220.0) * 0.0015, 0.94, 1.06)
-            notes.append(f"Pass defense fallback: {pass_allowed:.1f} yards allowed/game")
-    else:
-        matchup_factor = clamp(1 + (opp_rank - 16.5) * 0.0065, 0.90, 1.105)
-        if opp_rank <= 8:
-            notes.append("Top pass defense tax")
-        elif opp_rank >= 25:
-            notes.append("Weak pass defense boost")
+    adjusted_ypa=base_ypa*defense_factor*trench_factor*qb_eff_factor*vertical_match_factor*total_factor*stadium_factor
+    adjusted_ypa=clamp(adjusted_ypa,4.9,9.8)
+    attempt_model=projected_attempts*adjusted_ypa
 
-    pressure = safe_float(
-        row.get("opp_def_pressure_rate"),
-        safe_float(row.get("def_pressure_rate"), safe_float(row.get("pressure_rate"))),
-    )
-    pressure_factor = 1.0
-    if pressure is not None:
-        # Higher pressure suppresses efficiency more than attempts.
-        pressure_factor = clamp(1 - (pressure - 24) * 0.0035, 0.94, 1.04)
+    # Historical anchor receives the same volume change; otherwise it can fight the
+    # opportunity model whenever the current matchup projects unusually high/low volume.
+    volume_ratio=clamp(projected_attempts/max(attempts_pg,1.0),0.82,1.20)
+    efficiency_context=defense_factor*trench_factor*qb_eff_factor*vertical_match_factor*total_factor*stadium_factor
+    history_model=player_ypg*volume_ratio*efficiency_context
 
-    projected_attempts = expected_attempts * script_attempt_factor * pass_rate_factor
-    attempt_model = projected_attempts * ypa * total_factor * stadium_factor * matchup_factor * pressure_factor
-    history_model = player_ypg * total_factor * stadium_factor * matchup_factor * pressure_factor
-    projection = (history_model * 0.55) + (attempt_model * 0.45)
-    consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
-
-    # A final realism guard before market sanity. Passing yards game projections
-    # generally should not be extreme unless the live line/team context justifies it.
-    projection = clamp(projection, 90, 390)
-
-    breakdown = {
-        "player_pass_ypg": round(player_ypg, 2),
-        "pass_attempts_pg": round(attempts_pg, 2),
-        "projected_attempts": round(projected_attempts, 2),
-        "yards_per_attempt": round(ypa, 3),
-        "attempt_model": round(attempt_model, 2),
-        "history_model": round(history_model, 2),
-        "team_pass_rate": round(pass_rate, 2),
-        "team_plays_pg": round(team_plays, 2),
-        "opponent_pass_def_rank": None if opp_rank is None else int(round(opp_rank)),
-        "opponent_pass_yards_allowed_pg": None if pass_allowed is None else round(pass_allowed,2),
-        "game_total": round(total, 2),
-        "spread": round(spread, 2),
-        "matchup_factor": round(matchup_factor, 3),
-        "stadium_factor": round(stadium_factor, 3),
-        "total_factor": round(total_factor, 3),
-        "pressure_factor": round(pressure_factor, 3),
-        "final_pre_market": round(projection, 2),
-        "context_source": row.get("passing_context_bank_source"),
-        "model_match_status": row.get("model_match_status"),
-        "model_player_match": row.get("model_player_match"),
+    # Component coverage controls how much we trust the football decomposition.
+    coverage_checks={
+        "QB history": player_ypg is not None and attempts_pg is not None,
+        "team pace": team_plays is not None,
+        "opponent pace": opp_plays is not None,
+        "pass tendency": neutral_pass is not None or proe is not None,
+        "OL/trench": bool(trench_components),
+        "opponent pass defense": bool(defense_components),
+        "QB advanced": sav_rel>=55 and (cpoe is not None or adot is not None),
+        "game market environment": safe_float(row.get("game_total")) is not None or safe_float(row.get("spread")) is not None,
+        "weather/venue": bool(row.get("weather_pass_factor") is not None or env),
     }
-    return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
+    formula_quality=round(100*sum(1 for ok in coverage_checks.values() if ok)/len(coverage_checks),1)
+    attempt_weight=0.68 if formula_quality>=78 else 0.63 if formula_quality>=62 else 0.58
+    projection=attempt_model*attempt_weight+history_model*(1-attempt_weight)
+    projection=clamp(projection,90,390)
 
+    implied_ypa=projection/max(projected_attempts,1.0)
+    if implied_ypa<5.2 or implied_ypa>9.3:
+        notes.append(f"QB sanity check: implied {implied_ypa:.2f} yards/attempt")
+    if formula_quality<62:
+        notes.append(f"QB football-core context partial ({formula_quality:.0f}/100)")
+
+    breakdown={
+        "formula":"Projected attempts × adjusted YPA blended with volume-adjusted QB history",
+        "opportunity_weight":round(attempt_weight,3),
+        "formula_quality":formula_quality,
+        "missing_components":list(dict.fromkeys(missing)),
+        "coverage_checks":coverage_checks,
+        "player_pass_ypg":round(player_ypg,2),"pass_attempts_pg":round(attempts_pg,2),
+        "team_plays_pg":round(team_plays,2),"opponent_plays_pg":None if opp_plays is None else round(opp_plays,2),
+        "projected_game_plays":round(game_plays,2),"raw_pass_rate":round(pass_rate,2),
+        "neutral_pass_rate":None if neutral_pass is None else round(neutral_pass,2),
+        "proe_points":None if proe_pp is None else round(proe_pp,2),"modeled_pass_tendency":round(pass_tendency,2),
+        "projected_dropbacks":round(projected_dropbacks,2),"base_sack_rate":round(base_sack_rate,4),
+        "expected_sack_rate":round(expected_sack_rate,4),"pace_attempts_after_sacks":round(pace_attempts,2),
+        "projected_attempts":round(projected_attempts,2),"volume_ratio":round(volume_ratio,3),
+        "base_yards_per_attempt":round(base_ypa,3),"yards_per_attempt":round(adjusted_ypa,3),
+        "implied_final_ypa":round(implied_ypa,3),"attempt_model":round(attempt_model,2),"history_model":round(history_model,2),
+        "opponent_pass_def_rank":None if opp_rank is None else int(round(opp_rank)),
+        "opponent_pass_yards_allowed_pg":None if pass_allowed is None else round(pass_allowed,2),
+        "def_pass_epa_allowed":None if def_pass_epa is None else round(def_pass_epa,4),
+        "def_success_allowed":None if def_success is None else round(def_success,2),
+        "explosive_pass_allowed":None if explosive_allowed is None else round(explosive_allowed,2),
+        "coverage_success_rate":None if coverage_success is None else round(coverage_success,2),
+        "air_yards_per_attempt_allowed":None if air_yards_allowed is None else round(air_yards_allowed,2),
+        "defense_score":round(defense_score,3),"defense_factor":round(defense_factor,3),
+        "ol_pass_pro_rank":None if ol_rank is None else round(ol_rank,1),
+        "savant_pass_block_grade":None if pass_block_grade is None else round(pass_block_grade,1),
+        "quick_pressure_allowed":None if quick_pressure_allowed is None else round(quick_pressure_allowed,2),
+        "qb_pressure_to_sack_rate":None if qb_pressure_to_sack is None else round(qb_pressure_to_sack,4),
+        "ol_starters_out":int(ol_out),"opp_pressure_rank":None if pressure_rank is None else round(pressure_rank,1),
+        "opp_pressure_rate":None if pressure_rate is None else round(pressure_rate,2),
+        "opponent_time_to_pressure":None if time_to_pressure is None else round(time_to_pressure,3),
+        "trench_edge":None if trench_edge is None else round(trench_edge,2),"trench_score":round(trench_score,3),"trench_factor":round(trench_factor,3),
+        "cpoe":None if cpoe is None else round(cpoe,2),"cpoe_shrunk":None if cpoe_shrunk is None else round(cpoe_shrunk,2),
+        "xcomp_pct":None if xcomp is None else round(xcomp,2),"comp_pct":None if comp_pct is None else round(comp_pct,2),
+        "adot_aiay":None if adot is None else round(adot,2),"time_to_throw":None if ttt is None else round(ttt,3),
+        "epa_play":None if epa_play is None else round(epa_play,4),"success_pct":None if success_pct is None else round(success_pct,2),
+        "qb_efficiency_factor":round(qb_eff_factor,3),"vertical_match_factor":round(vertical_match_factor,3),
+        "stadium_factor":round(stadium_factor,3),"total_factor":round(total_factor,3),
+        "game_total":round(total,2),"team_total":None if team_total is None else round(team_total,2),"spread":round(spread,2),
+        "final_pre_market":round(projection,2),"context_source":row.get("passing_context_bank_source"),
+        "model_match_status":row.get("model_match_status"),"model_player_match":row.get("model_player_match"),
+    }
+    return float(projection),{"active":True,"breakdown":breakdown,"notes":notes,"formula_quality":formula_quality,"missing_components":breakdown["missing_components"]}
 
 def receiving_yards_stat_projection(row, role, cfg):
     """Receiving Yards projection from receiver history + targets × yards/target.
@@ -8342,12 +8739,21 @@ def rushing_yards_stat_projection(row, role, cfg):
         safe_float(row.get("ol_run_block_proxy_rank"), safe_float(row.get("run_block_rank"))),
     )
     run_stop=safe_float(row.get("def_run_stop_rank"), safe_float(row.get("opp_def_run_stop_rank")))
+    sav_team=dict(row.get("savant_team_context") or {})
+    sav_run_block=None
+    for _key in ["league__run_block","league__run_block_grade","league__ol_run_block","league__ol_run_block_grade"]:
+        sav_run_block=safe_float(sav_team.get(_key))
+        if sav_run_block is not None:
+            break
     trench_factor=1.0
     if run_block is not None and run_stop is not None:
         if run_block <= 8 and run_stop >= 24:
             trench_factor*=1.018; notes.append("Run-blocking trench edge")
         elif run_block >= 24 and run_stop <= 8:
             trench_factor*=0.972; notes.append("Run-blocking trench mismatch")
+    if sav_run_block is not None:
+        trench_factor*=clamp(1+(sav_run_block-100.0)*0.0014,0.97,1.035)
+        notes.append(f"NFL Savant OL run-block grade {sav_run_block:.1f}")
     if str(row.get("run_funnel") or "").upper() in ["TRUE","YES","1","HIGH"]:
         matchup_factor*=1.016; notes.append("Run-funnel matchup boost")
     if str(row.get("pass_funnel") or "").upper() in ["TRUE","YES","1","HIGH"]:
@@ -8371,6 +8777,7 @@ def rushing_yards_stat_projection(row, role, cfg):
         "script_factor": round(script_factor,3),
         "matchup_factor": round(matchup_factor,3),
         "trench_factor": round(trench_factor,3),
+        "savant_run_block_grade": None if sav_run_block is None else round(sav_run_block,1),
         "weather_factor": round(weather_factor,3),
         "final_pre_market": round(projection,2),
     }
@@ -9483,6 +9890,8 @@ def project_row_preseason(row, sims=12000):
         "true_line_delta":track_line_delta(row.get("player"),prop,row.get("source"),line),
         "role":role,"notes":notes,"sim_samples":sims,
     }
+    out["market_integrity_audit"]=market_row.get("market_integrity_audit") or _row_market_integrity_audit(market_row)
+    out["decision_gate"]={"thin_pass":bool(thin_decision),"thin_reason":thin_decision_reason,"market_integrity_conflict":bool(market_integrity_conflict)}
     out["market_compare"]=_market_compare_text(out)
     out["recent_form"]=_recent_form_text(out)
     signal,action_tier,rejections=build_signal(out)
@@ -9495,6 +9904,13 @@ def project_row(row, sims=12000):
     if raw_market_labels.strip() and not _is_full_game_market_label(raw_market_labels):
         raise ValueError(f"Projection blocked: non-full-game market {raw_market_labels!r}")
     row=merge_nfl_context(row)
+    integrity_audit=_row_market_integrity_audit(row)
+    # Wrong player/team/game joins are data errors, not model uncertainty.
+    # Team/matchup conflicts are blocked before any formula can manufacture an edge.
+    non_collision_blocks=[x for x in integrity_audit.get("hard_blocks",[]) if not str(x).startswith("Market-line collision:")]
+    if non_collision_blocks:
+        raise ValueError("Projection blocked: " + "; ".join(non_collision_blocks))
+    row["market_integrity_audit"]=integrity_audit
     row["database_readiness"]=projection_database_readiness()
     market_row=dict(row)
     prop=_canon_prop_label(row.get("prop"))
@@ -9510,10 +9926,11 @@ def project_row(row, sims=12000):
     # Keep sportsbook-derived information out of every raw model component. The
     # untouched market_row returns later for side selection, pricing, CLV and audit.
     market_only_fields={
-        "line","odds","price","over_price","under_price","spread","home_spread",
-        "away_spread","closing_spread","game_total","total","over_under",
-        "team_total","implied_team_total","open_line","best_line","consensus_line",
-        "no_vig_over","no_vig_under","has_market_context",
+        # Player-prop price/line fields are forbidden from creating the raw projection.
+        # Game-level spread/total/team-total are legitimate football environment inputs
+        # and remain available to the model (they do not contain this player's prop line).
+        "line","odds","price","over_price","under_price",
+        "open_line","best_line","consensus_line","no_vig_over","no_vig_under","has_market_context",
     }
     for key in list(row):
         if key in market_only_fields or str(key).startswith("market_"):
@@ -9561,7 +9978,11 @@ def project_row(row, sims=12000):
     # Stat-specific models already use recent form, so the role factor is bounded and
     # partially damped for those markets to prevent double counting.
     current_role_factor=safe_float(current_week_role.get("factor"),1.0) or 1.0
-    if prop in ["Passing Yards","Receiving Yards","Rushing Yards","Pass Attempts","Completions","Receptions","Rush Attempts"]:
+    if prop == "Passing Yards":
+        # Recent attempts/current form are already blended inside the QB core.
+        # Injury/depth limitations are still handled later by role_risk_adjustments.
+        pass
+    elif prop in ["Receiving Yards","Rushing Yards","Pass Attempts","Completions","Receptions","Rush Attempts"]:
         base *= 1.0 + (current_role_factor-1.0)*0.65
     else:
         base *= current_role_factor
@@ -9579,9 +10000,10 @@ def project_row(row, sims=12000):
     if defense_risk == "HIGH" or rank_risk == "HIGH" or game_env_risk == "HIGH" or script_risk == "HIGH" or blowout_risk == "HIGH" or vegas_risk == "HIGH" or advanced_risk == "HIGH" or split_risk == "HIGH":
         game_script_risk="HIGH"
     if prop == "Passing Yards":
-        # The stat model already includes QB history, attempts, pass rate, matchup,
-        # and stadium/weather. Keep only small generic risk modifiers.
-        base*=clamp(role_factor,0.92,1.04)*clamp(rank_factor,0.96,1.05)*clamp(game_factor,0.96,1.04)*clamp(blowout_factor,0.94,1.03)*clamp(advanced_factor,0.96,1.04)*clamp(split_factor,0.94,1.05)
+        # V7.35 QB core already owns pace/pass tendency, spread, total, opponent pass
+        # defense, OL vs pressure and venue/weather. Do not multiply those a second time.
+        # Keep only player availability/role and genuinely external specialty context.
+        base*=clamp(role_factor,0.93,1.03)*clamp(advanced_factor,0.985,1.025)*clamp(split_factor,0.97,1.03)
     elif prop == "Receiving Yards":
         # The stat model already includes receiving history, targets, team pass rate,
         # matchup, and stadium/weather. Keep generic modifiers small.
@@ -9677,6 +10099,7 @@ def project_row(row, sims=12000):
         kelly=0.0 if loss_prob is None else kelly_fraction(prob,selected_price,loss_prob=loss_prob)
 
     distribution_conflict=distribution_conflict_audit(mean,p50,line,side)
+    thin_decision=False; thin_decision_reason=""; market_integrity_conflict=bool(market_row.get("market_line_collision"))
 
     upside_gap=p90-(line if line is not None else p50)
     if upside_gap>cfg["sigma"]*0.95: upside="ELITE"
@@ -9714,6 +10137,12 @@ def project_row(row, sims=12000):
     ) or row.get("model_match_status") == "NO_MODEL_MATCH"
     if model_fallback_used:
         score=min(score,74)
+    if prop == "Passing Yards":
+        football_q=safe_float(pass_yards_model_info.get("formula_quality"))
+        if football_q is not None and football_q < 56:
+            score=min(score,72)
+        elif football_q is not None and football_q < 70:
+            score=min(score,80)
     if not row["database_readiness"].get("ready"):
         score=min(score,74)
     score=int(clamp(score,0,99))
@@ -9736,7 +10165,9 @@ def project_row(row, sims=12000):
         ev=None if loss_prob is None else expected_value(prob,selected_price,loss_prob=loss_prob)
         kelly=0.0 if loss_prob is None else kelly_fraction(prob,selected_price,loss_prob=loss_prob)
         distribution_conflict=distribution_conflict_audit(mean,p50,line,side)
-        if distribution_conflict.get("conflict"):
+        thin_decision, thin_decision_reason=_regular_thin_decision_gate(prop,mean,line,over,under)
+        market_integrity_conflict=bool(market_row.get("market_line_collision"))
+        if distribution_conflict.get("conflict") or thin_decision or market_integrity_conflict:
             side="PASS"; selected_price=None; ev=None; kelly=0.0
 
     line_delta=update_clv_snapshot(market_row.get("player"), prop, market_row.get("source"), line) if line is not None else None
@@ -9760,7 +10191,9 @@ def project_row(row, sims=12000):
     if pass_yards_model_info.get("active"):
         b = pass_yards_model_info.get("breakdown", {})
         active_breakdown = b
-        notes.append(f"Passing Yards model: {b.get('projected_attempts')} att × {b.get('yards_per_attempt')} YPA | base {b.get('player_pass_ypg')} YPG")
+        notes.append(f"Passing core: {b.get('projected_attempts')} att × {b.get('yards_per_attempt')} YPA · football context {b.get('formula_quality')}/100")
+        if b.get("missing_components"):
+            notes.append("Passing-core missing: " + ", ".join(str(x) for x in b.get("missing_components")[:4]))
         notes.append(f"QB tier: {qb_tier_info.get('tier')}")
     if receiving_yards_model_info.get("active"):
         b = receiving_yards_model_info.get("breakdown", {})
@@ -9826,6 +10259,10 @@ def project_row(row, sims=12000):
         notes.append(f"NFL Savant shadow: {savant_shadow.get('status','MISSING')}")
     if distribution_conflict.get("conflict"):
         notes.append("DISTRIBUTION_CONFLICT: expected mean and P50/pick direction disagree")
+    if thin_decision:
+        notes.append("THIN_DECISION_PASS: " + str(thin_decision_reason))
+    if market_integrity_conflict:
+        notes.append("MARKET_INTEGRITY_PASS: " + str(market_row.get("market_line_collision_reason") or "cross-market line collision"))
 
     factor_stack={"role":round(role_factor,3),"current_week_role":round(current_role_factor,3),"game_env":round(game_factor,3),"defense":round(defense_factor,3),"offense_defense_rank":round(rank_factor,3),"opportunity":round(opportunity.get("factor",1.0),3),"pace":round(pace_factor,3),"vegas":round(vegas_factor,3),"script":round(script_factor,3),"blowout":round(blowout_factor,3),"advanced":round(advanced_factor,3),"splits_personnel":round(split_factor,3),"learning":round(learn,3),"calibration":round(cal_scale,3),"sigma":round(sigma,3),"line_sanity_active":bool(line_sanity_info.get("active"))}
     factor_stack["savant_production_active"]=savant_shadow.get("status")=="PRODUCTION_VALIDATED"
@@ -10545,7 +10982,7 @@ def _render_player_cards(rows, limit=None, header=None):
                     st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
                     st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
                     st.write("Advanced context:")
-                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "line_sanity": p.get('line_sanity'), "projection_breakdown": p.get('projection_breakdown'), "qb_tier": p.get('qb_tier'), "offense_defense_rank_context": p.get('offense_defense_rank_context'), "advanced_context": p.get('advanced_context')})
+                    st.json({"market_integrity": p.get('market_integrity_audit'), "decision_gate": p.get('decision_gate'), "xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "line_sanity": p.get('line_sanity'), "projection_breakdown": p.get('projection_breakdown'), "qb_tier": p.get('qb_tier'), "offense_defense_rank_context": p.get('offense_defense_rank_context'), "advanced_context": p.get('advanced_context')})
                 st.write(f"Stability Score: **{p.get('stability_score')} /100**")
                 st.write(f"Action Tier: **{p.get('action_tier')}**")
                 if p.get('game_script_branches'):
