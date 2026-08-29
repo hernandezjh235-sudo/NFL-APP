@@ -2,4 +2,4 @@
 nixPkgs = ["python311", "gcc"]
 
 [start]
-cmd = "streamlit run app.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
+cmd = "streamlit run audit_wrapper.py --server.port=$PORT --server.address=0.0.0.0 --server.headless=true"
