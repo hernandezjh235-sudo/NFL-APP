@@ -1103,8 +1103,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.49 — ELITE TEAM UI + LIVE WEATHER + COMPACT ML"
-MODEL_VERSION = "nfl-prop-engine-v7.48.0"
+APP_VERSION = "NFL v7.50 — REGULAR DATA INTEGRITY + ROLE ENGINE"
+MODEL_VERSION = "nfl-prop-engine-v7.50.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2845,7 +2845,7 @@ REGULAR_MARKET_LINE_RANGES = {
     "Completions": (4.5, 42.5),
     "Rushing Yards": (2.5, 175.0),
     "Rush Attempts": (0.5, 35.5),
-    "Receiving Yards": (2.5, 190.0),
+    "Receiving Yards": (0.5, 190.0),
     "Receptions": (0.5, 14.5),
     "Fantasy Points": (1.0, 55.0),
     "Anytime TD": (0.05, 2.5),
@@ -4065,6 +4065,21 @@ def apply_market_integrity_guards(rows):
         event=str(row.get("event_id") or row.get("game_id") or row.get("match_id") or row.get("matchup") or "")
         key=(event,norm(row.get("player")),round(float(line),3))
         groups.setdefault(key,[]).append((i,prop))
+    # Same player/game duplicated as Receiving Yards with wildly separated lines is usually a feed market-map collision.
+    rec_groups={}
+    for i,row in enumerate(rows):
+        if (_canon_prop_label(row.get("prop")) or row.get("prop"))!="Receiving Yards": continue
+        event=str(row.get("event_id") or row.get("game_id") or row.get("match_id") or row.get("matchup") or "")
+        rec_groups.setdefault((event,norm(row.get("player"))),[]).append((i,safe_float(row.get("line"))))
+    for _,vals in rec_groups.items():
+        vals=[x for x in vals if x[1] is not None]
+        if len(vals)>=2:
+            lo=min(v for _,v in vals); hi=max(v for _,v in vals)
+            if hi-lo>=25 and hi/max(1,lo)>=1.65:
+                for idx,v in vals:
+                    if v==hi:
+                        rows[idx]["data_integrity_block"]=f"Market mapping conflict: duplicate Receiving Yards lines {lo:g} and {hi:g}; higher line blocked"
+                        rows[idx]["market_integrity_status"]="FEED_CONFLICT"
     for key,items in groups.items():
         props={p for _,p in items}
         if len(props)<2:
@@ -7793,13 +7808,29 @@ def merge_nfl_context(row):
             continue
         if k not in row or not _usable_context_value(row.get(k)) or row.get(k) == "NFL":
             row[k]=v
-    # Current-season/weekly usage should override last-season Phase 6 when present.
+    # v7.50 DATA IDENTITY: a prior-season fallback must never masquerade as current-season usage.
+    # Preserve explicit prior/current/projected namespaces so early-season blending can work correctly.
+    for k,v in usage.items():
+        if k and _usable_context_value(v) and k not in {"player","team","position"}:
+            row.setdefault("prior_"+str(k), v)
+    _cu_games=safe_float(current_usage.get("current_games"),0) or 0
+    _cu_season=safe_float(current_usage.get("source_season"),None)
+    _true_current=bool(_cu_games >= 1 and (_cu_season is None or int(_cu_season)==int(NFL_CURRENT_SEASON)))
+    row["current_usage_is_true_current"]=_true_current
+    row["current_usage_games"]=int(_cu_games)
+    row["current_usage_source_season"]=None if _cu_season is None else int(_cu_season)
+    row["current_usage_freshness"]="CURRENT" if _true_current else "PRIOR_FALLBACK"
     for k,v in current_usage.items():
         if not k or not _usable_context_value(v):
             continue
-        row[k]=v
-        if str(k).startswith("current_"):
+        if _true_current:
+            row["current_"+str(k) if not str(k).startswith("current_") and k not in {"player","team","position"} else str(k)]=v
+            # Only true current-season samples may replace same-name workload fields.
+            if k not in {"player","team","position","source_season"}: row[k]=v
             row["has_current_usage"] = True
+        else:
+            # Keep stale/fallback values as priors only; do not overwrite the 2025 historical baseline.
+            if k not in {"player","team","position"}: row.setdefault("prior_"+str(k),v)
     # Fix generic live-feed labels after usage/model context is attached.
     if row.get("team") in [None, "", "NFL"]:
         if _usable_context_value(current_usage.get("team")):
@@ -8027,6 +8058,19 @@ def merge_nfl_context(row):
             "savant_team_match":False,"savant_sample_size":0,
             "savant_reliability":0,"savant_error":str(exc)[:160],
         })
+    # v7.50 semantic validity gates. Missing/contradictory opportunity forces PASS instead of fake confidence.
+    if row.get("prop") in {"Receiving Yards","Receptions"}:
+        _ro=shared_receiver_opportunity(row, {}) if "shared_receiver_opportunity" in globals() else {}
+        if _ro.get("role_conflict"):
+            row["data_integrity_block"]=_ro.get("role_conflict")
+            row["market_integrity_status"]="ROLE_CONFLICT"
+    if row.get("prop")=="Anytime TD":
+        _rz=safe_float(row.get("red_zone_touch_share"),0) or 0
+        _rzc=safe_float(row.get("red_zone_carries"),0) or 0; _rzt=safe_float(row.get("red_zone_targets"),0) or 0
+        if _rz<=0 and _rzc<=0 and _rzt<=0:
+            row["data_integrity_block"]="TD ROLE DATA MISSING: no red-zone carry/target/share evidence; TRACK/PASS until populated"
+            row["td_role_data_ready"]=False
+        else: row["td_role_data_ready"]=True
     return row
 
 def apply_real_usage_to_role(row, role):
@@ -9517,6 +9561,47 @@ def passing_yards_stat_projection(row, role, cfg):
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
 
 
+def shared_receiver_opportunity(row, role=None):
+    """Single authoritative route -> target opportunity object for Receiving Yards + Receptions."""
+    row=dict(row or {}); role=dict(role or {})
+    shared=shared_game_opportunity_context(row)
+    attempts=safe_float(shared.get("pass_attempts"),None)
+    if attempts is None:
+        plays=safe_float(row.get("pbp_plays_pg"),safe_float(row.get("plays_pg"),62)) or 62
+        pr=safe_float(row.get("pbp_pass_rate"),safe_float(row.get("pass_rate"),56)) or 56
+        attempts=plays*pr/100.0
+    games=safe_float(row.get("current_games"),0) or 0
+    route=safe_float(row.get("current_route_participation") if games>=1 else None,
+                     safe_float(row.get("route_participation"),safe_float(row.get("route_participation_proxy"),safe_float(role.get("route"),65))))
+    route=clamp(route,5,100)
+    routes=attempts*route/100.0
+    prior_targets=safe_float(row.get("prior_targets_pg"),safe_float(row.get("targets_pg")))
+    cur_targets=safe_float(row.get("current_targets_pg")) if games>=1 else None
+    transition=_regular_offseason_transition(row,"Receiving Yards")
+    w=_early_season_current_weight(games,transition)
+    targets_pg=prior_targets
+    if cur_targets is not None and cur_targets>0 and games>=1:
+        targets_pg=(prior_targets or cur_targets)*(1-w)+cur_targets*w
+    target_share=safe_float(row.get("current_target_share") if games>=1 else None,safe_float(row.get("target_share"),safe_float(role.get("target"),15)))
+    tprr=safe_float(row.get("current_targets_per_route") if games>=1 else None,safe_float(row.get("targets_per_route"),safe_float(row.get("target_per_route_run"))))
+    if tprr is not None and tprr>1.5: tprr/=100.0
+    if tprr is None or tprr<=0:
+        tprr=(targets_pg/max(1.0,routes)) if targets_pg is not None else clamp((target_share/100.0)/max(.15,route/100.0),.08,.34)
+    tprr=clamp(tprr,.06,.38)
+    route_targets=routes*tprr
+    share_targets=attempts*(target_share/100.0)
+    if targets_pg is None: targets_pg=share_targets
+    projected_targets=0.56*route_targets+0.24*share_targets+0.20*targets_pg
+    # Semantic role guard: conflicting route/share inputs should not create an official play.
+    conflict=None
+    snap=safe_float(row.get("snap_share"))
+    pos=str(row.get("position") or "").upper()
+    if route<20 and target_share>=12 and pos in {"WR","TE"}: conflict=f"ROLE DATA CONFLICT: route participation {route:.1f}% vs target share {target_share:.1f}%"
+    if snap is not None and snap>=65 and route<20 and pos in {"WR","TE"}: conflict=f"ROLE DATA CONFLICT: snap share {snap:.1f}% vs route participation {route:.1f}%"
+    return {"pass_attempts":attempts,"route_participation":route,"projected_routes":routes,"target_share":target_share,
+            "targets_per_route":tprr,"projected_targets":projected_targets,"prior_targets_pg":prior_targets,
+            "current_targets_pg":cur_targets,"current_weight":w,"role_conflict":conflict,"shared_game_opportunity":shared}
+
 def receiving_yards_stat_projection(row, role, cfg):
     """Receiving Yards projection from receiver history + targets × yards/target.
 
@@ -9538,7 +9623,7 @@ def receiving_yards_stat_projection(row, role, cfg):
     spread=safe_float(row.get("spread"), 0) or 0
     total=safe_float(row.get("game_total"), 44) or 44
     target_share=safe_float(row.get("target_share"), None)
-    route_part=safe_float(row.get("route_participation"), None)
+    route_part=safe_float(row.get("current_route_participation") if (safe_float(row.get("current_games"),0) or 0)>=1 else None, safe_float(row.get("route_participation"), safe_float(row.get("route_participation_proxy"), None)))
     if row.get("model_match_status") == "NO_MODEL_MATCH":
         notes.append("NO MODEL MATCH: using capped receiving fallback until player exists in Phase 6/context bank")
     elif row.get("model_player_match"):
@@ -9572,10 +9657,12 @@ def receiving_yards_stat_projection(row, role, cfg):
     if ypt is None or ypt <= 0:
         ypt = rec_ypg/max(1.0, targets_pg)
     ypt = clamp(ypt, 4.0 if pos=="RB" else 5.0, 12.8 if pos!="RB" else 10.5)
-    shared_opp=shared_game_opportunity_context(row)
+    receiver_opp=shared_receiver_opportunity(row,role)
+    shared_opp=receiver_opp.get("shared_game_opportunity",{})
     team_plays=shared_opp.get("plays",team_plays); pass_rate=shared_opp.get("pass_rate",pass_rate)
-    implied_team_attempts=shared_opp.get("pass_attempts",team_plays*pass_rate/100.0)
-    # Route-first receiving opportunity: team dropbacks -> routes -> targets/route.
+    implied_team_attempts=receiver_opp.get("pass_attempts",team_plays*pass_rate/100.0)
+    # v7.50 shared receiver opportunity: identical routes/targets feed Receiving Yards and Receptions.
+    route_part=receiver_opp.get("route_participation")
     route_part_frac=None if route_part is None else clamp(route_part/100.0 if route_part>1.5 else route_part,0.0,1.0)
     expected_routes=implied_team_attempts*(route_part_frac if route_part_frac is not None else clamp(safe_float(role.get("route"),65)/100.0,0.20,0.98))
     tprr=safe_float(row.get("targets_per_route"),safe_float(row.get("target_per_route_run")))
@@ -9591,7 +9678,7 @@ def receiving_yards_stat_projection(row, role, cfg):
     tprr=clamp(tprr,0.06,0.38)
     route_targets=expected_routes*tprr
     share_targets=implied_team_attempts*(target_share/100.0 if target_share is not None and target_share>1.5 else (target_share or 0)) if target_share is not None else targets_pg
-    expected_targets=route_targets*0.56+(share_targets if share_targets is not None else targets_pg)*0.24+targets_pg*0.20
+    expected_targets=receiver_opp.get("projected_targets", route_targets*0.56+(share_targets if share_targets is not None else targets_pg)*0.24+targets_pg*0.20)
     # Game script and totals.
     script_factor=1.0
     if spread >= 6:
@@ -9819,7 +9906,7 @@ def pass_attempts_stat_projection(row, role, cfg):
     total=safe_float(row.get("game_total"),44) or 44
     script_factor=1.0 + clamp(spread, -10, 10)*0.012
     total_factor=clamp(1+(total-44)*0.006,0.94,1.06)
-    pace_factor=clamp(team_plays/62.0,0.92,1.08)
+    pace_factor=1.0  # v7.50: pace is already represented by projected team plays; do not double-count it
     pressure=safe_float(row.get("opp_def_pressure_rank"), safe_float(row.get("def_pressure_rank")))
     pressure_factor=1.0
     if pressure is not None and pressure <= 8:
@@ -9863,34 +9950,28 @@ def completions_stat_projection(row, role, cfg):
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
 
 def receptions_stat_projection(row, role, cfg):
-    notes=[]
-    line=safe_float(row.get("line"))
-    rec_pg=safe_float(row.get("current_receptions_pg"), safe_float(row.get("last5_receptions_pg"), safe_float(row.get("receptions_pg"))))
-    targets_pg=safe_float(row.get("current_targets_pg"), safe_float(row.get("last5_targets_pg"), safe_float(row.get("targets_pg"))))
-    if targets_pg is None or targets_pg <= 0:
-        targets_pg=6.2
-        notes.append("Targets model-data fallback used")
-    catch_rate=safe_float(row.get("catch_rate"), safe_float(row.get("reception_rate")))
+    row=dict(row or {}); notes=[]
+    opp=shared_receiver_opportunity(row,role)
+    targets=float(opp.get("projected_targets") or 0)
+    rec_pg=safe_float(row.get("receptions_pg")); games=safe_float(row.get("current_games"),0) or 0
+    cur_rec=safe_float(row.get("current_receptions_pg")) if games>=1 else None
+    catch_rate=safe_float(row.get("current_catch_rate") if games>=1 else None,safe_float(row.get("catch_rate"),safe_float(row.get("reception_rate"))))
     if catch_rate is None:
-        catch_rate=100*rec_pg/max(1,targets_pg) if rec_pg and targets_pg else (69 if str(row.get("position") or "").upper()=="TE" else 64)
-    route=safe_float(row.get("route_participation"), role.get("route",65)) or role.get("route",65)
-    target_share=safe_float(row.get("target_share"), role.get("target",15)) or role.get("target",15)
-    role_factor=clamp((route/75.0)*0.55 + (target_share/20.0)*0.45,0.78,1.20)
+        base_targets=safe_float(row.get("targets_pg"))
+        catch_rate=(rec_pg/max(1,base_targets)) if rec_pg is not None and base_targets else (0.69 if str(row.get("position") or "").upper()=="TE" else 0.64)
+    if catch_rate>1.5: catch_rate/=100.0
+    catch_rate=clamp(catch_rate,.40,.92)
+    coverage=safe_float(row.get("coverage_grade")); matchup=1.0
+    if coverage is not None: matchup=clamp(1-(coverage-60)*.0018,.965,1.025)
     qb_status=str(row.get("qb_status") or row.get("qb_injury_status") or "").upper()
-    qb_factor=0.94 if any(x in qb_status for x in ["OUT","BACKUP","DOUBTFUL"]) else 0.975 if any(x in qb_status for x in ["QUESTION","LIMIT"]) else 1.0
-    coverage=safe_float(row.get("coverage_grade"))
-    matchup_factor=1.0
-    if coverage is not None and coverage >= 70:
-        matchup_factor*=0.976; notes.append("Strong coverage receptions tax")
-    elif coverage is not None and coverage <= 45:
-        matchup_factor*=1.012; notes.append("Coverage matchup boost")
-    projection=targets_pg*(catch_rate/100.0)*role_factor*qb_factor*matchup_factor
-    if rec_pg and rec_pg > 0:
-        projection=(projection*0.62)+(rec_pg*0.38)
-    consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
+    qb=0.94 if any(x in qb_status for x in ["OUT","BACKUP","DOUBTFUL"]) else .975 if any(x in qb_status for x in ["QUESTION","LIMIT"]) else 1.0
+    projection=targets*catch_rate*matchup*qb
+    prior_rec=rec_pg
+    if games>=1 and cur_rec is not None:
+        w=opp.get("current_weight",0); prior_rec=prior_rec or cur_rec; projection=projection*(1-.20*w)+(prior_rec*(1-w)+cur_rec*w)*(.20*w)
     projection=clamp(projection,0,16)
-    breakdown={"receptions_pg":None if rec_pg is None else round(rec_pg,2),"targets_pg":round(targets_pg,2),"catch_rate":round(catch_rate,2),"role_factor":round(role_factor,3),"qb_factor":round(qb_factor,3),"matchup_factor":round(matchup_factor,3)}
-    return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
+    if opp.get("role_conflict"): notes.append(opp["role_conflict"])
+    return float(projection),{"active":True,"breakdown":{"projected_routes":round(opp.get("projected_routes",0),2),"targets_pg":round(targets,2),"projected_targets":round(targets,2),"catch_rate":round(catch_rate*100,2),"route_participation":round(opp.get("route_participation",0),2),"target_share":round(opp.get("target_share",0),2),"targets_per_route":round(opp.get("targets_per_route",0),3),"current_weight":round(opp.get("current_weight",0),3),"qb_factor":round(qb,3),"matchup_factor":round(matchup,3)},"notes":notes}
 
 def rush_attempts_stat_projection(row, role, cfg):
     notes=[]
@@ -13521,7 +13602,7 @@ def regular_season_readiness_panel():
 
     checks=[
         ("Historical core",100 if db.get("ready") else 55),
-        ("Current player usage",min(100,100*len(current_players)/350) if current_players else 0),
+        ("Current player usage", (min(100,100*sum(1 for r in current_players.values() if isinstance(r,dict) and (safe_float(r.get("current_games"),0) or 0)>=1 and (safe_float(r.get("source_season"),NFL_CURRENT_SEASON) or NFL_CURRENT_SEASON)==NFL_CURRENT_SEASON)/350) if current_players else 0)),
         ("Current team context",min(100,100*len(current_teams)/32) if current_teams else 0),
         ("Possession / drive data",deep_scores.get("Possessions",0)),
         ("OL/DL + pressure data",deep_scores.get("Trenches",0)),
@@ -13531,7 +13612,7 @@ def regular_season_readiness_panel():
         ("Depth charts",min(100,100*len(depth)/500) if depth else 0),
         ("Injuries",min(100,100*len(injuries)/120) if injuries else 0),
         ("Final inactives",100 if isinstance(finals,dict) and (finals.get("teams") or finals.get("confirmed_matchups")) else 35),
-        (f"NGS / Savant ({selected})",min(100,55+min(45,savant_teams*1.4)) if savant_players or savant_teams else 0),
+        (f"NGS / Savant ({selected})" + (" PRIOR" if int(selected)!=int(NFL_CURRENT_SEASON) else " CURRENT"),min(100,55+min(45,savant_teams*1.4)) if savant_players or savant_teams else 0),
         ("Weather",100 if weather else 55),
     ]
     # Core/deep modules matter more than optional live hooks in the global score.
@@ -14169,131 +14250,3 @@ elif active_page == 'Money Line':
 elif active_page == 'Backtest':
     st.markdown("<div class='section-title-pro'>Backtest + Edge Buckets</div>", unsafe_allow_html=True)
     _render_backtest_dashboard(active_season_mode)
-
-# =============================================================================
-# MANUAL FULL LIVE AUDIT DOWNLOAD — OFF BY DEFAULT / DIAGNOSTIC ONLY
-# =============================================================================
-def _v749_audit_safe(v, depth=0):
-    if depth > 10: return '<max-depth>'
-    if v is None or isinstance(v, (str, int, bool)): return v
-    if isinstance(v, float): return v if math.isfinite(v) else None
-    if isinstance(v, Path): return str(v)
-    if isinstance(v, (datetime, pd.Timestamp)):
-        try: return v.isoformat()
-        except Exception: return str(v)
-    if isinstance(v, dict): return {str(k): _v749_audit_safe(x, depth+1) for k,x in v.items()}
-    if isinstance(v, (list, tuple, set)): return [_v749_audit_safe(x, depth+1) for x in v]
-    if isinstance(v, pd.DataFrame): return [_v749_audit_safe(x, depth+1) for x in v.to_dict('records')]
-    if isinstance(v, pd.Series): return _v749_audit_safe(v.to_dict(), depth+1)
-    try:
-        if pd.isna(v): return None
-    except Exception: pass
-    try:
-        if isinstance(v, np.integer): return int(v)
-        if isinstance(v, np.floating):
-            x=float(v); return x if math.isfinite(x) else None
-    except Exception: pass
-    return str(v)
-
-
-def _v749_call_loader(name):
-    fn = globals().get(name)
-    if not callable(fn): return None, 'loader unavailable'
-    try: return _v749_audit_safe(fn()), None
-    except Exception as e: return None, str(e)[:500]
-
-
-def _v749_build_audit_zip():
-    active_rows = list(globals().get('selected_raw') or [])
-    live_rows = list(globals().get('live') or [])
-    season_mode = str(globals().get('active_season_mode') or 'REGULAR')
-    merged, merge_errors = [], []
-    merge_fn = globals().get('merge_nfl_context')
-    canon_fn = globals().get('_canon_prop_label')
-    for row in active_rows:
-        rr = dict(row)
-        if callable(canon_fn): rr['prop'] = canon_fn(rr.get('prop')) or rr.get('prop')
-        try:
-            merged.append(_v749_audit_safe(merge_fn(rr) if callable(merge_fn) else rr))
-        except Exception as e:
-            merge_errors.append({'player':rr.get('player'),'team':rr.get('team'),'opponent':rr.get('opponent'),'prop':rr.get('prop'),'line':rr.get('line'),'error':str(e)[:500]})
-
-    loader_names = [
-        'load_usage_bank','load_current_usage_bank','load_depth_chart_bank','load_market_context_bank',
-        'load_travel_context_bank','load_matchup_context_bank','load_qb_context_bank',
-        'load_defensive_injury_context','load_final_inactives_context','load_splits_context_bank',
-        'load_personnel_context_bank','load_current_team_context','load_weather_context','load_team_context','load_injury_bank'
-    ]
-    banks, loader_errors = {}, {}
-    for name in loader_names:
-        data, err = _v749_call_loader(name)
-        banks[name] = data
-        if err: loader_errors[name] = err
-
-    readiness = {}
-    for key, fn_name in [('projection_database','projection_database_readiness'),('regular_season','regular_season_readiness_panel')]:
-        fn=globals().get(fn_name)
-        if callable(fn):
-            try: readiness[key]=_v749_audit_safe(fn())
-            except Exception as e: readiness[key]={'error':str(e)[:500]}
-
-    meta = {
-        'generated_at': globals().get('now_iso', lambda: datetime.now().isoformat())(),
-        'diagnostic_only': True, 'season_mode': season_mode,
-        'app_version': globals().get('APP_VERSION'), 'model_version': globals().get('MODEL_VERSION'),
-        'current_season': globals().get('NFL_CURRENT_SEASON'), 'prior_season': globals().get('NFL_LAST_SEASON'),
-        'live_rows': len(live_rows), 'active_rows': len(active_rows), 'merged_rows': len(merged),
-        'merge_errors': len(merge_errors), 'active_markets': sorted(list(globals().get('ACTIVE_NFL_MARKETS') or [])),
-    }
-    settings = {
-        'PROP_CONFIG': _v749_audit_safe(globals().get('PROP_CONFIG',{})),
-        'ROLE_SAFETY_MINIMUMS': _v749_audit_safe(globals().get('ROLE_SAFETY_MINIMUMS',{})),
-        'session_settings': {k:_v749_audit_safe(st.session_state.get(k)) for k in [
-            'primary_lines_only','team_volume_reconciliation_enabled','advanced_sim_assist_enabled','smart_calibration_enabled'
-        ]}
-    }
-
-    buf=io.BytesIO()
-    with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED,allowZip64=True) as z:
-        def put(name,obj): z.writestr(name,json.dumps(_v749_audit_safe(obj),indent=2,sort_keys=True))
-        put('00_META.json',meta); put('01_LIVE_UNDERDOG_ROWS.json',live_rows); put('02_ACTIVE_ROWS.json',active_rows)
-        put('03_MERGED_MODEL_INPUTS.json',merged); put('04_LOADED_DATA_BANKS.json',banks); put('05_LOADER_ERRORS.json',loader_errors)
-        put('06_MERGE_ERRORS.json',merge_errors); put('07_READINESS.json',readiness); put('08_MODEL_SETTINGS.json',settings)
-        put('09_PROJECTION_CACHE.json',st.session_state.get('nfl_projection_cache',{})); put('10_MONEYLINE_ROWS.json',globals().get('moneylines',[]))
-        # Actual loaded Savant/NGS pack used by the app, current + prior season.
-        savant_dir=globals().get('SAVANT_DIR'); pack_fn=globals().get('load_savant_pack'); manifest_fn=globals().get('load_savant_manifest')
-        if callable(manifest_fn) and savant_dir is not None:
-            try: put('11_SAVANT_MANIFEST.json',manifest_fn(savant_dir))
-            except Exception as e: z.writestr('11_SAVANT_MANIFEST_ERROR.txt',str(e))
-        if callable(pack_fn) and savant_dir is not None:
-            for label,season in [('current',globals().get('NFL_CURRENT_SEASON')),('prior',globals().get('NFL_LAST_SEASON'))]:
-                try:
-                    pack=pack_fn(savant_dir,season=season) or {}
-                    pmeta={}
-                    for board,frame in pack.items():
-                        if isinstance(frame,pd.DataFrame):
-                            safe_name=re.sub(r'[^a-z0-9_-]+','_',str(board).lower())
-                            z.writestr(f'savant_loaded/{label}_{safe_name}.csv',frame.to_csv(index=False))
-                            pmeta[str(board)]={'rows':len(frame),'columns':list(frame.columns)}
-                    put(f'savant_loaded/{label}_pack_meta.json',pmeta)
-                except Exception as e: z.writestr(f'savant_loaded/{label}_ERROR.txt',str(e))
-    return buf.getvalue(), meta
-
-
-with st.sidebar.expander('🧪 FULL LIVE AUDIT DOWNLOAD', expanded=False):
-    st.caption('OFF by default. Diagnostic export only — it does not change projection formulas or run automatically.')
-    _v749_audit_on = st.toggle('Enable audit download', value=False, key='v749_manual_audit_toggle')
-    if _v749_audit_on:
-        st.caption('One ZIP: live lines + merged model inputs + current/prior usage + team/opponent/depth/injury/weather + Savant/NGS + readiness/config/cache.')
-        if st.button('BUILD AUDIT ZIP', use_container_width=True, key='v749_build_audit_zip'):
-            with st.spinner('Building one audit ZIP from the data loaded by the app…'):
-                try:
-                    _blob,_meta=_v749_build_audit_zip()
-                    st.session_state['v749_audit_blob']=_blob
-                    st.session_state['v749_audit_meta']=_meta
-                    st.success(f"Audit ready · {_meta.get('active_rows',0)} active rows · {_meta.get('merged_rows',0)} merged")
-                except Exception as e:
-                    st.error(f'Audit failed safely: {str(e)[:600]}')
-        if st.session_state.get('v749_audit_blob'):
-            _stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
-            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v749_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
