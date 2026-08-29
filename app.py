@@ -9,7 +9,7 @@ This is a live-only game-day build. It never substitutes synthetic lines for a m
 Underdog feed, and it only projects markets with dedicated player-stat models.
 """
 
-import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile, html
+import os, json, math, time, difflib, unicodedata, hashlib, re, io, zipfile, html, textwrap
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -1103,7 +1103,7 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.48 — ELITE NFL UI + FULL FOOTBALL DATA"
+APP_VERSION = "NFL v7.49 — ELITE TEAM UI + LIVE WEATHER + COMPACT ML"
 MODEL_VERSION = "nfl-prop-engine-v7.48.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
@@ -1559,6 +1559,24 @@ STADIUM_ENV.update({
     "WSH": {"stadium":"Northwest Stadium", "crowd":"MODERATE", "noise":0.988, "surface":"Grass", "roof":"Outdoor", "altitude":0},
 })
 
+# Official-style team accent palette used only for UI theming.
+NFL_TEAM_COLORS = {
+    "ARI":("#97233F","#000000"), "ATL":("#A71930","#000000"), "BAL":("#241773","#9E7C0C"),
+    "BUF":("#00338D","#C60C30"), "CAR":("#0085CA","#101820"), "CHI":("#0B162A","#C83803"),
+    "CIN":("#FB4F14","#000000"), "CLE":("#311D00","#FF3C00"), "DAL":("#003594","#869397"),
+    "DEN":("#FB4F14","#002244"), "DET":("#0076B6","#B0B7BC"), "GB":("#203731","#FFB612"),
+    "HOU":("#03202F","#A71930"), "IND":("#002C5F","#A2AAAD"), "JAX":("#006778","#D7A22A"),
+    "KC":("#E31837","#FFB81C"), "LAC":("#0080C6","#FFC20E"), "LAR":("#003594","#FFA300"),
+    "LV":("#A5ACAF","#000000"), "MIA":("#008E97","#FC4C02"), "MIN":("#4F2683","#FFC62F"),
+    "NE":("#002244","#C60C30"), "NO":("#D3BC8D","#101820"), "NYG":("#0B2265","#A71930"),
+    "NYJ":("#125740","#000000"), "PHI":("#004C54","#A5ACAF"), "PIT":("#FFB612","#101820"),
+    "SEA":("#002244","#69BE28"), "SF":("#AA0000","#B3995D"), "TB":("#D50A0A","#34302B"),
+    "TEN":("#0C2340","#4B92DB"), "WSH":("#5A1414","#FFB612"),
+}
+def nfl_team_theme(team):
+    team=_normalize_nfl_team(team)
+    return NFL_TEAM_COLORS.get(team,("#3267A8","#8EA3BA"))
+
 # Veteran / elite QB stability layer for Passing Yards.
 # This does not create fake yards. It only adjusts stability/volatility and lightly
 # protects proven QBs from extreme game-script penalties.
@@ -1713,6 +1731,77 @@ st.markdown("""
  .nfl-why{white-space:normal;line-height:1.35}
  .ml-main-grid{grid-template-columns:1fr 1fr}.ml-center-panel{grid-column:1/-1;grid-row:1;border:0;border-bottom:1px solid #172b40}.ml-team-panel{grid-row:2}.ml-market-panel,.ml-gauge-panel{grid-column:1/-1;border-top:1px solid #172b40;border-right:0}
  .ml-market-panel{display:grid;grid-template-columns:1fr 1fr;gap:7px}.ml-market-grid{margin-top:0}.ml-battle{grid-template-columns:repeat(4,1fr)}.ml-detail-grid{grid-template-columns:repeat(3,1fr)}
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------- v7.49 team-color + compact mobile UI overrides ----------
+st.markdown("""
+<style>
+.compact-prop-row,.nfl-elite-card{
+  --team-primary:#3267A8;--team-secondary:#8EA3BA;
+  border-left:3px solid var(--team-primary)!important;
+  background:
+    radial-gradient(circle at 0% 50%,color-mix(in srgb,var(--team-primary) 22%,transparent),transparent 28%),
+    linear-gradient(180deg,rgba(10,16,27,.98),rgba(5,9,16,.98))!important;
+}
+.compact-prop-row{border-bottom-color:color-mix(in srgb,var(--team-primary) 35%,rgba(255,255,255,.08))!important}
+.compact-prop-row:hover{background:
+  radial-gradient(circle at 0% 50%,color-mix(in srgb,var(--team-primary) 30%,transparent),transparent 32%),
+  #0a111d!important}
+.cp-team-logo,.nfl-logo{filter:drop-shadow(0 0 8px color-mix(in srgb,var(--team-primary) 55%,transparent))}
+.nfl-elite-card{border-color:color-mix(in srgb,var(--team-primary) 68%,#26384a)!important}
+.nfl-elite-card:before{background:linear-gradient(180deg,var(--team-primary),var(--team-secondary))!important}
+.nfl-weather-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px;margin-top:5px}
+.nfl-weather-grid span{display:block;padding:4px 5px;border:1px solid #172b40;border-radius:7px;background:rgba(2,8,14,.52);font-size:7px;color:#7f94ad;text-transform:uppercase}
+.nfl-weather-grid b{display:block;color:#eef5ff;font-size:10px;margin-top:1px;text-transform:none}
+
+.ml-elite-card{
+  --away-primary:#3267A8;--away-secondary:#8EA3BA;--home-primary:#7851A9;--home-secondary:#A9B3C1;--winner-primary:#ffcb45;
+  border:1px solid color-mix(in srgb,var(--winner-primary) 65%,#24364c)!important;
+  background:
+    radial-gradient(circle at 0% 15%,color-mix(in srgb,var(--away-primary) 24%,transparent),transparent 28%),
+    radial-gradient(circle at 100% 15%,color-mix(in srgb,var(--home-primary) 24%,transparent),transparent 28%),
+    linear-gradient(145deg,#07101b,#03070d 70%)!important;
+}
+.ml-elite-card:before{background:linear-gradient(180deg,var(--away-primary),var(--winner-primary),var(--home-primary))!important;width:4px!important}
+.ml-topline{background:linear-gradient(90deg,color-mix(in srgb,var(--away-primary) 13%,transparent),transparent 45%,color-mix(in srgb,var(--home-primary) 13%,transparent))}
+.ml-team-panel:first-child{background:linear-gradient(90deg,color-mix(in srgb,var(--away-primary) 16%,transparent),transparent)}
+.ml-team-panel.right{background:linear-gradient(270deg,color-mix(in srgb,var(--home-primary) 16%,transparent),transparent)}
+.ml-winner-big{color:var(--winner-primary);text-shadow:0 0 14px color-mix(in srgb,var(--winner-primary) 26%,transparent)}
+.ml-winner-tag{color:var(--winner-primary)}
+.ml-market-panel{background:rgba(2,8,15,.35)}
+.ml-tier-pill{display:inline-flex;align-items:center;justify-content:center;padding:5px 9px;border:1px solid color-mix(in srgb,var(--winner-primary) 55%,#26384c);border-radius:999px;background:color-mix(in srgb,var(--winner-primary) 10%,#06101a);font-size:10px;font-weight:1000;color:var(--winner-primary);margin-top:5px}
+.ml-weather-strip{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px;padding:0 10px 8px}
+.ml-weather-cell{background:rgba(3,9,16,.68);border:1px solid #172b40;border-radius:9px;padding:6px;min-width:0}
+.ml-weather-cell .ml-label{font-size:7px}.ml-weather-cell .ml-val{font-size:11px;overflow-wrap:anywhere}
+.ml-weather-source{font-size:7px;color:#6f849d;margin-top:2px;text-transform:uppercase}
+@media(max-width:760px){
+  .compact-prop-row{border-radius:10px!important;margin-bottom:6px!important;border:1px solid color-mix(in srgb,var(--team-primary) 45%,#1c2c40)!important;border-left:3px solid var(--team-primary)!important;padding:9px 5px!important}
+  .nfl-elite-card{padding:8px!important;border-radius:12px!important}
+  .nfl-readiness{margin-top:5px}.nfl-mini-box,.nfl-stat-box,.nfl-opp-box,.nfl-risk-box{padding:5px}
+  .nfl-card-grid{gap:5px!important}.nfl-context-row{gap:5px;margin-top:5px}.nfl-risk-strip{gap:4px;margin-top:4px}
+  .nfl-weather-grid{grid-template-columns:repeat(4,1fr)}
+  .ml-elite-board{gap:8px!important}.ml-elite-card{border-radius:14px!important}
+  .ml-topline{padding:6px 8px!important;font-size:8px!important;line-height:1.25;flex-wrap:wrap}
+  .ml-main-grid{grid-template-columns:1fr 1fr 1fr!important}
+  .ml-center-panel{grid-column:2!important;grid-row:1!important;border-left:1px solid #172b40!important;border-right:1px solid #172b40!important;border-bottom:0!important;padding:7px 4px!important}
+  .ml-team-panel{grid-row:1!important;padding:7px 5px!important;gap:4px!important;flex-direction:column!important;text-align:center!important}
+  .ml-team-panel.right{grid-column:3!important}
+  .ml-team-panel img{width:48px!important;height:48px!important}.ml-team-code{font-size:17px!important}.ml-team-score{font-size:9px!important;margin-top:1px!important}
+  .ml-winner-tag{font-size:7px!important}.ml-winner-big{font-size:23px!important}.ml-cal{font-size:9px!important}
+  .ml-scoreline{grid-column:1/-1;margin:0 7px 6px!important;padding:5px!important}.ml-scoreline b{font-size:14px!important}
+  .ml-market-panel{grid-column:1/-1!important;display:grid!important;grid-template-columns:82px 1fr!important;gap:5px!important;padding:6px 8px!important;border-top:1px solid #172b40;border-right:0!important}
+  .ml-market-grid{margin:0!important;grid-template-columns:repeat(4,1fr)!important}.ml-mini{padding:5px!important}.ml-val{font-size:12px!important}
+  .ml-gauge-panel{grid-column:1/-1!important;padding:5px 8px!important;display:grid!important;grid-template-columns:auto 1fr auto auto!important;align-items:center;gap:7px;border-top:1px solid #172b40!important}
+  .ml-gauge{width:58px!important;height:29px!important;margin:0!important}.ml-gauge:after{left:9px!important;right:9px!important;height:20px!important}
+  .ml-gauge-num{font-size:19px!important;margin:0!important}.ml-tier-pill{margin:0!important;font-size:9px!important}
+  .ml-battle{grid-template-columns:repeat(4,1fr)!important}.ml-battle-cell{padding:5px 2px!important}.ml-battle-name{font-size:6px!important}.ml-battle-val{font-size:8px!important}
+  .ml-detail-grid{grid-template-columns:repeat(3,1fr)!important;padding:6px 8px!important;gap:4px!important}
+  .ml-weather-strip{grid-template-columns:repeat(4,1fr)!important;padding:0 8px 6px!important;gap:4px!important}
+  .ml-weather-cell{padding:5px!important}.ml-weather-cell .ml-val{font-size:9px!important}
+  .ml-why{margin:0 8px 7px!important;font-size:8px!important;white-space:normal!important;line-height:1.3}
 }
 </style>
 """, unsafe_allow_html=True)
@@ -6315,18 +6404,124 @@ def _weather_risk_from_detail(ctx):
         notes.append(str(note)[:120])
     return risk or "LOW", clamp(pass_factor,0.86,1.03), notes
 
+def _weather_condition_label(code):
+    try: code=int(code)
+    except Exception: return "Unknown"
+    if code==0: return "Clear"
+    if code in {1,2}: return "Partly cloudy"
+    if code==3: return "Overcast"
+    if code in {45,48}: return "Fog"
+    if code in {51,53,55,56,57}: return "Drizzle"
+    if code in {61,63,65,66,67}: return "Rain"
+    if code in {71,73,75,77}: return "Snow"
+    if code in {80,81,82}: return "Rain showers"
+    if code in {85,86}: return "Snow showers"
+    if code in {95,96,99}: return "Thunderstorm"
+    return "Mixed"
+
+def _weather_home_team(row):
+    row=row or {}
+    explicit=_normalize_nfl_team(row.get("home_team") or row.get("home"))
+    if explicit in TEAM_STADIUM_COORDS:
+        return explicit
+    team=_normalize_nfl_team(row.get("team"))
+    opp=_normalize_nfl_team(row.get("opp"))
+    hoa=str(row.get("home_away") or row.get("location") or "").upper()
+    if "HOME" in hoa and team in TEAM_STADIUM_COORDS: return team
+    if "AWAY" in hoa and opp in TEAM_STADIUM_COORDS: return opp
+    matchup=str(row.get("matchup") or "")
+    if "@" in matchup:
+        h=_normalize_nfl_team(matchup.split("@")[-1].strip().split()[0])
+        if h in TEAM_STADIUM_COORDS: return h
+    return opp if opp in TEAM_STADIUM_COORDS else team
+
+def _weather_game_time(row):
+    for key in ["scheduled_at","game_time","start_time","commence_time","event_time","date"]:
+        val=(row or {}).get(key)
+        if val not in [None,""]:
+            try:
+                ts=pd.to_datetime(val,utc=True,errors="coerce")
+                if pd.notna(ts): return ts
+            except Exception:
+                pass
+    return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _open_meteo_game_weather(home_team, game_time_iso):
+    """Game-hour stadium forecast. Never fabricates a forecast when unavailable."""
+    home=_normalize_nfl_team(home_team)
+    coords=TEAM_STADIUM_COORDS.get(home)
+    if not coords or not game_time_iso: return {}
+    stadium=STADIUM_ENV.get(home,{})
+    roof=str(stadium.get("roof") or "Outdoor")
+    if roof.upper() in {"DOME","CLOSED"}:
+        return {"roof":roof,"stadium":stadium.get("stadium"),"weather_risk":"LOW",
+                "weather_note":"Protected indoor game","condition":"Indoor / protected",
+                "source":"stadium_roof","updated_at":now_iso()}
+    try:
+        game_ts=pd.to_datetime(game_time_iso,utc=True)
+        now=pd.Timestamp.now(tz="UTC")
+        if game_ts < now-pd.Timedelta(hours=6) or game_ts > now+pd.Timedelta(days=16):
+            return {"roof":roof,"stadium":stadium.get("stadium"),"source":"stadium_only",
+                    "weather_note":"Game-hour forecast outside live forecast window"}
+        lat,lon=coords
+        params={
+            "latitude":lat,"longitude":lon,"timezone":"UTC","temperature_unit":"fahrenheit",
+            "wind_speed_unit":"mph","precipitation_unit":"inch","forecast_days":16,
+            "hourly":"temperature_2m,apparent_temperature,relative_humidity_2m,precipitation_probability,precipitation,weather_code,wind_speed_10m,wind_gusts_10m"
+        }
+        r=requests.get("https://api.open-meteo.com/v1/forecast",params=params,timeout=8,
+                       headers={"User-Agent":"NFLProjectionApp/7.49"})
+        r.raise_for_status()
+        payload=r.json() if r.content else {}
+        hourly=payload.get("hourly") or {}; times=hourly.get("time") or []
+        if not times: return {}
+        parsed=pd.to_datetime(times,utc=True,errors="coerce")
+        valid=[(i,abs((ts-game_ts).total_seconds())) for i,ts in enumerate(parsed) if pd.notna(ts)]
+        if not valid: return {}
+        idx=min(valid,key=lambda x:x[1])[0]
+        def at(name):
+            arr=hourly.get(name) or []
+            return arr[idx] if idx < len(arr) else None
+        code=at("weather_code")
+        out={
+            "temperature":at("temperature_2m"),"feels_like_f":at("apparent_temperature"),
+            "humidity_pct":at("relative_humidity_2m"),"precipitation_pct":at("precipitation_probability"),
+            "precipitation_in":at("precipitation"),"weather_code":code,
+            "condition":_weather_condition_label(code),"wind_mph":at("wind_speed_10m"),
+            "gust_mph":at("wind_gusts_10m"),"roof":roof,"stadium":stadium.get("stadium"),
+            "forecast_time":str(parsed[idx]),"source":"open-meteo","updated_at":now_iso(),
+        }
+        if roof.upper()=="RETRACTABLE":
+            out["weather_note"]="Outdoor forecast shown; roof status must be confirmed near kickoff"
+        elif roof.upper()=="CANOPY":
+            out["weather_note"]="Open-air/canopy stadium forecast"
+        return {k:v for k,v in out.items() if v is not None}
+    except Exception as exc:
+        return {"roof":roof,"stadium":stadium.get("stadium"),"source":"weather_unavailable",
+                "weather_note":f"Live forecast unavailable: {type(exc).__name__}"}
+
 def _lookup_weather_for_row(row):
-    weather=load_weather_context()
-    if not weather:
-        return {}
-    team=str(row.get("team") or "").upper().strip()
-    opp=str(row.get("opp") or "").upper().strip()
+    row=row or {}; weather=load_weather_context()
+    team=str(row.get("team") or "").upper().strip(); opp=str(row.get("opp") or "").upper().strip()
     matchup=str(row.get("matchup") or "").upper().strip()
-    keys=[matchup, f"{team}|{opp}", f"{opp}|{team}", team, opp]
-    for k in keys:
-        if k and isinstance(weather.get(k), dict):
-            return weather.get(k)
-    return {}
+    manual={}
+    for k in [matchup,f"{team}|{opp}",f"{opp}|{team}",team,opp]:
+        if k and isinstance(weather.get(k),dict):
+            manual=dict(weather.get(k) or {}); break
+    home=_weather_home_team(row); game_ts=_weather_game_time(row)
+    auto=_open_meteo_game_weather(home,game_ts.isoformat() if game_ts is not None else "")
+    merged=dict(manual)
+    physical={"temperature","temp_f","feels_like_f","humidity_pct","precipitation_pct","precip_pct",
+              "precipitation_in","weather_code","condition","wind_mph","wind","gust_mph","gust",
+              "forecast_time","source","updated_at","stadium"}
+    for k,v in (auto or {}).items():
+        if k in physical and _usable_context_value(v): merged[k]=v
+        elif k not in merged and _usable_context_value(v): merged[k]=v
+    if _usable_context_value(manual.get("roof_status")): merged["roof"]=manual.get("roof_status")
+    elif _usable_context_value(manual.get("roof")): merged["roof"]=manual.get("roof")
+    elif _usable_context_value((auto or {}).get("roof")): merged["roof"]=auto.get("roof")
+    return merged
 
 def _local_nflverse_player_weekly(season):
     """Load saved nflverse weekly data without making an implicit web request."""
@@ -7112,10 +7307,10 @@ def _moneyline_injury_context(team):
             "final_inactives_confirmed":confirmed,"final_inactive_count":final_count}
 
 
-def _moneyline_game_environment(away,home,matchup):
+def _moneyline_game_environment(away,home,matchup,scheduled_at=None):
     env=STADIUM_ENV.get(home,{})
-    away_row={"team":away,"opp":home,"matchup":matchup,"home_away":"AWAY"}
-    home_row={"team":home,"opp":away,"matchup":matchup,"home_away":"HOME"}
+    away_row={"team":away,"opp":home,"matchup":matchup,"home_away":"AWAY","scheduled_at":scheduled_at}
+    home_row={"team":home,"opp":away,"matchup":matchup,"home_away":"HOME","scheduled_at":scheduled_at}
     travel=_lookup_pair_context(load_travel_context_bank(),away_row) or {}
     if travel:
         away_row.update(travel)
@@ -7132,7 +7327,15 @@ def _moneyline_game_environment(away,home,matchup):
     if travel_score.get("label")=="HIGH": home_edge+=0.10
     elif travel_score.get("label")=="MED": home_edge+=0.05
     return {"home_edge":float(clamp(home_edge,0.20,0.65)),"weather_risk":risk,"weather_pass_factor":pass_factor,
-            "weather_notes":notes,"wind":wind,"precip":precip,"travel":travel_score,"stadium":env}
+            "weather_notes":notes,"wind":wind,"precip":precip,"travel":travel_score,"stadium":env,
+            "weather_detail":weather,
+            "temperature":safe_float(weather.get("temperature"),safe_float(weather.get("temp_f"))) if weather else None,
+            "feels_like":safe_float(weather.get("feels_like_f")) if weather else None,
+            "humidity":safe_float(weather.get("humidity_pct")) if weather else None,
+            "gust":safe_float(weather.get("gust_mph"),safe_float(weather.get("gust"))) if weather else None,
+            "roof":str(weather.get("roof") or env.get("roof") or "") if weather or env else "",
+            "condition":str(weather.get("condition") or weather.get("summary") or "") if weather else "",
+            "weather_source":str(weather.get("source") or "") if weather else ""}
 
 
 def _preseason_moneyline_rotation(team, game_rows):
@@ -7428,7 +7631,7 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
             cards.append(base); continue
 
         away_profile=away_rating["profile"]; home_profile=home_rating["profile"]
-        env=_moneyline_game_environment(away,home,game["matchup"])
+        env=_moneyline_game_environment(away,home,game["matchup"],game.get("scheduled_at"))
         away_inj=_moneyline_injury_context(away); home_inj=_moneyline_injury_context(home)
         away_rot=_preseason_moneyline_rotation(away,game_rows) if phase=="PRESEASON" else {"score":0.0,"confidence":1.0,"records":0,"notes":[]}
         home_rot=_preseason_moneyline_rotation(home,game_rows) if phase=="PRESEASON" else {"score":0.0,"confidence":1.0,"records":0,"notes":[]}
@@ -11673,8 +11876,9 @@ def _render_compact_prop_board(rows, title="Prop Board"):
         savant=html.escape(str(p.get("savant_status") or "MISSING"))
         logo=html.escape(nfl_team_logo_url(p.get("team")),quote=True)
         logo_html=(f"<img class='cp-team-logo' src='{logo}' alt='{team} logo' loading='lazy' decoding='async' referrerpolicy='no-referrer' onerror=\"this.style.display='none'\">" if logo else "")
-        cards.append(f"""
-        <div class='compact-prop-row'>
+        primary,secondary=nfl_team_theme(p.get("team"))
+        cards.append(textwrap.dedent(f"""
+        <div class='compact-prop-row' style='--team-primary:{primary};--team-secondary:{secondary}'>
           <div class='cp-player'>{logo_html}<div class='cp-player-copy'><strong>{player}</strong><span>{team} · {pos}{(' · '+matchup) if matchup else ''}</span></div></div>
           <div class='cp-prop'><strong>{prop}</strong><span>{line_tag} · vs {line}</span></div>
           <div class='cp-proj'><strong>{proj}</strong><span>projection</span></div>
@@ -11682,7 +11886,7 @@ def _render_compact_prop_board(rows, title="Prop Board"):
           <div class='cp-pick {pick_cls}'><strong>{pick}</strong><span>{fair_txt} · {audit} · SAV {savant}</span></div>
           <div class='cp-over'><strong>{over_txt}</strong><div class='cp-bar'><i style='width:{bar:.0f}%'></i></div></div>
         </div>
-        """)
+        """))
     st.markdown("".join(cards), unsafe_allow_html=True)
     if pages>1:
         st.caption(f"Showing {lo+1}-{min(len(rows),lo+page_size)} of {len(rows)}")
@@ -11835,7 +12039,8 @@ def _render_moneyline_cards(cards):
         price_status=html.escape(str(card.get("price_status") or "MODEL ONLY"))
         if card.get("blocked"):
             reasons=" • ".join(html.escape(str(x)) for x in card.get("blocks",[]) if x)
-            markup.append(f"<section class='ml-elite-card'><div class='ml-topline'><span>{start} · {matchup}</span><span>PASS · DATA BLOCKED</span></div><div style='padding:14px'><b>NO OFFICIAL MODEL</b><div class='nfl-subline'>{reasons or 'Required team inputs are incomplete.'}</div></div></section>")
+            apc,asc=nfl_team_theme(away); hpc,hsc=nfl_team_theme(home)
+            markup.append(f"<section class='ml-elite-card' style='--away-primary:{apc};--away-secondary:{asc};--home-primary:{hpc};--home-secondary:{hsc};--winner-primary:#ffcb45'><div class='ml-topline'><span>{start} · {matchup}</span><span>PASS · DATA BLOCKED</span></div><div style='padding:14px'><b>NO OFFICIAL MODEL</b><div class='nfl-subline'>{reasons or 'Required team inputs are incomplete.'}</div></div></section>")
             continue
 
         fav=html.escape(str(card.get("favorite") or ""))
@@ -11849,8 +12054,12 @@ def _render_moneyline_cards(cards):
         away_logo=html.escape(nfl_team_logo_url(away),quote=True); home_logo=html.escape(nfl_team_logo_url(home),quote=True)
         al=f"<img src='{away_logo}' alt='{away} logo' loading='lazy' onerror=\"this.style.display='none'\">" if away_logo else ""
         hl=f"<img src='{home_logo}' alt='{home} logo' loading='lazy' onerror=\"this.style.display='none'\">" if home_logo else ""
-        am=_format_american_odds(card.get("away_market_odds") if card.get("away_market_odds") is not None else card.get("away_model_odds"))
-        hm=_format_american_odds(card.get("home_market_odds") if card.get("home_market_odds") is not None else card.get("home_model_odds"))
+        away_primary,away_secondary=nfl_team_theme(away); home_primary,home_secondary=nfl_team_theme(home)
+        fav_primary=(home_primary if fav==home else away_primary)
+        is_live_price=card.get("price_status")=="LIVE MARKET"
+        line_label="MARKET LINE" if is_live_price else "MODEL LINE"
+        am=_format_american_odds(card.get("away_market_odds") if is_live_price else card.get("away_model_odds"))
+        hm=_format_american_odds(card.get("home_market_odds") if is_live_price else card.get("home_model_odds"))
         aip=card.get("away_market_prob"); hip=card.get("home_market_prob")
         market_edge=safe_float(card.get("calibrated_market_edge"),safe_float(card.get("market_model_edge")))
         market_edge_txt="—" if market_edge is None else f"{market_edge*100:+.1f}%"
@@ -11879,8 +12088,29 @@ def _render_moneyline_cards(cards):
             _ml_advantage_cell(card,"special_teams","SPECIAL TEAMS"),
         ])
         gauge=max(0,min(100,football))
-        markup.append(f"""
-        <section class='ml-elite-card'>
+        env=card.get("game_environment") or {}
+        wx=env.get("weather_detail") or {}
+        wx_temp=_fmt_num(env.get("temperature",wx.get("temperature",wx.get("temp_f"))),0)
+        wx_feels=_fmt_num(env.get("feels_like",wx.get("feels_like_f")),0)
+        wx_hum=_fmt_num(env.get("humidity",wx.get("humidity_pct")),0)
+        wx_wind=_fmt_num(env.get("wind",wx.get("wind_mph",wx.get("wind"))),0)
+        wx_gust=_fmt_num(env.get("gust",wx.get("gust_mph",wx.get("gust"))),0)
+        wx_precip=_fmt_num(env.get("precip",wx.get("precipitation_pct",wx.get("precip_pct"))),0)
+        wx_roof=html.escape(str(env.get("roof") or wx.get("roof") or (env.get("stadium") or {}).get("roof") or "—"))
+        wx_cond=html.escape(str(env.get("condition") or wx.get("condition") or card.get("weather_risk") or "—"))
+        wx_source=html.escape(str(env.get("weather_source") or wx.get("source") or "—"))
+        wx_stadium=html.escape(str(wx.get("stadium") or (env.get("stadium") or {}).get("stadium") or "—"))
+        weather_strip="".join([
+            f"<div class='ml-weather-cell'><div class='ml-label'>WEATHER</div><div class='ml-val'>{wx_cond}</div><div class='ml-weather-source'>{wx_source}</div></div>",
+            f"<div class='ml-weather-cell'><div class='ml-label'>TEMP</div><div class='ml-val'>{wx_temp}°F</div></div>",
+            f"<div class='ml-weather-cell'><div class='ml-label'>FEELS</div><div class='ml-val'>{wx_feels}°F</div></div>",
+            f"<div class='ml-weather-cell'><div class='ml-label'>WIND / GUST</div><div class='ml-val'>{wx_wind} / {wx_gust} mph</div></div>",
+            f"<div class='ml-weather-cell'><div class='ml-label'>PRECIP</div><div class='ml-val'>{wx_precip}%</div></div>",
+            f"<div class='ml-weather-cell'><div class='ml-label'>HUMIDITY</div><div class='ml-val'>{wx_hum}%</div></div>",
+            f"<div class='ml-weather-cell'><div class='ml-label'>ROOF / STADIUM</div><div class='ml-val'>{wx_roof}</div><div class='ml-weather-source'>{wx_stadium}</div></div>",
+        ])
+        markup.append(textwrap.dedent(f"""
+        <section class='ml-elite-card' style='--away-primary:{away_primary};--away-secondary:{away_secondary};--home-primary:{home_primary};--home-secondary:{home_secondary};--winner-primary:{fav_primary}'>
           <div class='ml-topline'><span>{start} · {matchup}</span><span>{phase_note} · {status} · {price_status}</span></div>
           <div class='ml-main-grid'>
             <div class='ml-team-panel'>{al}<div><div class='ml-team-code'>{away}</div><div class='ml-team-score'>{ap} PTS · {away_prob:.0f}% FOOTBALL</div></div></div>
@@ -11888,13 +12118,13 @@ def _render_moneyline_cards(cards):
               <div class='ml-winner-tag'>★ MODEL WINNER ★</div><div class='ml-winner-big'>{fav} {football:.0f}%</div><div class='ml-cal'>CALIBRATED {calibrated:.0f}%</div>
               <div class='ml-scoreline'><span><b>{away} {ap}</b></span><span>PROJECTED<br><small>{margin_txt}</small></span><span><b>{home} {hp}</b></span></div>
             </div>
-            <div class='ml-market-panel'><div class='ml-label'>MARKET LINE</div><div class='ml-market-grid'>
+            <div class='ml-market-panel'><div class='ml-label'>{line_label}</div><div class='ml-market-grid'>
               <div class='ml-mini'><div class='ml-label'>{away}</div><div class='ml-val'>{am}</div></div>
               <div class='ml-mini'><div class='ml-label'>{home}</div><div class='ml-val'>{hm}</div></div>
               <div class='ml-mini'><div class='ml-label'>NO-VIG</div><div class='ml-val'>{'—' if aip is None else f'{100*aip:.0f}%'} / {'—' if hip is None else f'{100*hip:.0f}%'}</div></div>
               <div class='ml-mini'><div class='ml-label'>MODEL EDGE</div><div class='ml-val nfl-good'>{market_edge_txt}</div></div>
             </div></div>
-            <div class='ml-gauge-panel'><div class='ml-label'>WIN PROBABILITY</div><div class='ml-gauge' style='--p:{gauge:.0f}'></div><div class='ml-gauge-num'>{football:.0f}%</div><div class='ml-cal'>{calibrated:.0f}% CAL</div><div class='ml-tier nfl-good'>{tier}</div></div>
+            <div class='ml-gauge-panel'><div class='ml-label'>WIN PROBABILITY</div><div class='ml-gauge' style='--p:{gauge:.0f}'></div><div class='ml-gauge-num'>{football:.0f}%</div><div class='ml-cal'>{calibrated:.0f}% CAL</div><div class='ml-tier-pill'>{tier}</div></div>
             <div class='ml-team-panel right'>{hl}<div><div class='ml-team-code'>{home}</div><div class='ml-team-score'>{hp} PTS · {home_prob:.0f}% FOOTBALL</div></div></div>
           </div>
           <div class='ml-battle'>{battle}</div>
@@ -11906,10 +12136,11 @@ def _render_moneyline_cards(cards):
             <div class='ml-mini'><div class='ml-label'>EXPECTED TO</div><div class='ml-val'>{away} {_fmt_num(card.get('expected_turnovers_away'),2)} · {home} {_fmt_num(card.get('expected_turnovers_home'),2)}</div></div>
             <div class='ml-mini'><div class='ml-label'>DATA / STATUS</div><div class='ml-val'>{data}% · {'OFFICIAL' if card.get('official_moneyline_ready') else 'TRACK'}</div></div>
           </div>
+          <div class='ml-weather-strip'>{weather_strip}</div>
           <div class='nfl-risk-strip' style='padding:0 10px 6px'>{''.join(f"<span class='nfl-risk-chip'>{html.escape(x)}</span>" for x in risk_bits)}</div>
           <div class='ml-why'><b>WHY {fav}:</b> {html.escape(why)}</div>
         </section>
-        """)
+        """))
     markup.append("</div>")
     st.markdown("".join(markup),unsafe_allow_html=True)
 
@@ -11936,6 +12167,7 @@ def _render_player_cards(rows, limit=None, header=None):
         phase=season_mode_for_row(p)
         logo=html.escape(nfl_team_logo_url(team),quote=True)
         logo_html=f"<img class='nfl-logo' src='{logo}' alt='{team} logo' loading='lazy' decoding='async' onerror=\"this.style.display='none'\">" if logo else "<div></div>"
+        primary,secondary=nfl_team_theme(team)
         rank_cls="top1" if idx==1 else "top2" if idx==2 else "top3" if idx==3 else ""
         prop=html.escape(str(ACTIVE_NFL_MARKET_LABELS.get(p.get("prop"),p.get("prop") or "")))
         pick=str(p.get("pick") or "PASS").upper()
@@ -11954,6 +12186,16 @@ def _render_player_cards(rows, limit=None, header=None):
         spread=_fmt_num(p.get("spread",env.get("spread")),1)
         plays=_fmt_num(exp.get("plays_pg",p.get("plays_pg")),1)
         weather=html.escape(str(p.get("weather_risk") or env.get("weather_risk") or env.get("weather") or "—"))
+        wx_temp=_fmt_num(p.get("weather_temperature",p.get("weather_temp_f",env.get("temperature"))),0)
+        wx_feels=_fmt_num(p.get("weather_feels_like_f",env.get("feels_like")),0)
+        wx_hum=_fmt_num(p.get("weather_humidity_pct",env.get("humidity")),0)
+        wx_wind=_fmt_num(p.get("weather_wind_mph",env.get("wind")),0)
+        wx_gust=_fmt_num(p.get("weather_gust_mph",env.get("gust")),0)
+        wx_precip=_fmt_num(p.get("weather_precipitation_pct",p.get("weather_precip_pct",env.get("precip"))),0)
+        wx_roof=html.escape(str(p.get("weather_roof") or env.get("roof") or "—"))
+        wx_cond=html.escape(str(p.get("weather_condition") or env.get("condition") or weather))
+        wx_source=html.escape(str(p.get("weather_source") or env.get("weather_source") or "—"))
+        weather_grid=(f"<div class='nfl-weather-grid'><span>COND<b>{wx_cond}</b></span><span>TEMP<b>{wx_temp}°F</b></span><span>FEELS<b>{wx_feels}°F</b></span><span>WIND<b>{wx_wind} mph</b></span><span>GUST<b>{wx_gust} mph</b></span><span>PRECIP<b>{wx_precip}%</b></span><span>HUMID<b>{wx_hum}%</b></span><span>ROOF<b>{wx_roof}</b></span></div>")
         opp_fields=_ui_opp_fields(p)
         opp_html="".join(f"<div class='nfl-opp-box'><div class='nfl-label'>{html.escape(str(lbl))}</div><div class='nfl-val'>{html.escape(str(val))}</div></div>" for lbl,val in opp_fields)
         p25=_fmt_num(p.get("p25"),1); p50=_fmt_num(p.get("p50"),1); p75=_fmt_num(p.get("p75"),1)
@@ -11974,8 +12216,8 @@ def _render_player_cards(rows, limit=None, header=None):
         if p.get("game_script_risk"): chips.append(f"SCRIPT {str(p.get('game_script_risk')).upper()}")
         if weather!="—": chips.append(f"WX {weather}")
         why=html.escape(_ui_player_why(p))
-        cards.append(f"""
-        <section class='nfl-elite-card'>
+        cards.append(textwrap.dedent(f"""
+        <section class='nfl-elite-card' style='--team-primary:{primary};--team-secondary:{secondary}'>
           <div class='nfl-card-grid'>
             <div>
               <div class='nfl-ident'><div class='nfl-rank {rank_cls}'>#{idx}</div>{logo_html}<div><div class='nfl-player-name'>{player}</div><div class='nfl-subline'>{team} {('VS '+opp) if opp else ''} · {pos} · {matchup}</div></div></div>
@@ -11991,14 +12233,14 @@ def _render_player_cards(rows, limit=None, header=None):
             <div>
               <div class='nfl-opportunity'><div class='nfl-opp-title'>OPPORTUNITY — PROJECTED / REAL INPUTS</div>{opp_html}</div>
               <div class='nfl-context-row'><div class='nfl-risk-box'><div class='nfl-label'>MATCHUP GRADE</div><div class='nfl-match-grade {grade_cls}'>{grade}</div><div class='nfl-context-lines'>Factor {_fmt_num(matchup_factor,3)}<br>Defense risk {html.escape(str(p.get('defense_risk') or '—'))}</div></div>
-              <div class='nfl-risk-box'><div class='nfl-label'>GAME ENVIRONMENT</div><div class='nfl-context-lines'>Total {total} · Spread {spread}<br>Projected plays {plays}<br>Weather {weather}</div>{phase_extra}</div></div>
+              <div class='nfl-risk-box'><div class='nfl-label'>GAME ENVIRONMENT</div><div class='nfl-context-lines'>Total {total} · Spread {spread}<br>Projected plays {plays}<br>Weather risk {weather}</div>{weather_grid}{phase_extra}</div></div>
             </div>
             <div class='nfl-likely'><div><div class='nfl-label'>LIKELY</div><div class='pct'>{fair_txt}</div><div class='nfl-subline'>MODEL FAIR PROB</div></div><div class='nfl-action {action_cls}'>{action}</div></div>
           </div>
           <div class='nfl-risk-strip'>{''.join(f"<span class='nfl-risk-chip'>{html.escape(str(x))}</span>" for x in chips)}</div>
           <div class='nfl-why'><b>WHY:</b> {why}</div>
         </section>
-        """)
+        """))
     cards.append("</div>")
     st.markdown("".join(cards),unsafe_allow_html=True)
 
