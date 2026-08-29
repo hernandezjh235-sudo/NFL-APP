@@ -146,6 +146,12 @@ def _canonical_column(value) -> str:
         "expected_completion_percentage": "xcomp_pct",
         "completion_percentage_above_expectation": "cpoe",
         "avg_time_to_throw": "time_to_throw",
+        "avg_separation": "avg_separation",
+        "average_separation": "avg_separation",
+        "avg_cushion": "avg_cushion",
+        "average_cushion": "avg_cushion",
+        "catch_percentage_above_expectation": "catch_pct_above_expectation",
+        "target_separation": "target_separation",
         "aggressiveness": "aggression_pct",
         "pressure_pct": "pressure_pct", "tgt_pct": "target_share",
         "target_pct": "target_share", "rztgt": "rz_targets", "rztgt_pct": "rz_target_share",
@@ -908,6 +914,35 @@ def _route_profile(player):
             "vertical_pct": round(routes["post"] + routes["go"] + routes["corner"] + routes["deep_out"], 2)}
 
 
+
+def attach_best_savant_context(row, savant_dir):
+    """Prefer current-season NGS/Savant once real boards exist; otherwise use prior season."""
+    season=int(NFL_LAST_SEASON)
+    try:
+        pack=load_savant_pack(savant_dir,int(NFL_CURRENT_SEASON))
+        if any(isinstance(df,pd.DataFrame) and not df.empty for df in (pack or {}).values()):
+            season=int(NFL_CURRENT_SEASON)
+    except Exception:
+        season=int(NFL_LAST_SEASON)
+    out=attach_savant_context(row,savant_dir,season)
+    player=out.get("savant_player_context") or {}
+    # Flatten only the small set of NGS/route metrics consumed by live projection logic.
+    flatten={
+        "avg_separation":["ngs-receiving__avg_separation","ngs_receiving__avg_separation","avg_separation"],
+        "avg_cushion":["ngs-receiving__avg_cushion","ngs_receiving__avg_cushion","avg_cushion"],
+        "catch_pct_above_expectation":["ngs-receiving__catch_pct_above_expectation","catch_pct_above_expectation"],
+        "time_to_throw":["ngs-passing__time_to_throw","time_to_throw"],
+        "cpoe":["ngs-passing__cpoe","cpoe"],
+        "yoe_per_attempt":["ngs-rushing__yoe_per_attempt","yoe_per_attempt"],
+    }
+    for dst,keys in flatten.items():
+        for key in keys:
+            if _usable_context_value(player.get(key)):
+                out[dst]=player.get(key); break
+    out["savant_selected_season"]=season
+    out["savant_prior_fallback"]=bool(season!=int(NFL_CURRENT_SEASON))
+    return out
+
 def savant_shadow_projection(row, legacy_projection, season_mode="REGULAR") -> dict:
     """Create a line-independent, bounded shadow projection from Savant composites."""
     projection = max(0.0, _finite(legacy_projection, 0.0) or 0.0)
@@ -1068,8 +1103,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.45 — REGULAR READINESS + MONEYLINE V2"
-MODEL_VERSION = "nfl-prop-engine-v7.44.0"
+APP_VERSION = "NFL v7.48 — ELITE NFL UI + FULL FOOTBALL DATA"
+MODEL_VERSION = "nfl-prop-engine-v7.48.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1082,6 +1117,9 @@ LINE_HISTORY_FILE = LOCAL_DIR / "nfl_line_history.json"
 REQUEST_LOG = LOCAL_DIR / "request_log.json"
 BOARD_CACHE_FILE = LOCAL_DIR / "nfl_last_pulled_board.json"
 MONEYLINE_CACHE_FILE = LOCAL_DIR / "nfl_last_pulled_moneylines.json"
+MONEYLINE_RESULT_LOG = LOCAL_DIR / "nfl_moneyline_results.json"
+MONEYLINE_SNAPSHOT_FILE = LOCAL_DIR / "nfl_moneyline_snapshots.json"
+MONEYLINE_CLV_FILE = LOCAL_DIR / "nfl_moneyline_clv.json"
 USAGE_FILE = LOCAL_DIR / "nfl_player_usage.csv"
 TEAM_CONTEXT_FILE = LOCAL_DIR / "nfl_team_context.json"
 INJURY_FILE = LOCAL_DIR / "nfl_injuries.json"
@@ -1602,6 +1640,79 @@ div[data-testid="stDataFrame"]{border-radius:14px;overflow:hidden}
   .kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr))!important}
   .trust-strip{grid-template-columns:repeat(2,minmax(0,1fr))!important}
   .kpi-label{font-size:10px}.kpi-value{font-size:19px}.kpi-sub{font-size:10px}
+}
+</style>
+""", unsafe_allow_html=True)
+
+
+# ---------- v7.48 elite NFL UI ----------
+st.markdown("""
+<style>
+:root{
+  --nfl-bg:#04070d;--nfl-panel:#07101b;--nfl-panel2:#0a1422;--nfl-line:#1b3149;
+  --nfl-text:#f5f8ff;--nfl-muted:#7f93ad;--nfl-green:#5dff87;--nfl-blue:#49a6ff;
+  --nfl-red:#ff4f66;--nfl-gold:#ffcb45;--nfl-purple:#a96bff;--nfl-cyan:#3de2d1;
+}
+.nfl-elite-board,.ml-elite-board{display:flex;flex-direction:column;gap:10px;margin:8px 0 12px}
+.nfl-elite-card,.ml-elite-card{
+  position:relative;overflow:hidden;background:
+  radial-gradient(circle at 5% 0%,rgba(61,117,255,.11),transparent 25%),
+  linear-gradient(145deg,#07111d 0%,#050a12 100%);
+  border:1px solid #21364f;border-radius:18px;padding:12px;color:var(--nfl-text);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.035);
+}
+.nfl-elite-card:before,.ml-elite-card:before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(#ff4f66,#49a6ff,#3de2d1)}
+.nfl-card-grid{display:grid;grid-template-columns:minmax(230px,1.4fr) minmax(250px,1.15fr) minmax(300px,1.55fr) minmax(145px,.7fr);gap:9px;align-items:stretch}
+.nfl-ident{display:grid;grid-template-columns:44px 58px 1fr;gap:9px;align-items:center;min-width:0}
+.nfl-rank{height:44px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:950;background:#111d2b;border:1px solid #2a405b;color:#dbe9ff}
+.nfl-rank.top1{background:linear-gradient(145deg,#8f6200,#2b1b00);border-color:#f5c542;color:#ffe8a0}
+.nfl-rank.top2{background:linear-gradient(145deg,#526070,#18202a);border-color:#aebccb}
+.nfl-rank.top3{background:linear-gradient(145deg,#7b472f,#24140e);border-color:#c9865f}
+.nfl-logo{width:56px;height:56px;object-fit:contain;filter:drop-shadow(0 0 7px rgba(255,255,255,.10))}
+.nfl-player-name{font-size:18px;font-weight:950;letter-spacing:.01em;line-height:1.05;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nfl-subline{font-size:10px;color:#9fb2c9;font-weight:750;margin-top:5px;letter-spacing:.06em;text-transform:uppercase}
+.nfl-readiness{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:9px}
+.nfl-mini-box,.nfl-stat-box,.nfl-opp-box,.nfl-risk-box,.ml-mini{
+ background:rgba(3,9,16,.64);border:1px solid #172b40;border-radius:10px;padding:7px;min-width:0
+}
+.nfl-label,.ml-label{font-size:8px;color:#758ba5;text-transform:uppercase;font-weight:900;letter-spacing:.08em}
+.nfl-val,.ml-val{font-size:15px;font-weight:950;margin-top:2px;color:#f5f8ff}
+.nfl-good{color:var(--nfl-green)!important}.nfl-bad{color:var(--nfl-red)!important}.nfl-warn{color:var(--nfl-gold)!important}.nfl-blue{color:var(--nfl-blue)!important}.nfl-purple{color:var(--nfl-purple)!important}
+.nfl-meter{height:5px;background:#0e1c2a;border-radius:8px;overflow:hidden;margin-top:5px}.nfl-meter i{display:block;height:100%;border-radius:8px;background:linear-gradient(90deg,#347eff,#53d7ff)}
+.nfl-market-panel{display:grid;grid-template-columns:1.1fr .9fr .8fr;gap:6px}
+.nfl-market-main{grid-column:1/-1;background:linear-gradient(145deg,rgba(25,36,53,.70),rgba(4,10,18,.85));border:1px solid #243b54;border-radius:11px;padding:8px}
+.nfl-market-name{font-size:9px;color:#95a9c0;font-weight:900;letter-spacing:.08em;text-transform:uppercase}.nfl-line{font-size:17px;font-weight:950;margin-top:2px}
+.nfl-dist{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-top:6px}.nfl-dist>div{text-align:center;border-top:1px solid #172a3c;padding-top:4px}
+.nfl-opportunity{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.nfl-opp-title{grid-column:1/-1;font-size:9px;color:#9bb0c7;text-transform:uppercase;font-weight:950;letter-spacing:.08em}
+.nfl-opp-box{text-align:center}.nfl-opp-box .nfl-val{font-size:14px}.nfl-opp-box .nfl-label{font-size:7px}
+.nfl-context-row{display:grid;grid-template-columns:1.05fr .95fr;gap:7px;margin-top:7px}.nfl-match-grade{font-size:27px;font-weight:1000;line-height:1}.nfl-context-lines{font-size:9px;color:#a7b8cb;line-height:1.55;margin-top:3px}
+.nfl-likely{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;background:linear-gradient(180deg,rgba(6,16,26,.8),rgba(3,8,14,.95));border:1px solid #23415d;border-radius:13px;padding:8px}
+.nfl-likely .pct{font-size:25px;font-weight:1000;color:#69ff8b}.nfl-action{font-size:10px;font-weight:950;text-transform:uppercase;margin-top:6px;letter-spacing:.06em}
+.nfl-why{margin-top:8px;padding-top:7px;border-top:1px solid #162a3d;font-size:9px;color:#a7b7c9;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nfl-risk-strip{display:flex;gap:7px;flex-wrap:wrap;margin-top:6px}.nfl-risk-chip{font-size:8px;font-weight:850;padding:3px 6px;border-radius:999px;border:1px solid #22364c;background:#08131f;color:#afc0d2}
+.ml-elite-card{padding:0}.ml-topline{padding:7px 11px;border-bottom:1px solid #1b3045;display:flex;justify-content:space-between;gap:8px;font-size:9px;color:#91a4ba;font-weight:850;text-transform:uppercase}
+.ml-main-grid{display:grid;grid-template-columns:1.05fr 1.35fr .75fr .72fr;min-width:0}
+.ml-team-panel{padding:11px;display:flex;align-items:center;gap:9px}.ml-team-panel.right{flex-direction:row-reverse;text-align:right}.ml-team-panel img{width:64px;height:64px;object-fit:contain}.ml-team-code{font-size:21px;font-weight:1000}.ml-team-score{font-size:13px;color:#a6b8ca;margin-top:3px}
+.ml-center-panel{padding:10px;border-left:1px solid #172b40;border-right:1px solid #172b40;text-align:center}.ml-winner-tag{font-size:9px;color:#ffcf4a;text-transform:uppercase;font-weight:950;letter-spacing:.1em}.ml-winner-big{font-size:27px;font-weight:1000;margin-top:1px}.ml-cal{font-size:11px;color:#aebfd0;margin-top:1px}.ml-scoreline{display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:7px;margin-top:7px;background:#030a11;border:1px solid #1a2f44;border-radius:9px;padding:6px}.ml-scoreline b{font-size:19px}
+.ml-market-panel{padding:9px;border-right:1px solid #172b40}.ml-market-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-top:5px}
+.ml-gauge-panel{padding:9px;text-align:center;display:flex;flex-direction:column;justify-content:center}.ml-gauge{width:78px;height:39px;margin:3px auto 0;border-radius:78px 78px 0 0;background:conic-gradient(from 270deg at 50% 100%,#43e879 0deg,var(--gauge,#43e879) calc(var(--p)*1.8deg),#172737 calc(var(--p)*1.8deg) 180deg,transparent 180deg);position:relative}.ml-gauge:after{content:"";position:absolute;left:12px;right:12px;bottom:0;height:27px;background:#050c14;border-radius:55px 55px 0 0}.ml-gauge-num{font-size:24px;font-weight:1000;margin-top:-4px;position:relative;z-index:2}.ml-tier{font-size:11px;font-weight:1000;margin-top:4px}
+.ml-battle{display:grid;grid-template-columns:repeat(8,1fr);border-top:1px solid #1a3045;border-bottom:1px solid #1a3045;background:#050c14}.ml-battle-cell{padding:7px 4px;text-align:center;border-right:1px solid #142537;min-width:0}.ml-battle-cell:last-child{border-right:0}.ml-battle-name{font-size:7px;color:#8fa3b9;font-weight:950;text-transform:uppercase}.ml-battle-val{font-size:10px;font-weight:950;margin-top:3px}.ml-adv-home{color:#62f888}.ml-adv-away{color:#55b9ff}.ml-even{color:#a8b6c6}
+.ml-detail-grid{display:grid;grid-template-columns:repeat(6,1fr);gap:5px;padding:8px 10px}.ml-why{margin:0 10px 9px;padding-top:6px;border-top:1px solid #16293b;font-size:9px;color:#9eb0c3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ml-pre-note{color:#ffd05a;font-weight:850}.ml-reg-note{color:#64f48a;font-weight:850}
+@media(max-width:1100px){
+ .nfl-card-grid{grid-template-columns:1.15fr 1fr 1.4fr .65fr}
+ .ml-main-grid{grid-template-columns:1fr 1.25fr .7fr}.ml-gauge-panel{grid-column:1/-1;border-top:1px solid #172b40}
+ .ml-battle{grid-template-columns:repeat(4,1fr)}
+}
+@media(max-width:760px){
+ .nfl-elite-card{padding:9px;border-radius:14px}
+ .nfl-card-grid{grid-template-columns:1fr 1fr;gap:7px}
+ .nfl-ident{grid-column:1/-1;grid-template-columns:38px 48px 1fr}.nfl-logo{width:46px;height:46px}.nfl-player-name{font-size:16px}
+ .nfl-market-panel{grid-template-columns:repeat(3,1fr)}.nfl-opportunity{grid-template-columns:repeat(4,1fr)}
+ .nfl-likely{grid-column:1/-1;flex-direction:row;justify-content:space-between;padding:7px 11px}.nfl-likely .pct{font-size:21px}.nfl-action{margin-top:0}
+ .nfl-why{white-space:normal;line-height:1.35}
+ .ml-main-grid{grid-template-columns:1fr 1fr}.ml-center-panel{grid-column:1/-1;grid-row:1;border:0;border-bottom:1px solid #172b40}.ml-team-panel{grid-row:2}.ml-market-panel,.ml-gauge-panel{grid-column:1/-1;border-top:1px solid #172b40;border-right:0}
+ .ml-market-panel{display:grid;grid-template-columns:1fr 1fr;gap:7px}.ml-market-grid{margin-top:0}.ml-battle{grid-template-columns:repeat(4,1fr)}.ml-detail-grid{grid-template-columns:repeat(3,1fr)}
 }
 </style>
 """, unsafe_allow_html=True)
@@ -4554,6 +4665,98 @@ def _build_pbp_context(pbp):
             if drive_points <= 0:
                 tds=float(g.get("touchdown",pd.Series(dtype=float)).sum()) if "touchdown" in g.columns else 0.0
                 drive_points=tds*7.0+fg_made*3.0
+            # Deep possession / field-position / hidden-yards / game-state features.
+            drive_first = pd.DataFrame()
+            if "model_drive" in g.columns:
+                drive_first = g.dropna(subset=["model_drive"]).drop_duplicates(["game_id","model_drive"],keep="first") if "game_id" in g.columns else g.dropna(subset=["model_drive"]).drop_duplicates(["model_drive"],keep="first")
+            start_field=[]
+            if not drive_first.empty and "yardline_100_num" in drive_first.columns:
+                start_field=[100-float(x) for x in pd.to_numeric(drive_first["yardline_100_num"],errors="coerce").dropna().tolist()]
+            avg_start_own=float(np.mean(start_field)) if start_field else None
+            yards_per_drive=float(g.loc[plays_mask,"yards_gained"].sum())/max(1.0,drives) if "yards_gained" in g.columns else None
+            plays_per_drive=float(plays)/max(1.0,drives)
+            rz_trip_count=float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 0.0
+            gl_drives=float(gl["model_drive"].nunique()) if not gl.empty and "model_drive" in gl.columns else float(len(gl))/2.0 if len(gl) else 0.0
+            gl_tds=float(gl.get("touchdown",pd.Series(dtype=float)).sum()) if not gl.empty and "touchdown" in gl.columns else 0.0
+            fg_settle=0.0
+            if rz_trip_count>0 and "model_drive_result" in rz.columns:
+                rz_last=rz.dropna(subset=["model_drive"]).drop_duplicates(["game_id","model_drive"],keep="last") if "game_id" in rz.columns else rz.dropna(subset=["model_drive"]).drop_duplicates(["model_drive"],keep="last")
+                fg_settle=float(rz_last["model_drive_result"].astype(str).str.upper().str.contains("FIELD GOAL|FIELD_GOAL|\bFG\b",regex=True,na=False).sum())
+            pressure_events=(float(g.get("qb_hit",pd.Series(dtype=float)).sum()) if "qb_hit" in g.columns else 0.0)+(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)
+            pressure_allowed_rate=100*pressure_events/max(1.0,pass_att)
+            sack_given_pressure=100*(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)/max(1.0,pressure_events)
+            # Neutral situation = regulation, within one score before Q4 when possible.
+            neutral=g
+            if "score_differential" in g.columns:
+                sd=pd.to_numeric(g["score_differential"],errors="coerce")
+                neutral=g[sd.abs()<=8]
+            if "qtr_num" in neutral.columns:
+                neutral=neutral[neutral["qtr_num"]<=3]
+            neutral_mask=((neutral.get("pass_attempt",0)==1)|(neutral.get("rush_attempt",0)==1)) if not neutral.empty and "pass_attempt" in neutral.columns and "rush_attempt" in neutral.columns else pd.Series(False,index=neutral.index)
+            neutral_pass=float(neutral.loc[neutral_mask,"pass_attempt"].sum()) if len(neutral) and "pass_attempt" in neutral.columns else 0.0
+            neutral_rush=float(neutral.loc[neutral_mask,"rush_attempt"].sum()) if len(neutral) and "rush_attempt" in neutral.columns else 0.0
+            neutral_epa=float(neutral.loc[neutral_mask,"epa"].mean()) if len(neutral) and "epa" in neutral.columns and neutral_mask.any() else None
+            neutral_success=100*float(neutral.loc[neutral_mask,"success"].mean()) if len(neutral) and "success" in neutral.columns and neutral_mask.any() else None
+            # Hidden yards and kicking. nflverse exposes return_yards/punt_distance on many seasons.
+            # Return production belongs to return_team, not posteam (the kicking
+            # team is usually posteam on punt/kickoff plays).
+            return_g=df.iloc[0:0]
+            if "return_team" in df.columns:
+                return_g=df[df["return_team"].astype(str).eq(str(team))]
+            ret_yards=float(return_g.get("return_yards",pd.Series(dtype=float)).sum()) if not return_g.empty and "return_yards" in return_g.columns else 0.0
+            punt_distance=float(g.loc[g.get("punt_attempt",pd.Series(0,index=g.index))==1,"punt_distance"].sum()) if "punt_distance" in g.columns and "punt_attempt" in g.columns else 0.0
+            punt_ret_g=return_g[return_g.get("punt_attempt",pd.Series(0,index=return_g.index))==1] if not return_g.empty and "punt_attempt" in return_g.columns else return_g.iloc[0:0]
+            punt_returns=float((pd.to_numeric(punt_ret_g.get("return_yards",pd.Series(0,index=punt_ret_g.index)),errors="coerce").fillna(0)>0).sum()) if not punt_ret_g.empty else 0.0
+            punt_return_yards=float(punt_ret_g.get("return_yards",pd.Series(dtype=float)).sum()) if not punt_ret_g.empty and "return_yards" in punt_ret_g.columns else 0.0
+            # Net punt is computed from the punting team's plays and therefore uses
+            # opponent return yards on those same punt plays.
+            opponent_punt_return_yards=float(g.loc[g.get("punt_attempt",pd.Series(0,index=g.index))==1,"return_yards"].sum()) if "punt_attempt" in g.columns and "return_yards" in g.columns else 0.0
+            net_punt=(punt_distance-opponent_punt_return_yards)/max(1.0,float(g.get("punt_attempt",pd.Series(dtype=float)).sum())) if "punt_attempt" in g.columns and float(g.get("punt_attempt",pd.Series(dtype=float)).sum())>0 else None
+            # Expected field-goal make rate from distance bands; used only as a special-teams residual.
+            fg_xm=0.0; fg_obs=0.0
+            if "field_goal_attempt" in g.columns:
+                fg_rows=g[g["field_goal_attempt"]==1]
+                if not fg_rows.empty:
+                    fg_obs=fg_made
+                    if "kick_distance" in fg_rows.columns:
+                        for d in pd.to_numeric(fg_rows["kick_distance"],errors="coerce").dropna():
+                            fg_xm += 0.97 if d<=29 else 0.92 if d<=39 else 0.84 if d<=49 else 0.68 if d<=59 else 0.48
+                    else:
+                        fg_xm=0.84*len(fg_rows)
+            fg_oe=(fg_obs-fg_xm)/max(1.0,len(g[g["field_goal_attempt"]==1]) if "field_goal_attempt" in g.columns else 0)
+            # Turnover regression proxy: fumbles are assumed 50/50 recovery; interceptions
+            # are shrunk toward league-average rather than treated as fully repeatable.
+            fumbles=float(g.get("fumble",pd.Series(dtype=float)).sum()) if "fumble" in g.columns else 0.0
+            ints=float(g.get("interception",pd.Series(dtype=float)).sum()) if "interception" in g.columns else 0.0
+            turnover_regression=(0.50*fumbles+0.68*ints)/gp
+            fourth_go=fourth_conv+fourth_fail
+            fourth_punts=float(g.loc[g["down_num"].eq(4),"punt_attempt"].sum()) if "punt_attempt" in g.columns and "down_num" in g.columns else 0.0
+            fourth_fgs=float(g.loc[g["down_num"].eq(4),"field_goal_attempt"].sum()) if "field_goal_attempt" in g.columns and "down_num" in g.columns else 0.0
+            fourth_decisions=fourth_go+fourth_punts+fourth_fgs
+            two_pt=float(pd.to_numeric(g.get("two_point_attempt",pd.Series(dtype=float)),errors="coerce").fillna(0).sum()) if "two_point_attempt" in g.columns else 0.0
+            row.update({
+                "avg_drive_start_own_yardline": None if avg_start_own is None else round(avg_start_own,2),
+                "yards_per_drive": None if yards_per_drive is None else round(yards_per_drive,3),
+                "plays_per_drive": round(plays_per_drive,3),
+                "red_zone_trips_pg": round(rz_trip_count/gp,3),
+                "goal_to_go_td_rate": round(100*gl_tds/max(1.0,gl_drives),2) if gl_drives else 0,
+                "red_zone_fg_settlement_rate": round(100*fg_settle/max(1.0,rz_trip_count),2) if rz_trip_count else 0,
+                "pressure_allowed_rate": round(pressure_allowed_rate,2),
+                "sack_given_pressure_rate": round(sack_given_pressure,2),
+                "neutral_epa_per_play": None if neutral_epa is None else round(neutral_epa,4),
+                "neutral_success_rate": None if neutral_success is None else round(neutral_success,2),
+                "neutral_pass_rate": round(100*neutral_pass/max(1.0,neutral_pass+neutral_rush),2),
+                "return_yards_pg": round(ret_yards/gp,2),
+                "punt_return_yards_pg": round(punt_return_yards/gp,2),
+                "punt_return_attempts_pg": round(punt_returns/gp,2),
+                "net_punt_yards": None if net_punt is None else round(net_punt,2),
+                "fg_over_expected_per_attempt": round(fg_oe,4),
+                "turnover_regression_proxy_pg": round(turnover_regression,3),
+                "fumble_lost_share": round(100*float(g.get("fumble_lost",pd.Series(dtype=float)).sum())/max(1.0,fumbles),2) if fumbles else 0,
+                "explosive_40_rate": round(100*float((pd.to_numeric(g.get("yards_gained",pd.Series(0,index=g.index)),errors="coerce").fillna(0)>=40).mean()),2) if "yards_gained" in g.columns else 0,
+                "fourth_down_go_rate": round(100*fourth_go/max(1.0,fourth_decisions),2) if fourth_decisions else 0,
+                "two_point_attempts_pg": round(two_pt/gp,3),
+            })
             row.update({
                 "first_downs_pg": round(first_downs/gp,2),
                 "first_down_rate": round(100*first_downs/max(1.0,float(plays)),2),
@@ -4620,6 +4823,28 @@ def _build_pbp_context(pbp):
             rz_tds=float(rz.get("touchdown",pd.Series(dtype=float)).sum()) if not rz.empty and "touchdown" in rz.columns else 0.0
             rz_drives=max(1.0,float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 1.0)
             takeaways=(float(g.get("fumble_lost",pd.Series(dtype=float)).sum()) if "fumble_lost" in g.columns else 0.0)+(float(g.get("interception",pd.Series(dtype=float)).sum()) if "interception" in g.columns else 0.0)
+            def_pass_att=float(pass_mask.sum())
+            def_pressure_events=(float(g.get("qb_hit",pd.Series(dtype=float)).sum()) if "qb_hit" in g.columns else 0.0)+(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)
+            def_pressure_rate=100*def_pressure_events/max(1.0,def_pass_att)
+            def_sack_given_pressure=100*(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)/max(1.0,def_pressure_events)
+            def_rz_trips=float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 0.0
+            def_neutral=g
+            if "score_differential" in g.columns:
+                sd=pd.to_numeric(g["score_differential"],errors="coerce")
+                def_neutral=g[sd.abs()<=8]
+            if "qtr_num" in def_neutral.columns:
+                def_neutral=def_neutral[def_neutral["qtr_num"]<=3]
+            dn_mask=((def_neutral.get("pass_attempt",0)==1)|(def_neutral.get("rush_attempt",0)==1)) if not def_neutral.empty and "pass_attempt" in def_neutral.columns and "rush_attempt" in def_neutral.columns else pd.Series(False,index=def_neutral.index)
+            def_neutral_epa=float(def_neutral.loc[dn_mask,"epa"].mean()) if len(def_neutral) and "epa" in def_neutral.columns and dn_mask.any() else None
+            def_neutral_success=100*float(def_neutral.loc[dn_mask,"success"].mean()) if len(def_neutral) and "success" in def_neutral.columns and dn_mask.any() else None
+            row.update({
+                "def_pressure_rate":round(def_pressure_rate,2),
+                "def_sack_given_pressure_rate":round(def_sack_given_pressure,2),
+                "def_red_zone_trips_allowed_pg":round(def_rz_trips/gp,3),
+                "def_neutral_epa_allowed":None if def_neutral_epa is None else round(def_neutral_epa,4),
+                "def_neutral_success_allowed_rate":None if def_neutral_success is None else round(def_neutral_success,2),
+                "def_explosive_40_allowed_rate":round(100*float((pd.to_numeric(g.get("yards_gained",pd.Series(0,index=g.index)),errors="coerce").fillna(0)>=40).mean()),2) if "yards_gained" in g.columns else 0,
+            })
             row.update({
                 "def_first_downs_allowed_pg":round(first_allowed/gp,2),
                 "def_first_down_rate_allowed":round(100*first_allowed/max(1.0,float(len(g))),2),
@@ -6698,6 +6923,31 @@ def _moneyline_team_profile(ctx):
     fg_pct=_ml_pct(_ml_num(ctx,"field_goal_pct","league__fg_pct"))
     punts=_ml_num(ctx,"punts_pg")
     special_epa=_ml_num(ctx,"league__special_teams_epa","league__st_epa")
+    # v7.47 deep football modules.
+    yards_drive=_ml_num(ctx,"yards_per_drive")
+    plays_drive=_ml_num(ctx,"plays_per_drive")
+    rz_trips=_ml_num(ctx,"red_zone_trips_pg")
+    avg_start=_ml_num(ctx,"avg_drive_start_own_yardline")
+    neutral_epa=_ml_num(ctx,"neutral_epa_per_play")
+    neutral_success=_ml_pct(_ml_num(ctx,"neutral_success_rate"))
+    neutral_pass=_ml_pct(_ml_num(ctx,"neutral_pass_rate"))
+    pressure_allowed=_ml_pct(_ml_num(ctx,"pressure_allowed_rate"))
+    sack_given_pressure=_ml_pct(_ml_num(ctx,"sack_given_pressure_rate"))
+    return_yards=_ml_num(ctx,"return_yards_pg")
+    punt_return_yards=_ml_num(ctx,"punt_return_yards_pg")
+    net_punt=_ml_num(ctx,"net_punt_yards")
+    fg_oe=_ml_num(ctx,"fg_over_expected_per_attempt")
+    turnover_reg=_ml_num(ctx,"turnover_regression_proxy_pg")
+    fumble_lost_share=_ml_pct(_ml_num(ctx,"fumble_lost_share"))
+    explosive_40=_ml_pct(_ml_num(ctx,"explosive_40_rate"))
+    def_pressure_real=_ml_pct(_ml_num(ctx,"def_pressure_rate"))
+    def_sack_given_pressure=_ml_pct(_ml_num(ctx,"def_sack_given_pressure_rate"))
+    def_neutral_epa=_ml_num(ctx,"def_neutral_epa_allowed")
+    def_neutral_success=_ml_pct(_ml_num(ctx,"def_neutral_success_allowed_rate"))
+    def_explosive_40=_ml_pct(_ml_num(ctx,"def_explosive_40_allowed_rate"))
+    fourth_go_rate=_ml_pct(_ml_num(ctx,"fourth_down_go_rate"))
+    two_point_attempts=_ml_num(ctx,"two_point_attempts_pg")
+    ol_continuity=_ml_pct(_ml_num(ctx,"ol_returning_starters_pct"))
 
     families={
         "offense": _ml_mean([
@@ -6708,11 +6958,13 @@ def _moneyline_team_profile(ctx):
         "situational": _ml_mean([
             _ml_center(third,39.5,7.0), _ml_center(fourth,53.0,12.0),
             _ml_center(rz,56.0,10.0), _ml_center(three_out,35.0,8.0,invert=True),
+            _ml_center(fourth_go_rate,18.0,10.0),
         ]),
         "explosive": _ml_mean([_ml_center(explosive_pass,7.0,2.0),_ml_center(explosive_rush,6.5,2.0)]),
         "trench": _ml_mean([
             pass_pro_rank,run_block_rank,savant_pb,savant_rb,
             _ml_center(sacks_allowed,2.4,0.8,invert=True),_ml_center(hits_allowed,5.0,1.8,invert=True),
+            _ml_center(ol_continuity,70.0,20.0),
         ]),
         "quarterback": _ml_mean([qb_rank,qb_epa,qb_cpoe,qb_sack_rate]),
         "defense": _ml_mean([
@@ -6737,8 +6989,46 @@ def _moneyline_team_profile(ctx):
         ]),
         "special_teams": _ml_mean([
             _ml_center(fg_pct,84.0,7.0),_ml_center(punts,4.0,1.2,invert=True),_ml_center(special_epa,0.0,0.08),
+            _ml_center(net_punt,42.0,4.0),_ml_center(fg_oe,0.0,0.10),
         ]),
+        "possessions": _ml_mean([
+            _ml_center(yards_drive,31.0,5.5),_ml_center(plays_drive,5.8,0.8),
+            _ml_center(rz_trips,3.2,0.8),_ml_center(avg_start,28.0,4.0),
+        ]),
+        "game_state": _ml_mean([
+            _ml_center(neutral_epa,0.0,0.10),_ml_center(neutral_success,44.5,5.5),
+            _ml_center(neutral_pass,56.0,8.0),
+        ]),
+        "hidden_yards": _ml_mean([
+            _ml_center(return_yards,45.0,25.0),_ml_center(punt_return_yards,15.0,12.0),
+            _ml_center(net_punt,42.0,4.0),_ml_center(fg_oe,0.0,0.10),
+        ]),
+        "pressure_response": _ml_mean([
+            _ml_center(pressure_allowed,28.0,6.0,invert=True),
+            _ml_center(sack_given_pressure,22.0,7.0,invert=True),
+            _ml_center(def_pressure_real,28.0,6.0),
+            _ml_center(def_sack_given_pressure,22.0,7.0),
+        ]),
+        "turnover_quality": _ml_mean([
+            _ml_center(turnover_reg,1.35,0.55,invert=True),
+            _ml_center(fumble_lost_share,50.0,18.0,invert=True),
+        ]),
+        "neutral_defense": _ml_mean([
+            _ml_center(def_neutral_epa,0.0,0.10,invert=True),
+            _ml_center(def_neutral_success,44.5,5.5,invert=True),
+            _ml_center(def_explosive_40,1.5,0.8,invert=True),
+        ]),
+        "coaching": _ml_mean([
+            _ml_center(fourth_go_rate,18.0,10.0),_ml_center(two_point_attempts,0.12,0.12),
+            _ml_center(_ml_pct(_ml_num(ctx,"no_huddle_rate","league__no_huddle_rate")),8.0,6.0),
+        ]),
+        "ol_continuity": _ml_mean([_ml_center(ol_continuity,70.0,20.0)]),
     }
+    # Strength-of-schedule is a small independent family, not another offense multiplier.
+    sos_rank=_ml_rank_score(ctx,"sos_rank","strength_of_schedule_rank","schedule_strength_rank")
+    sos_value=_ml_center(_ml_num(ctx,"strength_of_schedule","sos","schedule_strength"),0.0,0.12)
+    opp_quality=_ml_center(_ml_num(ctx,"opponent_avg_epa","avg_opponent_epa"),0.0,0.08)
+    families["schedule"]=_ml_mean([sos_rank,sos_value,opp_quality],0.0)
     # Cap every family.  This is the primary anti-double-counting control.
     families={k:float(clamp(v,-1.25,1.25)) for k,v in families.items()}
     pace=_ml_num(ctx,"current_plays_pg","pbp_plays_pg","plays_pg",default=63.0)
@@ -6746,8 +7036,16 @@ def _moneyline_team_profile(ctx):
     no_huddle=_ml_pct(_ml_num(ctx,"no_huddle_rate","league__no_huddle_rate"))
     coverage=sum(1 for v in [off_epa,off_success,first_rate,third,rz,def_epa,def_success,turnovers,penalties,fg_pct] if v is not None)
     qb_coverage=sum(1 for v in [qb_rank,qb_epa,qb_cpoe,qb_sack_rate] if v is not None)
-    trench_coverage=sum(1 for v in [pass_pro_rank,run_block_rank,savant_pb,savant_rb,sacks_allowed,hits_allowed] if v is not None)
-    return {"families":families,"pace":pace,"drives":drives,"no_huddle":no_huddle,"coverage":coverage,"qb_coverage":qb_coverage,"trench_coverage":trench_coverage,"off_epa":off_epa}
+    trench_coverage=sum(1 for v in [pass_pro_rank,run_block_rank,savant_pb,savant_rb,sacks_allowed,hits_allowed,pressure_allowed,sack_given_pressure] if v is not None)
+    module_coverage={
+        "possessions":sum(1 for v in [yards_drive,plays_drive,rz_trips,avg_start,third,fourth] if v is not None),
+        "trenches":sum(1 for v in [pass_pro_rank,run_block_rank,pressure_allowed,sack_given_pressure,def_pressure_real,def_sack_given_pressure] if v is not None),
+        "hidden_yards":sum(1 for v in [return_yards,punt_return_yards,net_punt,fg_pct,fg_oe,penalties] if v is not None),
+        "game_state":sum(1 for v in [neutral_epa,neutral_success,neutral_pass,def_neutral_epa,def_neutral_success] if v is not None),
+        "skill_role":sum(1 for v in [qb_rank,qb_epa,qb_cpoe,explosive_pass,explosive_rush,explosive_40] if v is not None),
+    }
+    return {"families":families,"pace":pace,"drives":drives,"no_huddle":no_huddle,"coverage":coverage,"qb_coverage":qb_coverage,
+            "trench_coverage":trench_coverage,"module_coverage":module_coverage,"off_epa":off_epa}
 
 
 def _moneyline_injury_context(team):
@@ -6869,41 +7167,61 @@ def _preseason_moneyline_rotation(team, game_rows):
 
 
 
+
 def _moneyline_regular_readiness(away_profile,home_profile,away_inj,home_inj,env,away_ctx,home_ctx,market_odds):
-    """Data-readiness audit for REGULAR season Moneyline only."""
+    """REGULAR-season readiness audit with required football data modules."""
     rows=[]
     def component(name,score,weight,detail):
         rows.append({"name":name,"score":round(float(clamp(score,0,1))*100,1),"weight":weight,"detail":detail})
     core=min(1.0,(away_profile.get("coverage",0)+home_profile.get("coverage",0))/16.0)
     qb=min(1.0,(away_profile.get("qb_coverage",0)+home_profile.get("qb_coverage",0))/4.0)
-    trench=min(1.0,(away_profile.get("trench_coverage",0)+home_profile.get("trench_coverage",0))/6.0)
+    trench=min(1.0,(away_profile.get("trench_coverage",0)+home_profile.get("trench_coverage",0))/10.0)
+    am=away_profile.get("module_coverage",{}) or {}; hm=home_profile.get("module_coverage",{}) or {}
+    def mod_score(key,denom):
+        return min(1.0,(safe_float(am.get(key),0)+safe_float(hm.get(key),0))/float(denom))
+    possessions=mod_score("possessions",8)
+    hidden=mod_score("hidden_yards",8)
+    game_state=mod_score("game_state",7)
+    skill_role=mod_score("skill_role",8)
     current=float(any(src=="current_team_context" for src in (away_ctx.get("moneyline_context_sources") or [])))
-    current+=float(any(src=="current_team_context" for src in (home_ctx.get("moneyline_context_sources") or [])))
-    current/=2.0
-    injuries=0.65+0.175*bool(away_inj.get("notes") or away_inj.get("final_inactives_confirmed"))+0.175*bool(home_inj.get("notes") or home_inj.get("final_inactives_confirmed"))
+    current+=float(any(src=="current_team_context" for src in (home_ctx.get("moneyline_context_sources") or []))); current/=2.0
+    # Current PBP is the gold-standard signal once games exist.
+    current_pbp=(float(bool(away_ctx.get("current_pbp_rows") or away_ctx.get("source","").startswith("nflverse_current_pbp")))+
+                 float(bool(home_ctx.get("current_pbp_rows") or home_ctx.get("source","").startswith("nflverse_current_pbp"))))/2.0
+    injuries=0.45+0.275*bool(away_inj.get("notes") or away_inj.get("final_inactives_confirmed"))+0.275*bool(home_inj.get("notes") or home_inj.get("final_inactives_confirmed"))
     finals=(float(bool(away_inj.get("final_inactives_confirmed")))+float(bool(home_inj.get("final_inactives_confirmed"))))/2.0
     weather=1.0 if env.get("weather_pass_factor") is not None else 0.6
     travel=1.0 if isinstance(env.get("travel"),dict) else 0.6
     market=1.0 if len(market_odds)>=2 else 0.65
-    component("Core offense/defense",core,0.24,f"coverage {away_profile.get('coverage',0)} + {home_profile.get('coverage',0)}")
-    component("QB context",qb,0.14,f"QB fields {away_profile.get('qb_coverage',0)} + {home_profile.get('qb_coverage',0)}")
-    component("OL/DL trenches",trench,0.14,f"trench fields {away_profile.get('trench_coverage',0)} + {home_profile.get('trench_coverage',0)}")
-    component("Current-season team context",current,0.14,"weekly/current context overrides history")
-    component("Injury availability",injuries,0.12,"injury report + defensive starter context")
-    component("Final inactives",finals,0.08,"confirmed team inactive lists")
-    component("Weather/stadium",weather,0.06,str(env.get("weather_risk") or "LOW"))
-    component("Travel/rest",travel,0.04,str((env.get("travel") or {}).get("label") or "LOW"))
-    component("Live market audit",market,0.04,"two-sided price audit" if len(market_odds)>=2 else "model-only")
+    component("Core offense/defense",core,0.14,f"coverage {away_profile.get('coverage',0)} + {home_profile.get('coverage',0)}")
+    component("Possession/drive module",possessions,0.12,f"fields {am.get('possessions',0)} + {hm.get('possessions',0)}")
+    component("QB / skill-role",min(1.0,0.55*qb+0.45*skill_role),0.12,f"QB {away_profile.get('qb_coverage',0)}+{home_profile.get('qb_coverage',0)}; skill {am.get('skill_role',0)}+{hm.get('skill_role',0)}")
+    component("OL/DL + pressure",trench,0.12,f"trench fields {away_profile.get('trench_coverage',0)} + {home_profile.get('trench_coverage',0)}")
+    component("Hidden yards / special teams",hidden,0.08,f"fields {am.get('hidden_yards',0)} + {hm.get('hidden_yards',0)}")
+    component("Neutral game-state",game_state,0.08,f"fields {am.get('game_state',0)} + {hm.get('game_state',0)}")
+    component("Current-season context",max(current,current_pbp),0.10,"weekly + current PBP override prior when real")
+    component("Injury availability",injuries,0.08,"injury report + defensive starter context")
+    component("Final inactives",finals,0.06,"confirmed team inactive lists")
+    component("Weather/stadium",weather,0.04,str(env.get("weather_risk") or "LOW"))
+    component("Travel/rest",travel,0.03,str((env.get("travel") or {}).get("label") or "LOW"))
+    component("Live market audit",market,0.03,"two-sided price audit" if len(market_odds)>=2 else "model-only")
     total=sum((r["score"]/100.0)*r["weight"] for r in rows)/sum(r["weight"] for r in rows)
     score=int(round(total*100))
-    label="ELITE" if score>=90 else "STRONG" if score>=82 else "USABLE" if score>=72 else "THIN"
-    return {"score":score,"label":label,"components":rows,"official_ready":score>=72}
+    label="ELITE" if score>=92 else "STRONG" if score>=84 else "USABLE" if score>=72 else "THIN"
+    module_floor=min(possessions,trench,hidden,game_state)
+    tracking=(score>=72 and module_floor>=0.35)
+    official=(score>=82 and module_floor>=0.50)
+    return {"score":score,"label":label,"components":rows,"tracking_ready":tracking,"official_ready":official,
+            "module_floor":round(module_floor,3),"module_coverage":{"possessions":possessions,"trenches":trench,"hidden_yards":hidden,"game_state":game_state,"skill_role":skill_role}}
 
 def _moneyline_possession_probs(own,opp,env_side=0.0,injury_off=0.0,injury_def_opp=0.0,preseason_rotation=0.0,weather_pass_factor=1.0):
     f=own["families"]; d=opp["families"]
-    offense=0.50*f["offense"]+0.17*f["situational"]+0.10*f["explosive"]+0.11*f["trench"]+0.12*f["quarterback"]
-    defense_opp=0.60*d["defense"]+0.16*d["pass_rush"]+0.12*d["def_explosive"]+0.12*d["takeaways"]
-    field=0.08*f["special_teams"]+0.06*f["discipline"]
+    offense=(0.34*f["offense"]+0.12*f["situational"]+0.06*f["explosive"]+0.08*f["trench"]+
+             0.10*f["quarterback"]+0.08*f["possessions"]+0.06*f["game_state"]+
+             0.04*f["hidden_yards"]+0.04*f["pressure_response"]+0.03*f["turnover_quality"]+0.05*f.get("schedule",0.0))
+    defense_opp=(0.45*d["defense"]+0.12*d["pass_rush"]+0.09*d["def_explosive"]+0.07*d["takeaways"]+
+                 0.11*d["neutral_defense"]+0.09*d["pressure_response"]+0.07*d["turnover_quality"])
+    field=0.05*f["special_teams"]+0.05*f["hidden_yards"]+0.05*f["discipline"]
     availability=-0.70*injury_off+0.38*injury_def_opp
     weather_adj=(safe_float(weather_pass_factor,1.0)-1.0)*1.8
     strength=offense-defense_opp+field+env_side+availability+preseason_rotation+weather_adj
@@ -6921,8 +7239,11 @@ def _moneyline_possession_probs(own,opp,env_side=0.0,injury_off=0.0,injury_def_o
 def _moneyline_team_rating(ctx):
     profile=_moneyline_team_profile(ctx)
     fam=profile["families"]
-    offense=0.47*fam["offense"]+0.18*fam["situational"]+0.10*fam["explosive"]+0.12*fam["trench"]+0.13*fam["quarterback"]
-    defense=0.60*fam["defense"]+0.18*fam["pass_rush"]+0.12*fam["def_explosive"]+0.10*fam["takeaways"]
+    offense=(0.34*fam["offense"]+0.14*fam["situational"]+0.07*fam["explosive"]+0.10*fam["trench"]+
+             0.12*fam["quarterback"]+0.09*fam["possessions"]+0.06*fam["game_state"]+
+             0.04*fam["hidden_yards"]+0.04*fam["pressure_response"])
+    defense=(0.46*fam["defense"]+0.13*fam["pass_rush"]+0.10*fam["def_explosive"]+0.07*fam["takeaways"]+
+             0.10*fam["neutral_defense"]+0.08*fam["pressure_response"]+0.06*fam["turnover_quality"])
     return {"ready":profile["coverage"]>=4,"offense":offense,"defense":defense,"pace":profile["pace"],"inputs":profile["coverage"],"labels":list(fam),"off_epa":profile.get("off_epa"),"profile":profile}
 
 
@@ -6966,6 +7287,99 @@ def _moneyline_games_from_rows(moneyline_rows, prop_rows):
                 if row.get(source_key) not in [None,""]:
                     game[target]=row.get(source_key); break
     return list(games.values())
+
+
+def _moneyline_market_calibration(football_prob, market_prob, readiness_score, phase="REGULAR"):
+    """Second probability layer. Never changes the football side; only calibrates confidence."""
+    p=clamp(safe_float(football_prob,0.5) or 0.5,0.01,0.99)
+    m=safe_float(market_prob)
+    if phase!="REGULAR" or m is None:
+        return p,{"market_weight":0.0,"note":"football-only probability"}
+    readiness=clamp((safe_float(readiness_score,72) or 72)/100.0,0.0,1.0)
+    # Strong data earns more independence from market; thin data gets more shrinkage.
+    market_weight=clamp(0.30-(readiness-0.70)*0.45,0.08,0.30)
+    calibrated=p*(1-market_weight)+m*market_weight
+    # Preserve football side. Calibration can reduce conviction to near coin flip, not reverse it.
+    if p>=0.5: calibrated=max(0.5001,calibrated)
+    else: calibrated=min(0.4999,calibrated)
+    return float(clamp(calibrated,0.01,0.99)),{"market_weight":round(market_weight,3),"note":"market used for calibration only; football side preserved"}
+
+
+def _moneyline_clv_update(matchup, implied, phase="REGULAR"):
+    data=load_json(MONEYLINE_CLV_FILE,{})
+    if not isinstance(data,dict): data={}
+    key=f"{phase}|{matchup}"
+    rec=data.setdefault(key,{"matchup":matchup,"phase":phase,"history":[]})
+    stamp=now_iso()
+    clean={k:round(float(v),5) for k,v in (implied or {}).items() if safe_float(v) is not None}
+    if clean:
+        hist=rec.setdefault("history",[])
+        if not hist or hist[-1].get("probabilities")!=clean:
+            hist.append({"at":stamp,"probabilities":clean})
+            rec["history"]=hist[-80:]
+            rec["updated_at"]=stamp
+            save_json(MONEYLINE_CLV_FILE,data)
+    hist=rec.get("history",[])
+    opening=hist[0].get("probabilities",{}) if hist else {}
+    latest=hist[-1].get("probabilities",{}) if hist else clean
+    return {"opening":opening,"latest":latest,"snapshots":len(hist)}
+
+
+def save_moneyline_snapshot(cards, label="BEFORE"):
+    rows=load_json(MONEYLINE_SNAPSHOT_FILE,[])
+    if not isinstance(rows,list): rows=[]
+    stamp=now_iso(); slate_id=f"NFL_ML_{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    saved=[]
+    for card in cards or []:
+        if card.get("phase")!="REGULAR": continue
+        r=_clean_snapshot_row(card); r.update({"saved_at":stamp,"snapshot_type":label,"slate_id":slate_id})
+        rows.append(r); saved.append(r)
+    save_json(MONEYLINE_SNAPSHOT_FILE,rows[-4000:])
+    return len(saved),slate_id
+
+
+def grade_moneyline_results_csv(uploaded_file):
+    """Grade saved REGULAR moneylines from away/home/away_score/home_score CSV."""
+    if uploaded_file is None: return []
+    try:
+        raw=uploaded_file.read(); uploaded_file.seek(0); df=pd.read_csv(io.BytesIO(raw))
+    except Exception as exc:
+        request_log("ML_GRADE","CSV_ERROR",str(exc)[:180]); return []
+    snapshots=load_json(MONEYLINE_SNAPSHOT_FILE,[]); results=load_json(MONEYLINE_RESULT_LOG,[])
+    if not isinstance(results,list): results=[]
+    graded=[]
+    for _,rr in df.iterrows():
+        away=_normalize_nfl_team(rr.get("away") or rr.get("Away")); home=_normalize_nfl_team(rr.get("home") or rr.get("Home"))
+        away_score=safe_float(rr.get("away_score"),safe_float(rr.get("Away Score"))); home_score=safe_float(rr.get("home_score"),safe_float(rr.get("Home Score")))
+        if not away or not home or away_score is None or home_score is None: continue
+        matchup=f"{away} @ {home}"
+        candidates=[s for s in snapshots if s.get("phase")=="REGULAR" and s.get("matchup")==matchup]
+        if not candidates: continue
+        s=sorted(candidates,key=lambda x:str(x.get("saved_at") or ""))[-1]
+        winner=home if home_score>away_score else away if away_score>home_score else "TIE"
+        model=s.get("favorite"); win=(model==winner) if winner!="TIE" else None
+        p=safe_float(s.get("calibrated_favorite_prob"),safe_float(s.get("favorite_prob"),0.5)) or 0.5
+        y=1.0 if win else 0.0 if win is False else 0.5
+        brier=(p-y)**2; logloss=-(y*math.log(max(p,1e-9))+(1-y)*math.log(max(1-p,1e-9)))
+        margin_actual=home_score-away_score; margin_proj=(safe_float(s.get("home_projection"),0) or 0)-(safe_float(s.get("away_projection"),0) or 0)
+        clv=load_json(MONEYLINE_CLV_FILE,{}).get(f"REGULAR|{matchup}",{}) if isinstance(load_json(MONEYLINE_CLV_FILE,{}),dict) else {}
+        hist=clv.get("history",[]) if isinstance(clv,dict) else []
+        close_probs=hist[-1].get("probabilities",{}) if hist else {}
+        close_model_prob=safe_float(close_probs.get(model))
+        row={**_clean_snapshot_row(s),"graded_at":now_iso(),"actual_away_score":away_score,"actual_home_score":home_score,"actual_winner":winner,"model_win":win,"brier":round(brier,5),"log_loss":round(logloss,5),"actual_margin":round(margin_actual,2),"projected_margin":round(margin_proj,2),"margin_error":round(margin_actual-margin_proj,2),"closing_market_prob":close_model_prob,"clv_probability":None if close_model_prob is None else round(p-close_model_prob,5)}
+        results.append(row); graded.append(row)
+    save_json(MONEYLINE_RESULT_LOG,results[-5000:])
+    return graded
+
+
+def moneyline_calibration_summary():
+    rows=[r for r in load_json(MONEYLINE_RESULT_LOG,[]) if r.get("phase")=="REGULAR" and r.get("model_win") is not None]
+    if not rows: return {}
+    wins=[1.0 if r.get("model_win") else 0.0 for r in rows]
+    b=[safe_float(r.get("brier")) for r in rows if safe_float(r.get("brier")) is not None]
+    ll=[safe_float(r.get("log_loss")) for r in rows if safe_float(r.get("log_loss")) is not None]
+    mae=[abs(safe_float(r.get("margin_error"),0) or 0) for r in rows]
+    return {"games":len(rows),"win_rate":float(np.mean(wins)),"brier":float(np.mean(b)) if b else None,"log_loss":float(np.mean(ll)) if ll else None,"margin_mae":float(np.mean(mae)) if mae else None}
 
 
 def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=18000, rng_seed=7717):
@@ -7072,16 +7486,22 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
         if phase=="PRESEASON":
             shrink=clamp(0.52+0.36*rotation_conf,0.52,0.86)
             home_wins=0.5+(home_wins-0.5)*shrink; away_wins=1.0-home_wins
+        football_home_wins=float(home_wins); football_away_wins=float(away_wins)
+        readiness_score=(regular_readiness or {}).get("score",72) if phase=="REGULAR" else 70
+        calibrated_home,home_cal_meta=_moneyline_market_calibration(football_home_wins,implied.get(home),readiness_score,phase)
+        calibrated_away=1.0-calibrated_home
+        clv_state=_moneyline_clv_update(game["matchup"],implied,phase)
         totals=away_scores+home_scores; margins=home_scores-away_scores
         away_mean=float(np.mean(away_scores)); home_mean=float(np.mean(home_scores)); model_total=float(np.mean(totals)); blowout=float(np.mean(np.abs(margins)>=14))
-        favorite=home if home_wins>=away_wins else away; favorite_prob=max(home_wins,away_wins)
+        favorite=home if football_home_wins>=football_away_wins else away; favorite_prob=max(football_home_wins,football_away_wins)
+        calibrated_favorite_prob=calibrated_home if favorite==home else calibrated_away
         total_pick="NO MARKET TOTAL"; total_prob=None; total_edge=None; total_over_prob=None
         if market_total is not None:
             over_prob=float(np.mean(totals>market_total)+0.5*np.mean(totals==market_total)); total_over_prob=over_prob
             total_pick="OVER" if model_total>market_total else "UNDER"; total_prob=over_prob if total_pick=="OVER" else 1-over_prob; total_edge=model_total-market_total
             if abs(total_edge)<1.5 or total_prob<0.56: total_pick="PASS"
 
-        fam_weights={"offense":0.22,"quarterback":0.12,"situational":0.12,"explosive":0.07,"trench":0.11,"defense":0.17,"pass_rush":0.07,"def_explosive":0.04,"ball_security":0.04,"takeaways":0.02,"discipline":0.01,"special_teams":0.01}
+        fam_weights={"offense":0.20,"quarterback":0.12,"situational":0.11,"explosive":0.06,"trench":0.11,"schedule":0.05,"defense":0.17,"pass_rush":0.07,"def_explosive":0.04,"ball_security":0.03,"takeaways":0.02,"discipline":0.01,"special_teams":0.01}
         contributions={}
         for k,w in fam_weights.items():
             # positive = home advantage
@@ -7108,18 +7528,24 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
                 reliability="MED"
         if phase=="REGULAR" and regular_readiness and not regular_readiness.get("official_ready"):
             reliability="LOW"
-        base.update({"blocked":False,"status":(("REGULAR READY" if regular_readiness and regular_readiness.get("official_ready") else "REGULAR DATA LIMITED") if phase=="REGULAR" else "PRESEASON MODEL READY"),"away_projection":round(away_mean,1),"home_projection":round(home_mean,1),"away_win_prob":round(away_wins,4),"home_win_prob":round(home_wins,4),
-                     "away_model_odds":_probability_to_american(away_wins),"home_model_odds":_probability_to_american(home_wins),"favorite":favorite,"favorite_prob":round(favorite_prob,4),
+        base.update({"blocked":False,"status":(("REGULAR READY" if regular_readiness and regular_readiness.get("official_ready") else "REGULAR DATA LIMITED") if phase=="REGULAR" else "PRESEASON MODEL READY"),"away_projection":round(away_mean,1),"home_projection":round(home_mean,1),"away_win_prob":round(football_away_wins,4),"home_win_prob":round(football_home_wins,4),
+                     "football_away_win_prob":round(football_away_wins,4),"football_home_win_prob":round(football_home_wins,4),
+                     "calibrated_away_win_prob":round(calibrated_away,4),"calibrated_home_win_prob":round(calibrated_home,4),
+                     "away_model_odds":_probability_to_american(calibrated_away),"home_model_odds":_probability_to_american(calibrated_home),"favorite":favorite,"favorite_prob":round(favorite_prob,4),"calibrated_favorite_prob":round(calibrated_favorite_prob,4),"probability_calibration":home_cal_meta,
                      "model_total":round(model_total,1),"total_pick":total_pick,"total_prob":None if total_prob is None else round(total_prob,4),"total_over_prob":None if total_over_prob is None else round(total_over_prob,4),
                      "total_edge":None if total_edge is None else round(total_edge,1),"projected_plays":round(projected_plays,1),"projected_drives":round(drives,1),
                      "away_offense":round(away_rating["offense"],3),"home_offense":round(home_rating["offense"],3),"away_off_epa":away_rating.get("off_epa"),"home_off_epa":home_rating.get("off_epa"),
                      "blowout_prob":round(blowout,4),"data_score":data_score,"reliability":reliability,"sim_samples":sim_n,"weather_risk":env.get("weather_risk") or "LOW",
                      "expected_turnovers_away":round(float(np.mean(away_tos)),2),"expected_turnovers_home":round(float(np.mean(home_tos)),2),
                      "away_possession_probs":{k:round(v,4) for k,v in away_probs.items() if k!="strength"},"home_possession_probs":{k:round(v,4) for k,v in home_probs.items() if k!="strength"},
-                     "football_contributions":contributions,"top_factors":top[:6],"market_model_edge":None if market_edge is None else round(market_edge,4),"market_disagreement":market_disagreement,
+                     "football_contributions":contributions,"top_factors":top[:6],"market_model_edge":None if market_edge is None else round(market_edge,4),"calibrated_market_edge":None if favorite not in implied else round(calibrated_favorite_prob-implied[favorite],4),"market_disagreement":market_disagreement,"moneyline_clv":clv_state,
                      "away_injuries":away_inj,"home_injuries":home_inj,"away_preseason_rotation":away_rot,"home_preseason_rotation":home_rot,
+                     "away_family_scores":{k:round(v,3) for k,v in (away_profile.get("families") or {}).items()},
+                     "home_family_scores":{k:round(v,3) for k,v in (home_profile.get("families") or {}).items()},
+                     "away_module_coverage":dict(away_profile.get("module_coverage") or {}),"home_module_coverage":dict(home_profile.get("module_coverage") or {}),
+                     "away_profile_drives":round(safe_float(away_profile.get("drives"),10.5) or 10.5,2),"home_profile_drives":round(safe_float(home_profile.get("drives"),10.5) or 10.5,2),
                      "regular_season_readiness":regular_readiness,"official_moneyline_ready":bool(phase=="PRESEASON" or (regular_readiness and regular_readiness.get("official_ready") and reliability!="LOW")),
-                     "game_environment":env,"model_note":"Possession simulation: current-priority offense/defense, QB quality, first downs, situational downs, red zone, OL/DL trenches, regressed turnovers/fumbles, penalties, special teams, injuries/final inactives, weather/stadium and travel/rest. Market is audit-only and can downgrade confidence but never flip the football side."})
+                     "game_environment":env,"model_note":"Possession simulation: current-priority offense/defense, QB quality, first downs, situational downs, red zone, OL/DL trenches, regressed turnovers/fumbles, penalties, special teams, injuries/final inactives, weather/stadium and travel/rest. Market is calibration/audit-only and can reduce conviction but never flip the football side. SOS-adjusted strength, current opponent defense and dual football/calibrated probabilities are active."})
         cards.append(base)
     return sorted(cards,key=lambda card:(str(card.get("scheduled_at") or "9999"),card.get("matchup","")))
 
@@ -7200,6 +7626,9 @@ def merge_nfl_context(row):
     if not current_team_ctx and team in current_bank.get("teams",{}):
         current_team_ctx=current_bank["teams"].get(team,{})
     opp_ctx=teams.get(opp,{}) if isinstance(teams.get(opp,{}),dict) else {}
+    current_opp_ctx=current_teams.get(opp,{}) if isinstance(current_teams.get(opp,{}),dict) else {}
+    if not current_opp_ctx and opp in current_bank.get("teams",{}):
+        current_opp_ctx=current_bank["teams"].get(opp,{})
     # Team offense / pace / Vegas / coach-style context.  These are NFL-specific
     # equivalents of the MLB environment and lineup context layers.
     team_keys = [
@@ -7211,7 +7640,13 @@ def merge_nfl_context(row):
         "ot_rate","team_identity","coach_pace_proxy","seconds_per_play","no_huddle_rate",
         "offense_rank","off_pass_rank","off_run_rank","off_scoring_rank","off_pace_rank",
         "off_success_rank","off_epa_rank","off_explosive_pass_rank","off_explosive_run_rank",
-        "ol_pass_pro_rank","ol_run_block_rank","wr_unit_rank","rb_unit_rank","qb_unit_rank"
+        "ol_pass_pro_rank","ol_run_block_rank","wr_unit_rank","rb_unit_rank","qb_unit_rank",
+        "drives_pg","points_per_drive","yards_per_drive","plays_per_drive","avg_drive_start_own_yardline",
+        "red_zone_trips_pg","goal_to_go_td_rate","red_zone_fg_settlement_rate","pressure_allowed_rate",
+        "sack_given_pressure_rate","neutral_epa_per_play","neutral_success_rate","neutral_pass_rate",
+        "return_yards_pg","punt_return_yards_pg","punt_return_attempts_pg","net_punt_yards",
+        "fg_over_expected_per_attempt","turnover_regression_proxy_pg","fumble_lost_share","explosive_40_rate",
+        "ol_returning_starters_pct","ol_returning_core_count","ol_prior_core_count"
     ]
     for k in team_keys:
         if not _usable_context_value(row.get(k)) and _usable_context_value(team_ctx.get(k)):
@@ -7241,7 +7676,11 @@ def merge_nfl_context(row):
         "def_epa_allowed_per_play","def_success_allowed_rate","def_sacks_pg",
         "def_qb_hits_pg","def_fumbles_forced_pg","explosive_pass_allowed_rate",
         "explosive_rush_allowed_rate","def_explosive_pass_rank","def_explosive_run_rank",
-        "def_pressure_rank","def_run_stop_rank"
+        "def_pressure_rank","def_run_stop_rank","def_pressure_rate","def_sack_given_pressure_rate",
+        "def_red_zone_trips_allowed_pg","def_neutral_epa_allowed","def_neutral_success_allowed_rate",
+        "def_explosive_40_allowed_rate","def_first_downs_allowed_pg","def_first_down_rate_allowed",
+        "def_third_down_allowed_rate","def_fourth_down_allowed_rate","def_red_zone_td_allowed_rate",
+        "def_takeaways_pg","def_yards_per_play_allowed"
     ]
     for k in opp_keys:
         if _usable_context_value(opp_ctx.get(k)):
@@ -7249,6 +7688,13 @@ def merge_nfl_context(row):
                 row[k]=opp_ctx.get(k)
             if not _usable_context_value(row.get("opp_"+k)):
                 row["opp_"+k]=opp_ctx.get(k)
+    # Current-season opponent defense must be allowed to replace the historical prior.
+    # This fixes the asymmetry where the offense became current while its matchup stayed stale.
+    for k in opp_keys:
+        if _usable_context_value(current_opp_ctx.get(k)):
+            row[k]=current_opp_ctx.get(k)
+            row["opp_"+k]=current_opp_ctx.get(k)
+            row["has_current_opponent_context"] = True
     injuries=load_injury_bank()
     inj=injuries.get(norm(row.get("player"))) or injuries.get(str(row.get("player") or ""))
     row["has_injury_context"]=bool(inj)
@@ -7371,7 +7817,7 @@ def merge_nfl_context(row):
     # Savant is supplemental and fail-soft. It never replaces market identity,
     # workload, or the existing Phase 6/current-week context.
     try:
-        row=attach_savant_context(row,SAVANT_DIR,NFL_LAST_SEASON)
+        row=attach_best_savant_context(row,SAVANT_DIR)
     except Exception as exc:
         row.update({
             "savant_status":"MISSING","savant_player_match":False,
@@ -7418,16 +7864,60 @@ def _first_numeric(row, keys, default=None):
             return v
     return default
 
+def _regular_offseason_transition(row, prop=None):
+    """Describe how aggressively history should be trusted entering a new season.
+
+    Returning starters retain a stronger prior.  Rookies, team changes, coordinator/head
+    coach changes and clear depth-chart promotions lower the old-team prior without
+    pretending we know the new role precisely before regular-season snaps exist.
+    """
+    row=row or {}; notes=[]; risk="LOW"; prior_mult=1.0
+    rookie=str(row.get("rookie_flag") or row.get("split_rookie_flag") or "").upper() in {"1","TRUE","YES"}
+    team_change=str(row.get("team_change") or row.get("new_team") or row.get("changed_team") or "").upper() in {"1","TRUE","YES","NEW"}
+    scheme_change=str(row.get("new_offensive_coordinator") or row.get("new_head_coach") or row.get("scheme_change") or row.get("coaching_change") or "").upper() in {"1","TRUE","YES","NEW","HIGH"}
+    depth=safe_float(row.get("depth_rank")); prev=safe_float(row.get("previous_depth_rank"))
+    promoted=depth is not None and prev is not None and depth < prev
+    if rookie:
+        prior_mult*=0.50; risk="HIGH"; notes.append("Rookie transition: last-season player prior heavily reduced")
+    if team_change:
+        prior_mult*=0.62; risk="HIGH"; notes.append("New-team transition: old environment prior reduced")
+    if scheme_change:
+        prior_mult*=0.78; risk="MED" if risk!="HIGH" else risk; notes.append("Coaching/scheme transition prior reduction")
+    if promoted:
+        prior_mult*=0.72; risk="MED" if risk!="HIGH" else risk; notes.append("Depth-chart promotion: old role prior reduced")
+    ol_cont=safe_float(row.get("ol_continuity"),safe_float(row.get("offensive_line_continuity")))
+    if ol_cont is not None and ol_cont < 60 and prop in ["Passing Yards","Pass Attempts","Completions","Rushing Yards","Rush Attempts"]:
+        prior_mult*=0.88; risk="MED" if risk!="HIGH" else risk; notes.append("Low OL continuity increases Week 1-3 uncertainty")
+    return {"prior_multiplier":float(clamp(prior_mult,0.35,1.0)),"risk":risk,"notes":notes,"rookie":rookie,"team_change":team_change,"scheme_change":scheme_change,"promoted":promoted}
+
+
+def _early_season_current_weight(games, transition=None):
+    """Current-season evidence weight without counting L3/L5 as independent samples."""
+    games=max(0,int(safe_float(games,0) or 0)); transition=transition or {}
+    # One game is evidence, not three samples just because season/L3/L5 all contain it.
+    table={0:0.00,1:0.24,2:0.39,3:0.53,4:0.64,5:0.72}
+    weight=table.get(games,min(0.90,0.72+0.045*(games-5)))
+    prior_mult=safe_float(transition.get("prior_multiplier"),1.0) or 1.0
+    # If the old prior is structurally less relevant, current snaps take over faster.
+    weight=1.0-(1.0-weight)*prior_mult
+    return float(clamp(weight,0.0,0.92))
+
+
 def _weighted_current_metric(row, season_keys, last5_keys, last3_keys):
+    """Estimate the current-season metric without triple-counting the same early games."""
     season=_first_numeric(row, season_keys)
     l5=_first_numeric(row, last5_keys)
     l3=_first_numeric(row, last3_keys)
     games=int(safe_float((row or {}).get("current_games"),0) or 0)
+    if season is None and l5 is None and l3 is None:
+        return None
+    # Season average is the anchor; L5/L3 only add recency once enough distinct games exist.
+    if games <= 3:
+        return season if season is not None else l3 if l3 is not None else l5
     vals=[]
-    if season is not None: vals.append((season,0.50 if games>=5 else 0.65))
-    if l5 is not None: vals.append((l5,0.30 if games>=5 else 0.20))
-    if l3 is not None: vals.append((l3,0.20 if games>=5 else 0.15))
-    if not vals: return None
+    if season is not None: vals.append((season,0.68 if games<6 else 0.52))
+    if l5 is not None: vals.append((l5,0.22 if games<6 else 0.30))
+    if l3 is not None: vals.append((l3,0.10 if games<6 else 0.18))
     total=sum(w for _,w in vals)
     return sum(v*w for v,w in vals)/max(total,1e-9)
 
@@ -7435,6 +7925,12 @@ def current_week_role_engine(row, role, prop):
     """Blend season role with L5/L3 usage, depth chart, QB and OL changes."""
     row=row or {}; role=dict(role or {}); notes=[]; factor=1.0; risk="LOW"
     metrics={}
+    transition=_regular_offseason_transition(row,prop)
+    current_games=int(safe_float(row.get("current_games"),0) or 0)
+    current_weight=_early_season_current_weight(current_games,transition)
+    notes.extend(transition.get("notes") or [])
+    if transition.get("risk")=="HIGH": risk="HIGH"
+    elif transition.get("risk")=="MED" and risk!="HIGH": risk="MED"
     metric_specs={
         "snap":(["current_snap_share","snap_share"],["last5_snap_share","l5_snap_share"],["last3_snap_share","l3_snap_share"]),
         "route":(["current_route_participation","route_participation"],["last5_route_participation","l5_route_participation"],["last3_route_participation","l3_route_participation"]),
@@ -7446,8 +7942,10 @@ def current_week_role_engine(row, role, prop):
         val=_weighted_current_metric(row,season_keys,l5_keys,l3_keys)
         if val is not None:
             old=safe_float(role.get(dst),val) or val
-            role[dst]=float(clamp(val,0,100)); metrics[dst]=round(val,2)
-            if abs(val-old)>=8: notes.append(f"Current-week {dst} role moved {val-old:+.1f} pts")
+            blended=old*(1.0-current_weight)+val*current_weight
+            role[dst]=float(clamp(blended,0,100)); metrics[dst]=round(blended,2)
+            metrics[f"{dst}_current_raw"]=round(val,2)
+            if abs(val-old)>=8: notes.append(f"Current-week {dst} role moved {val-old:+.1f} pts; sample-weight {current_weight:.0%}")
 
     volume_specs={
         "pass":(["current_pass_attempts_pg","pass_attempts_pg"],["last5_pass_attempts_pg"],["last3_pass_attempts_pg"]),
@@ -7457,17 +7955,20 @@ def current_week_role_engine(row, role, prop):
     volumes={k:_weighted_current_metric(row,*spec) for k,spec in volume_specs.items()}
     metrics.update({k:round(v,2) for k,v in volumes.items() if v is not None})
     if prop in ["Passing Yards","Passing TDs","Interceptions","Pass Attempts","Completions"]:
-        season=_first_numeric(row,["current_pass_attempts_pg","pass_attempts_pg"])
-        if volumes.get("pass") is not None and season and season>0:
-            factor*=clamp(volumes["pass"]/season,0.90,1.10)
+        baseline=_first_numeric(row,["pass_attempts_pg"])
+        if volumes.get("pass") is not None and baseline and baseline>0:
+            ratio=clamp(volumes["pass"]/baseline,0.82,1.18)
+            factor*=1.0+(ratio-1.0)*current_weight
     elif prop in ["Receiving Yards","Receptions","Longest Reception"]:
-        season=_first_numeric(row,["current_targets_pg","targets_pg"])
-        if volumes.get("targets") is not None and season and season>0:
-            factor*=clamp(volumes["targets"]/season,0.88,1.12)
+        baseline=_first_numeric(row,["targets_pg"])
+        if volumes.get("targets") is not None and baseline and baseline>0:
+            ratio=clamp(volumes["targets"]/baseline,0.78,1.22)
+            factor*=1.0+(ratio-1.0)*current_weight
     elif prop in ["Rushing Yards","Rush Attempts","Longest Rush"]:
-        season=_first_numeric(row,["current_rush_attempts_pg","rush_attempts_pg"])
-        if volumes.get("carries") is not None and season and season>0:
-            factor*=clamp(volumes["carries"]/season,0.86,1.14)
+        baseline=_first_numeric(row,["rush_attempts_pg","carries_pg"])
+        if volumes.get("carries") is not None and baseline and baseline>0:
+            ratio=clamp(volumes["carries"]/baseline,0.74,1.26)
+            factor*=1.0+(ratio-1.0)*current_weight
     elif prop in ["Fantasy Points","Anytime TD"]:
         parts=[]
         for key,base_keys in [("targets",["current_targets_pg","targets_pg"]),("carries",["current_rush_attempts_pg","rush_attempts_pg"])]:
@@ -7492,7 +7993,9 @@ def current_week_role_engine(row, role, prop):
     role_bucket=projection_role_bucket(row,role)
     has_recent=any(_first_numeric(row,[k]) is not None for k in ["last3_pass_attempts_pg","last3_targets_pg","last3_rush_attempts_pg","last3_snap_share","last5_snap_share"])
     if has_recent: notes.append("L3/L5 current-week role blend active")
-    return role, {"factor":float(clamp(factor,0.84,1.16)),"risk":risk,"notes":notes,"metrics":metrics,"role_bucket":role_bucket,"active":bool(metrics or notes)}
+    metrics["current_sample_weight"]=round(current_weight,3)
+    metrics["current_games"]=current_games
+    return role, {"factor":float(clamp(factor,0.84,1.16)),"risk":risk,"notes":notes,"metrics":metrics,"role_bucket":role_bucket,"active":bool(metrics or notes),"offseason_transition":transition,"current_sample_weight":round(current_weight,3)}
 
 def usage_data_quality(row, prop):
     needed=ROLE_SAFETY_MINIMUMS.get(prop,{})
@@ -8869,13 +9372,23 @@ def receiving_yards_stat_projection(row, role, cfg):
     shared_opp=shared_game_opportunity_context(row)
     team_plays=shared_opp.get("plays",team_plays); pass_rate=shared_opp.get("pass_rate",pass_rate)
     implied_team_attempts=shared_opp.get("pass_attempts",team_plays*pass_rate/100.0)
-    expected_targets=(targets_pg*0.68)
-    if target_share is not None and target_share > 0:
-        expected_targets += (implied_team_attempts * target_share/100.0)*0.32
-    else:
-        expected_targets += targets_pg*0.32
-    if route_part is not None:
-        expected_targets *= clamp(0.90 + (route_part/100.0)*0.14, 0.90, 1.04)
+    # Route-first receiving opportunity: team dropbacks -> routes -> targets/route.
+    route_part_frac=None if route_part is None else clamp(route_part/100.0 if route_part>1.5 else route_part,0.0,1.0)
+    expected_routes=implied_team_attempts*(route_part_frac if route_part_frac is not None else clamp(safe_float(role.get("route"),65)/100.0,0.20,0.98))
+    tprr=safe_float(row.get("targets_per_route"),safe_float(row.get("target_per_route_run")))
+    if tprr is not None and tprr>1.5: tprr/=100.0
+    if tprr is None or tprr<=0:
+        if expected_routes>0 and targets_pg is not None:
+            tprr=targets_pg/max(1.0,expected_routes)
+        elif target_share is not None and route_part_frac and route_part_frac>0:
+            ts=target_share/100.0 if target_share>1.5 else target_share
+            tprr=ts/max(0.15,route_part_frac)
+        else:
+            tprr=0.20 if pos=="WR" else 0.18 if pos=="TE" else 0.16
+    tprr=clamp(tprr,0.06,0.38)
+    route_targets=expected_routes*tprr
+    share_targets=implied_team_attempts*(target_share/100.0 if target_share is not None and target_share>1.5 else (target_share or 0)) if target_share is not None else targets_pg
+    expected_targets=route_targets*0.56+(share_targets if share_targets is not None else targets_pg)*0.24+targets_pg*0.20
     # Game script and totals.
     script_factor=1.0
     if spread >= 6:
@@ -8918,15 +9431,51 @@ def receiving_yards_stat_projection(row, role, cfg):
     coverage_factor=1.0
     if coverage is not None:
         coverage_factor=clamp(1 - (coverage-60)*0.0025, 0.94, 1.04)
-    target_model=expected_targets * ypt * script_factor * pass_rate_factor * total_factor * stadium_factor * matchup_factor * coverage_factor
-    history_model=rec_ypg * script_factor * total_factor * stadium_factor * matchup_factor * coverage_factor
-    projection=(history_model*0.58)+(target_model*0.42)
+    # NGS/route skill context. These are small efficiency modifiers only;
+    # they never replace route/target opportunity.
+    separation=safe_float(row.get("avg_separation"),safe_float(row.get("target_separation")))
+    cushion=safe_float(row.get("avg_cushion"))
+    cpoe_rec=safe_float(row.get("catch_pct_above_expectation"))
+    man_rate=safe_float(row.get("man_rate"),safe_float(row.get("opp_man_rate")))
+    zone_rate=safe_float(row.get("zone_rate"),safe_float(row.get("opp_zone_rate")))
+    yprr_man=safe_float(row.get("yprr_vs_man"),safe_float(row.get("yards_per_route_vs_man")))
+    yprr_zone=safe_float(row.get("yprr_vs_zone"),safe_float(row.get("yards_per_route_vs_zone")))
+    skill_factor=1.0
+    if separation is not None:
+        skill_factor*=clamp(1+(separation-3.0)*0.018,0.96,1.04)
+    if cpoe_rec is not None:
+        skill_factor*=clamp(1+cpoe_rec*0.0025,0.97,1.03)
+    if man_rate is not None and zone_rate is not None and yprr_man is not None and yprr_zone is not None:
+        mr=man_rate/100.0 if man_rate>1.5 else man_rate
+        zr=zone_rate/100.0 if zone_rate>1.5 else zone_rate
+        denom=max(1e-6,mr+zr)
+        matchup_yprr=(mr*yprr_man+zr*yprr_zone)/denom
+        skill_factor*=clamp(1+(matchup_yprr-1.65)*0.025,0.96,1.04)
+        notes.append("Man/zone receiver efficiency blend active")
+    catch_rate=safe_float(row.get("catch_rate"),safe_float(row.get("catch_pct")))
+    if catch_rate is None and receptions_pg is not None and targets_pg:
+        catch_rate=receptions_pg/max(1.0,targets_pg)
+    if catch_rate is None: catch_rate=0.66 if pos=="WR" else 0.69 if pos=="TE" else 0.76
+    if catch_rate>1.5: catch_rate/=100.0
+    catch_rate=clamp(catch_rate,0.40,0.92)
+    ypr=safe_float(row.get("yards_per_reception"))
+    if ypr is None or ypr<=0: ypr=ypt/max(0.35,catch_rate)
+    ypr=clamp(ypr,5.0,22.0)
+    caught_yard_model=expected_targets*catch_rate*ypr
+    target_model=(expected_targets*ypt*0.50+caught_yard_model*0.50)*script_factor*pass_rate_factor*total_factor*stadium_factor*matchup_factor*coverage_factor*skill_factor
+    history_model=rec_ypg*script_factor*total_factor*stadium_factor*matchup_factor*coverage_factor*skill_factor
+    # Opportunity should lead; history remains a stabilizer, especially early season.
+    projection=(history_model*0.40)+(target_model*0.60)
     consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
     projection=clamp(projection, 4, 185)
     breakdown={
         "player_rec_ypg": round(rec_ypg,2),
         "targets_pg": round(targets_pg,2),
+        "projected_routes": round(expected_routes,2),
+        "targets_per_route": round(tprr,3),
         "projected_targets": round(expected_targets,2),
+        "catch_rate": round(catch_rate,3),
+        "yards_per_reception": round(ypr,3),
         "yards_per_target": round(ypt,3),
         "target_model": round(target_model,2),
         "history_model": round(history_model,2),
@@ -8940,6 +9489,10 @@ def receiving_yards_stat_projection(row, role, cfg):
         "stadium_factor": round(stadium_factor,3),
         "total_factor": round(total_factor,3),
         "coverage_factor": round(coverage_factor,3),
+        "skill_factor": round(skill_factor,3),
+        "avg_separation": None if separation is None else round(separation,3),
+        "avg_cushion": None if cushion is None else round(cushion,3),
+        "receiver_cpoe": None if cpoe_rec is None else round(cpoe_rec,3),
         "shared_game_opportunity": shared_opp,
         "final_pre_market": round(projection,2),
         "context_source": row.get("receiving_context_bank_source"),
@@ -8949,104 +9502,105 @@ def receiving_yards_stat_projection(row, role, cfg):
     return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
 
 def rushing_yards_stat_projection(row, role, cfg):
-    """Rushing Yards projection from carries x yards/carry plus script/trench context."""
-    row=dict(row or {})
-    notes=[]; line=safe_float(row.get("line"))
-    rush_ypg=safe_float(row.get("rushing_yards_pg"))
-    carries_pg=safe_float(row.get("rush_attempts_pg"), safe_float(row.get("carries_pg")))
-    current_games=safe_float(row.get("current_games"), 0) or 0
-    cur_ypg=safe_float(row.get("current_rushing_yards_pg"))
-    last3_ypg=safe_float(row.get("last3_rushing_yards_pg"))
-    cur_carries=safe_float(row.get("current_rush_attempts_pg"))
-    last3_carries=safe_float(row.get("last3_rush_attempts_pg"))
-    team_plays=safe_float(row.get("pbp_plays_pg"), safe_float(row.get("plays_pg"), 62)) or 62
-    rush_rate=safe_float(row.get("pbp_rush_rate"), safe_float(row.get("rush_rate"), 44)) or 44
-    carry_share=safe_float(row.get("carries_share"), role.get("carry", 40)) or role.get("carry", 40)
-    spread=safe_float(row.get("spread"), 0) or 0
-    total=safe_float(row.get("game_total"), 44) or 44
-    if carries_pg is None or carries_pg <= 0:
-        carries_pg=(team_plays*rush_rate/100.0)*(carry_share/100.0)
-        notes.append("Carries estimated from team rush rate and carry share")
-    if rush_ypg is None or rush_ypg <= 0:
-        rush_ypg=cfg.get("base",49)
-        notes.append("Rushing yards fallback used")
-    if current_games >= 2 and cur_ypg and cur_ypg > 0:
-        blend=0.25 if current_games < 5 else 0.38
-        form_ypg=(cur_ypg*0.62 + (last3_ypg or cur_ypg)*0.38)
-        rush_ypg=(rush_ypg*(1-blend))+(form_ypg*blend)
-        notes.append(f"Current-season RB form blend active ({int(current_games)} games)")
-    if current_games >= 2 and cur_carries and cur_carries > 0:
-        blend=0.30 if current_games < 5 else 0.44
-        form_carries=(cur_carries*0.62 + (last3_carries or cur_carries)*0.38)
-        carries_pg=(carries_pg*(1-blend))+(form_carries*blend)
-    ypc=safe_float(row.get("yards_per_carry"))
-    if ypc is None or ypc <= 0:
-        ypc=rush_ypg/max(1.0,carries_pg)
-    ypc=clamp(ypc,2.8,6.2)
-    shared_opp=shared_game_opportunity_context(row)
-    team_plays=shared_opp.get("plays",team_plays)
-    team_rushes=shared_opp.get("rushes",team_plays*rush_rate/100.0)
-    rush_rate=100.0*team_rushes/max(1.0,team_plays)
-    expected_carries=(carries_pg*0.70)+((team_rushes*carry_share/100.0)*0.30)
-    script_factor=1.0
-    if spread <= -6:
-        script_factor+=0.055; notes.append("Rushing volume boost: favorite/lead script")
-    elif spread >= 6:
-        script_factor-=0.070; notes.append("Rushing volume tax: trailing script")
-    elif abs(spread) <= 3:
-        script_factor+=0.012; notes.append("Close game rushing stability")
-    total_factor=clamp(1 + (total-44)*0.003,0.96,1.04)
-    run_rank=safe_float(row.get("def_run_rank"), safe_float(row.get("opp_def_run_rank")))
-    rush_allowed=safe_float(row.get("rush_yards_allowed_pg"), safe_float(row.get("opp_rush_yards_allowed_pg")))
+    """Position-aware rushing model.
+
+    RB/FB: team rush volume -> carry share -> YPC -> script/trenches.
+    QB: designed runs + pressure-created scrambles - kneels -> QB rush efficiency.
+    """
+    row=dict(row or {}); notes=[]; line=safe_float(row.get("line")); pos=str(row.get("position") or "").upper()
+    rush_ypg=safe_float(row.get("rushing_yards_pg")); current_games=safe_float(row.get("current_games"),0) or 0
+    cur_ypg=safe_float(row.get("current_rushing_yards_pg")); last3_ypg=safe_float(row.get("last3_rushing_yards_pg"))
+    team_plays=safe_float(row.get("pbp_plays_pg"),safe_float(row.get("plays_pg"),62)) or 62
+    rush_rate=safe_float(row.get("pbp_rush_rate"),safe_float(row.get("rush_rate"),44)) or 44
+    spread=safe_float(row.get("spread"),0) or 0; total=safe_float(row.get("game_total"),44) or 44
+    shared_opp=shared_game_opportunity_context(row); team_plays=shared_opp.get("plays",team_plays)
+    team_rushes=shared_opp.get("rushes",team_plays*rush_rate/100.0); rush_rate=100.0*team_rushes/max(1.0,team_plays)
+    run_rank=safe_float(row.get("def_run_rank"),safe_float(row.get("opp_def_run_rank")))
+    rush_allowed=safe_float(row.get("rush_yards_allowed_pg"),safe_float(row.get("opp_rush_yards_allowed_pg")))
     if run_rank is None:
-        if rush_allowed is None:
-            matchup_factor=1.0; notes.append("Opponent run defense rank/yards allowed missing")
-        else:
-            matchup_factor=clamp(1 + (rush_allowed-115.0)*0.0020,0.94,1.06)
-            notes.append(f"Run defense fallback: {rush_allowed:.1f} yards allowed/game")
+        matchup_factor=1.0 if rush_allowed is None else clamp(1+(rush_allowed-115.0)*0.0020,0.94,1.06)
     else:
-        matchup_factor=clamp(1 + (run_rank-16.5)*0.006,0.90,1.10)
-        if run_rank <= 8: notes.append("Top run defense tax")
-        elif run_rank >= 25: notes.append("Weak run defense boost")
-    run_block=safe_float(
-        row.get("ol_run_block_rank"),
-        safe_float(row.get("ol_run_block_proxy_rank"), safe_float(row.get("run_block_rank"))),
-    )
-    run_stop=safe_float(row.get("def_run_stop_rank"), safe_float(row.get("opp_def_run_stop_rank")))
+        matchup_factor=clamp(1+(run_rank-16.5)*0.006,0.90,1.10)
+    run_block=safe_float(row.get("ol_run_block_rank"),safe_float(row.get("ol_run_block_proxy_rank"),safe_float(row.get("run_block_rank"))))
+    run_stop=safe_float(row.get("def_run_stop_rank"),safe_float(row.get("opp_def_run_stop_rank")))
     trench_factor=1.0
     if run_block is not None and run_stop is not None:
-        if run_block <= 8 and run_stop >= 24:
-            trench_factor*=1.018; notes.append("Run-blocking trench edge")
-        elif run_block >= 24 and run_stop <= 8:
-            trench_factor*=0.972; notes.append("Run-blocking trench mismatch")
-    if str(row.get("run_funnel") or "").upper() in ["TRUE","YES","1","HIGH"]:
-        matchup_factor*=1.016; notes.append("Run-funnel matchup boost")
-    if str(row.get("pass_funnel") or "").upper() in ["TRUE","YES","1","HIGH"]:
-        matchup_factor*=0.992; notes.append("Pass-funnel rushing volume tax")
-    weather=str(row.get("weather_risk") or "").upper()
-    weather_factor=1.0
-    if weather in ["WIND","RAIN","SNOW","SEVERE"]:
-        weather_factor*=1.01; notes.append("Weather rush-volume nudge")
-    projection=(rush_ypg*0.54 + expected_carries*ypc*0.46)*script_factor*total_factor*matchup_factor*trench_factor*weather_factor
-    consensus=safe_float(row.get("market_consensus_line"), safe_float(row.get("market_consensus"), safe_float(row.get("market_best_line"))))
+        if run_block<=8 and run_stop>=24: trench_factor*=1.018; notes.append("Run-blocking trench edge")
+        elif run_block>=24 and run_stop<=8: trench_factor*=0.972; notes.append("Run-blocking trench mismatch")
+    weather=str(row.get("weather_risk") or "").upper(); weather_factor=1.01 if weather in ["WIND","RAIN","SNOW","SEVERE"] else 1.0
+    transition=_regular_offseason_transition(row,"Rushing Yards"); sample_w=_early_season_current_weight(current_games,transition)
+
+    if pos=="QB":
+        # QB carries are not RB carry-share events. Separate designed runs and scrambles.
+        designed=safe_float(row.get("designed_rush_attempts_pg"),safe_float(row.get("qb_designed_runs_pg")))
+        scrambles=safe_float(row.get("scrambles_pg"),safe_float(row.get("qb_scrambles_pg")))
+        kneels=safe_float(row.get("kneels_pg"),safe_float(row.get("qb_kneels_pg"),0)) or 0
+        raw_qb_carries=safe_float(row.get("qb_rush_attempts_pg"),safe_float(row.get("rush_attempts_pg"),safe_float(row.get("carries_pg"))))
+        dropbacks=shared_opp.get("pass_attempts",team_plays*(safe_float(row.get("pass_rate"),56) or 56)/100.0)
+        pressure_rate=safe_float(row.get("opp_def_pressure_rate"),safe_float(row.get("def_pressure_rate")))
+        scramble_rate=safe_float(row.get("scramble_rate"),safe_float(row.get("qb_scramble_rate")))
+        if scramble_rate is not None:
+            scramble_rate=scramble_rate/100.0 if scramble_rate>1.5 else scramble_rate
+        if scrambles is None:
+            if scramble_rate is not None:
+                scrambles=dropbacks*scramble_rate
+            elif raw_qb_carries is not None:
+                scrambles=max(0.0,raw_qb_carries-max(0.0,safe_float(designed,0) or 0)-kneels)
+            else:
+                scrambles=2.4
+                notes.append("QB scramble fallback used")
+        if designed is None:
+            designed=max(0.5,(raw_qb_carries or 4.2)-scrambles-kneels)
+        if pressure_rate is not None:
+            pr=pressure_rate/100.0 if pressure_rate>1.5 else pressure_rate
+            scrambles*=clamp(0.88+pr*0.55,0.90,1.10)
+        expected_carries=max(0.0,designed+scrambles-kneels)
+        cur_carries=safe_float(row.get("current_rush_attempts_pg")); last3_carries=safe_float(row.get("last3_rush_attempts_pg"))
+        if cur_carries is not None and current_games>=1:
+            recent=cur_carries if last3_carries is None else 0.72*cur_carries+0.28*last3_carries
+            expected_carries=expected_carries*(1-sample_w)+recent*sample_w
+        if rush_ypg is None or rush_ypg<=0: rush_ypg=cfg.get("base",28)
+        if cur_ypg is not None and current_games>=1:
+            recent_y=cur_ypg if last3_ypg is None else 0.72*cur_ypg+0.28*last3_ypg
+            rush_ypg=rush_ypg*(1-sample_w)+recent_y*sample_w
+        ypc=safe_float(row.get("qb_yards_per_carry"),safe_float(row.get("yards_per_carry")))
+        if ypc is None or ypc<=0: ypc=rush_ypg/max(1.0,raw_qb_carries or expected_carries)
+        ypc=clamp(ypc,3.0,8.5)
+        # Trailing can create more scrambles; big leads reduce dropback-created rushes.
+        script_factor=1.0
+        if spread>=6: script_factor+=0.035
+        elif spread<=-8: script_factor-=0.030
+        projection=(expected_carries*ypc*0.68+rush_ypg*0.32)*script_factor*matchup_factor*weather_factor
+        projection=clamp(projection,0,125)
+        breakdown={"rush_model_type":"QB_DESIGNED_PLUS_SCRAMBLE","player_rush_ypg":round(rush_ypg,2),"designed_runs":round(designed,2),"projected_scrambles":round(scrambles,2),"kneels":round(kneels,2),"projected_carries":round(expected_carries,2),"yards_per_carry":round(ypc,3),"sample_weight":round(sample_w,3),"matchup_factor":round(matchup_factor,3),"weather_factor":round(weather_factor,3),"shared_game_opportunity":shared_opp,"final_pre_market":round(projection,2)}
+        notes.append("QB rushing model: designed runs + scrambles - kneels")
+        return float(projection),{"active":True,"breakdown":breakdown,"notes":notes}
+
+    carries_pg=safe_float(row.get("rush_attempts_pg"),safe_float(row.get("carries_pg")))
+    carry_share=safe_float(row.get("carries_share"),role.get("carry",40)) or role.get("carry",40)
+    if carries_pg is None or carries_pg<=0:
+        carries_pg=(team_plays*rush_rate/100.0)*(carry_share/100.0); notes.append("Carries estimated from team rush rate and carry share")
+    cur_carries=safe_float(row.get("current_rush_attempts_pg")); last3_carries=safe_float(row.get("last3_rush_attempts_pg"))
+    if cur_carries is not None and current_games>=1:
+        recent=cur_carries if last3_carries is None else 0.72*cur_carries+0.28*last3_carries
+        carries_pg=carries_pg*(1-sample_w)+recent*sample_w
+    if rush_ypg is None or rush_ypg<=0: rush_ypg=cfg.get("base",49); notes.append("Rushing yards fallback used")
+    if cur_ypg is not None and current_games>=1:
+        recent_y=cur_ypg if last3_ypg is None else 0.72*cur_ypg+0.28*last3_ypg
+        rush_ypg=rush_ypg*(1-sample_w)+recent_y*sample_w
+    ypc=safe_float(row.get("yards_per_carry")); ypc=ypc if ypc and ypc>0 else rush_ypg/max(1.0,carries_pg); ypc=clamp(ypc,2.8,6.2)
+    expected_carries=0.70*carries_pg+0.30*(team_rushes*carry_share/100.0)
+    script_factor=1.0
+    if spread<=-6: script_factor+=0.055; notes.append("Rushing volume boost: favorite/lead script")
+    elif spread>=6: script_factor-=0.070; notes.append("Rushing volume tax: trailing script")
+    elif abs(spread)<=3: script_factor+=0.012
+    total_factor=clamp(1+(total-44)*0.003,0.96,1.04)
+    if str(row.get("run_funnel") or "").upper() in ["TRUE","YES","1","HIGH"]: matchup_factor*=1.016
+    if str(row.get("pass_funnel") or "").upper() in ["TRUE","YES","1","HIGH"]: matchup_factor*=0.992
+    projection=(rush_ypg*0.48+expected_carries*ypc*0.52)*script_factor*total_factor*matchup_factor*trench_factor*weather_factor
     projection=clamp(projection,1,175)
-    breakdown={
-        "player_rush_ypg": round(rush_ypg,2),
-        "rush_attempts_pg": round(carries_pg,2),
-        "projected_carries": round(expected_carries,2),
-        "yards_per_carry": round(ypc,3),
-        "team_rush_rate": round(rush_rate,2),
-        "team_plays_pg": round(team_plays,2),
-        "opponent_run_def_rank": None if run_rank is None else int(round(run_rank)),
-        "opponent_rush_yards_allowed_pg": None if rush_allowed is None else round(rush_allowed,2),
-        "script_factor": round(script_factor,3),
-        "matchup_factor": round(matchup_factor,3),
-        "trench_factor": round(trench_factor,3),
-        "weather_factor": round(weather_factor,3),
-        "shared_game_opportunity": shared_opp,
-        "final_pre_market": round(projection,2),
-    }
-    return float(projection), {"active": True, "breakdown": breakdown, "notes": notes}
+    breakdown={"rush_model_type":"RB_CARRY_SHARE","player_rush_ypg":round(rush_ypg,2),"rush_attempts_pg":round(carries_pg,2),"projected_carries":round(expected_carries,2),"yards_per_carry":round(ypc,3),"team_rush_rate":round(rush_rate,2),"team_plays_pg":round(team_plays,2),"opponent_run_def_rank":None if run_rank is None else int(round(run_rank)),"opponent_rush_yards_allowed_pg":None if rush_allowed is None else round(rush_allowed,2),"sample_weight":round(sample_w,3),"script_factor":round(script_factor,3),"matchup_factor":round(matchup_factor,3),"trench_factor":round(trench_factor,3),"weather_factor":round(weather_factor,3),"shared_game_opportunity":shared_opp,"final_pre_market":round(projection,2)}
+    return float(projection),{"active":True,"breakdown":breakdown,"notes":notes}
 
 def pass_attempts_stat_projection(row, role, cfg):
     notes=[]
@@ -10184,7 +10738,7 @@ def project_row_preseason(row, sims=12000):
     ceiling_prob=0.09 if workload.get("confidence")!="LOW" else 0.07
     seed=stable_projection_seed(row.get("player","x"),prop,line,row.get("team",""),row.get("opp",""),"PRESEASON")
     sim,distribution_meta=simulate_prop_distribution(base,sigma,prop,sims,seed,collapse_prob,ceiling_prob,empirical_values=None)
-    mean=float(np.mean(sim)); p10,p50,p75,p90=[float(np.percentile(sim,q)) for q in [10,50,75,90]]
+    mean=float(np.mean(sim)); p10,p25,p50,p75,p90=[float(np.percentile(sim,q)) for q in [10,25,50,75,90]]
     raw_over=float(np.mean(sim>line)); raw_under=float(np.mean(sim<line)); raw_push=max(0.0,1.0-raw_over-raw_under)
 
     vol=(p90-p10)/max(1,mean)
@@ -10261,7 +10815,7 @@ def project_row_preseason(row, sims=12000):
         "reliability_score":reliability_score,"reliability_label":reliability_label,
         "probability_calibration":{"preseason_reliability_shrink":prob_strength,"edge_strength":round(edge_strength,3),"small_edge_pass":small_edge,"raw_fair_prob":round(raw_prob,3),"calibrated_fair_prob":round(prob,3)},
         "selected_price":selected_price,"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),
-        "p10":round(p10,2),"p50":round(p50,2),"p50_fair_line":conflict.get("p50_fair_line"),"median_edge":conflict.get("median_edge"),"distribution_conflict":conflict,"p75":round(p75,2),"p90":round(p90,2),
+        "p10":round(p10,2),"p25":round(p25,2),"p50":round(p50,2),"p50_fair_line":conflict.get("p50_fair_line"),"median_edge":conflict.get("median_edge"),"distribution_conflict":conflict,"p75":round(p75,2),"p90":round(p90,2),
         "pure_upside":"GOOD" if p90-line>sigma*0.55 else "NORMAL",
         "volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,
         "opportunity_score":safe_float(workload.get("score"),0) or 0,
@@ -10475,7 +11029,7 @@ def project_row(row, sims=12000):
     empirical_values=empirical_values_for_row(row,prop)
     sim, distribution_meta=simulate_prop_distribution(base, sigma, prop, sims, seed, collapse_prob, ceiling_prob, empirical_values=empirical_values)
 
-    mean=float(np.mean(sim)); p50=float(np.percentile(sim,50)); p75=float(np.percentile(sim,75)); p90=float(np.percentile(sim,90)); p10=float(np.percentile(sim,10))
+    mean=float(np.mean(sim)); p50=float(np.percentile(sim,50)); p75=float(np.percentile(sim,75)); p90=float(np.percentile(sim,90)); p25=float(np.percentile(sim,25)); p10=float(np.percentile(sim,10))
     if line is None:
         raw_over=None; raw_under=None; raw_push=None; over=None; under=None; push=None; prob=None; side="NO LINE"; edge=None; ev=None; kelly=0.0; selected_price=None
     else:
@@ -10668,7 +11222,7 @@ def project_row(row, sims=12000):
     model_meta={"model_version":MODEL_VERSION,"app_version":APP_VERSION,"generated_at":now_iso(),"active_market_count":len(ACTIVE_NFL_MARKETS),"prop":prop,"source":row.get("source"),"context_layers":audit_preview.get("layers",{}),"staleness":context_staleness(market_row),"calibration_status":cal_status,"projection_consumed_factors":savant_input.get("projection_consumed_factors",[])}
     if market_row.get("data_integrity_block"):
         side="PASS"; selected_price=None; ev=None; kelly=0.0
-    out={**market_row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"over_prob":None if over is None else round(over,3),"under_prob":None if under is None else round(under,3),"push_prob":None if push is None else round(push,3),"raw_fair_prob":None if raw_prob is None else round(raw_prob,3),"raw_over_prob":None if raw_over is None else round(raw_over,3),"raw_under_prob":None if raw_under is None else round(raw_under,3),"raw_push_prob":None if raw_push is None else round(raw_push,3),"reliability_score":reliability_score,"reliability_label":reliability_label,"probability_calibration":{"decision_probability_strength":decision_prob_strength,"raw_fair_prob":None if raw_prob is None else round(raw_prob,3),"calibrated_fair_prob":None if prob is None else round(prob,3)},"selected_price":selected_price,"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"split_personnel_factor":round(split_factor,3),"split_personnel_context":split_context,"advanced_context":advanced_context,"offense_defense_rank_context":rank_context,"offense_defense_rank_factor":round(rank_factor,3),"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"rushing_yards_model":rushing_yards_model_info,"pass_attempts_model":pass_attempts_model_info,"completions_model":completions_model_info,"receptions_model":receptions_model_info,"rush_attempts_model":rush_attempts_model_info,"passing_tds_model":passing_tds_model_info,"anytime_td_model":anytime_td_model_info,"field_goals_made_model":fg_made_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"factor_stack":factor_stack,"model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,"smart_calibration":smart_calibration,"role_bucket":current_week_role.get("role_bucket") or projection_role_bucket(row,role),"data_quality_bucket":projection_data_quality_bucket(row,usage_quality),"current_week_role":current_week_role,"market_intelligence":market_intelligence,"distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_preview.get("label"),"audit_score":audit_preview.get("score"),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"model_fallback_used":model_fallback_used,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
+    out={**market_row,"projection":round(mean,2),"edge":None if edge is None else round(edge,2),"pick":side,"fair_prob":None if prob is None else round(prob,3),"over_prob":None if over is None else round(over,3),"under_prob":None if under is None else round(under,3),"push_prob":None if push is None else round(push,3),"raw_fair_prob":None if raw_prob is None else round(raw_prob,3),"raw_over_prob":None if raw_over is None else round(raw_over,3),"raw_under_prob":None if raw_under is None else round(raw_under,3),"raw_push_prob":None if raw_push is None else round(raw_push,3),"reliability_score":reliability_score,"reliability_label":reliability_label,"probability_calibration":{"decision_probability_strength":decision_prob_strength,"raw_fair_prob":None if raw_prob is None else round(raw_prob,3),"calibrated_fair_prob":None if prob is None else round(prob,3)},"selected_price":selected_price,"ev":None if ev is None else round(ev,4),"kelly":round(kelly,4),"p10":round(p10,2),"p25":round(p25,2),"p50":round(p50,2),"p75":round(p75,2),"p90":round(p90,2),"pure_upside":upside,"volatility":volatility,"stability_score":stability,"usage_quality":usage_quality,"opportunity_score":round(opportunity.get("factor",1.0)*100,1),"expected_opportunity":opportunity.get("expected",{}),"pace_factor":round(pace_factor,3),"vegas_factor":round(vegas_factor,3),"advanced_factor":round(advanced_factor,3),"split_personnel_factor":round(split_factor,3),"split_personnel_context":split_context,"advanced_context":advanced_context,"offense_defense_rank_context":rank_context,"offense_defense_rank_factor":round(rank_factor,3),"passing_yards_model":pass_yards_model_info,"receiving_yards_model":receiving_yards_model_info,"rushing_yards_model":rushing_yards_model_info,"pass_attempts_model":pass_attempts_model_info,"completions_model":completions_model_info,"receptions_model":receptions_model_info,"rush_attempts_model":rush_attempts_model_info,"passing_tds_model":passing_tds_model_info,"anytime_td_model":anytime_td_model_info,"field_goals_made_model":fg_made_model_info,"qb_tier":qb_tier_info,"projection_breakdown":active_breakdown,"factor_stack":factor_stack,"model_meta":model_meta,"model_version":MODEL_VERSION,"calibration_status":cal_status,"smart_calibration":smart_calibration,"role_bucket":current_week_role.get("role_bucket") or projection_role_bucket(row,role),"data_quality_bucket":projection_data_quality_bucket(row,usage_quality),"current_week_role":current_week_role,"market_intelligence":market_intelligence,"distribution_meta":distribution_meta,"projection_audit":audit_preview,"audit_label":audit_preview.get("label"),"audit_score":audit_preview.get("score"),"xgb_assist":xgb_info,"bayes_markov_assist":bayes_markov_info,"ensemble_ml_assist":ensemble_info,"line_sanity":line_sanity_info,"model_fallback_used":model_fallback_used,"game_script_factor":round(script_factor,3),"game_script_branches":script_branches,"blowout_prob":blowout_prob,"matchup_factor":round(defense_factor,3),"collapse_prob":round(collapse_prob,3),"ceiling_prob":round(ceiling_prob,3),"data_score":score,"injury_risk":injury_risk,"game_script_risk":game_script_risk,"defense_risk":defense_risk,"line_delta":line_delta,"true_line_delta":true_line_delta,"role":role,"env":env,"notes":notes,"sim_samples":sims}
     out.update({
         "expected_mean":round(mean,2),
         "p50_fair_line":distribution_conflict.get("p50_fair_line"),
@@ -10694,7 +11248,7 @@ def _resimulate_scaled_projection(p, scale, reason, sims=3000):
     sigma=safe_float((p.get("factor_stack") or {}).get("sigma"), PROP_CONFIG.get(prop,{}).get("sigma",1)) or 1
     seed=stable_projection_seed(p.get("player","x"),prop,p.get("team",""),p.get("opp",""),"team_reconcile_v732")
     sim,meta=simulate_prop_distribution(target,sigma*max(0.82,math.sqrt(scale)),prop,sims,seed,safe_float(p.get("collapse_prob"),0.12) or 0.12,safe_float(p.get("ceiling_prob"),0.08) or 0.08,empirical_values=empirical_values_for_row(p,prop))
-    mean=float(np.mean(sim)); p10,p50,p75,p90=[float(np.percentile(sim,q)) for q in [10,50,75,90]]
+    mean=float(np.mean(sim)); p10,p25,p50,p75,p90=[float(np.percentile(sim,q)) for q in [10,25,50,75,90]]
     line=safe_float(p.get("line"))
     if line is not None:
         over=float(np.mean(sim>line)); under=float(np.mean(sim<line)); push=max(0.0,1.0-over-under)
@@ -10702,7 +11256,7 @@ def _resimulate_scaled_projection(p, scale, reason, sims=3000):
         price=selected_side_price(p,side); loss_prob=under if side=="OVER" else over if side=="UNDER" else None
         p.update({"edge":round(mean-line,2),"pick":side,"fair_prob":round(prob,3),"over_prob":round(over,3),"under_prob":round(under,3),"push_prob":round(push,3),"selected_price":price,"ev":None if loss_prob is None else round(expected_value(prob,price,loss_prob=loss_prob),4),"kelly":0.0 if loss_prob is None else round(kelly_fraction(prob,price,loss_prob=loss_prob),4)})
     conflict=distribution_conflict_audit(mean,p50,line,p.get("pick"))
-    p.update({"projection":round(mean,2),"expected_mean":round(mean,2),"p10":round(p10,2),"p50":round(p50,2),"p50_fair_line":conflict.get("p50_fair_line"),"median_edge":conflict.get("median_edge"),"distribution_conflict":conflict,"p75":round(p75,2),"p90":round(p90,2),"stability_score":projection_stability_score(p10,p90,mean,prop),"distribution_meta":{**(p.get("distribution_meta") or {}),**meta},"team_volume_reconciliation":{"active":True,"scale":round(scale,4),"before":round(old,2),"after":round(mean,2),"reason":reason}})
+    p.update({"projection":round(mean,2),"expected_mean":round(mean,2),"p10":round(p10,2),"p25":round(p25,2),"p50":round(p50,2),"p50_fair_line":conflict.get("p50_fair_line"),"median_edge":conflict.get("median_edge"),"distribution_conflict":conflict,"p75":round(p75,2),"p90":round(p90,2),"stability_score":projection_stability_score(p10,p90,mean,prop),"distribution_meta":{**(p.get("distribution_meta") or {}),**meta},"team_volume_reconciliation":{"active":True,"scale":round(scale,4),"before":round(old,2),"after":round(mean,2),"reason":reason}})
     p["data_score"]=int(clamp((safe_float(p.get("data_score"),70) or 70)-max(1,int((1-scale)*25)),0,99))
     notes=list(p.get("notes") or []); notes.append(f"Team-volume reconciliation: {reason} (x{scale:.3f})"); p["notes"]=notes
     signal,tier,rejections=build_signal(p); p.update({"signal":signal,"action_tier":tier,"official_rejections":rejections,"bettable":tier=="BET"})
@@ -11164,120 +11718,196 @@ def _moneyline_time_label(value):
     label=dt.strftime("%a %b %d | %I:%M %p %Z").replace(" 0"," ").upper()
     return label
 
+
+def _ui_pct(value):
+    x=safe_float(value)
+    if x is None: return None
+    if abs(x)<=1.0: x*=100.0
+    return float(clamp(x,0,100))
+
+def _ui_grade_from_factor(value):
+    x=safe_float(value)
+    if x is None: return "—"
+    if x>=1.12: return "A+"
+    if x>=1.075: return "A"
+    if x>=1.035: return "A-"
+    if x>=1.01: return "B+"
+    if x>=0.99: return "B"
+    if x>=0.965: return "B-"
+    if x>=0.925: return "C+"
+    return "C"
+
+def _ui_action_label(p):
+    tier=str(p.get("action_tier") or p.get("signal") or "").upper()
+    pick=str(p.get("pick") or "PASS").upper()
+    prob=_ui_pct(p.get("fair_prob"))
+    if "PASS" in tier or pick=="PASS": return "PASS"
+    if "OFFICIAL" in tier or (prob is not None and prob>=67): return "ELITE PLAY"
+    if "STRONG" in tier or (prob is not None and prob>=62): return "STRONG PLAY"
+    if "LEAN" in tier or (prob is not None and prob>=56): return "LEAN / TRACK"
+    return "TRACK"
+
+def _ui_missing(value):
+    return value is None or (isinstance(value,str) and value.strip().lower() in {"","none","nan","n/a","missing"})
+
+def _ui_opp_fields(p):
+    role=p.get("role") or {}
+    exp=p.get("expected_opportunity") or {}
+    prop=str(p.get("prop") or "")
+    pos=str(p.get("position") or "").upper()
+    def item(label,*vals):
+        for v in vals:
+            if not _ui_missing(v):
+                return (label,_fmt_num(v,1) if safe_float(v) is not None else str(v))
+        return (label,"—")
+    if prop=="Receiving Yards":
+        return [item("ROUTES",exp.get("routes_pg"),role.get("routes")),
+                item("TARGETS",exp.get("targets_pg_est"),role.get("targets")),
+                item("TGT SHARE",role.get("target"),p.get("target_share")),
+                item("1ST READ",p.get("first_read_share"),p.get("current_first_read_share"),p.get("ngs_first_read_share"))]
+    if prop=="Rushing Yards":
+        if pos=="QB":
+            model=p.get("rushing_yards_model") or {}
+            return [item("DES RUN",model.get("designed_rushes"),p.get("qb_designed_runs_pg")),
+                    item("SCRAMBLE",model.get("scrambles"),p.get("qb_scrambles_pg")),
+                    item("KNEELS",model.get("kneels"),p.get("qb_kneels_pg")),
+                    item("RUSH ATT",exp.get("carries_pg_est"),p.get("rush_attempts_pg"))]
+        return [item("CARRIES",exp.get("carries_pg_est"),p.get("rush_attempts_pg")),
+                item("CARRY SHR",role.get("carry"),p.get("carry_share")),
+                item("RZ SHARE",role.get("rz"),p.get("red_zone_touch_share")),
+                item("PLAYS",exp.get("plays_pg"),p.get("plays_pg"))]
+    if prop=="Passing Yards":
+        return [item("DROPBACKS",exp.get("dropbacks_pg"),p.get("dropbacks_pg")),
+                item("ATTEMPTS",exp.get("pass_attempts_pg"),p.get("pass_attempts_pg")),
+                item("OL PASS",p.get("ol_pass_pro_rank")),
+                item("PRESSURE",p.get("opp_def_pressure_rate"),p.get("def_pressure_rate"))]
+    return [item("SNAP %",role.get("snap")),item("ROLE %",role.get("route"),role.get("carry")),
+            item("RZ %",role.get("rz")),item("PLAYS",exp.get("plays_pg"))]
+
+def _ui_player_why(p):
+    parts=[]
+    for n in (p.get("notes") or []):
+        t=str(n).strip()
+        if t and t not in parts: parts.append(t)
+        if len(parts)>=3: break
+    if not parts:
+        role=p.get("role") or {}
+        if safe_float(role.get("route")) is not None: parts.append(f"Route participation {safe_float(role.get('route')):.0f}%")
+        if safe_float(role.get("target")) is not None: parts.append(f"Target share {safe_float(role.get('target')):.0f}%")
+        mf=safe_float(p.get("matchup_factor"))
+        if mf is not None: parts.append(f"Matchup factor {mf:.3f}")
+    return " • ".join(parts[:3]) if parts else "No additional model note available"
+
+def _ml_tier(card):
+    if card.get("blocked"): return "PASS"
+    prob=100*(safe_float(card.get("favorite_prob"),0) or 0)
+    ready=bool(card.get("official_moneyline_ready"))
+    rel=str(card.get("reliability") or "").upper()
+    if ready and rel=="HIGH" and prob>=64: return "ELITE ML"
+    if ready and rel in {"HIGH","MED"} and prob>=59: return "STRONG ML"
+    if prob>=54 and rel!="LOW": return "LEAN ML"
+    return "TRACK ONLY"
+
+def _ml_advantage_cell(card,key,label):
+    af=card.get("away_family_scores") or {}; hf=card.get("home_family_scores") or {}
+    a=safe_float(af.get(key)); h=safe_float(hf.get(key))
+    away=html.escape(str(card.get("away") or "")); home=html.escape(str(card.get("home") or ""))
+    if a is None or h is None:
+        return f"<div class='ml-battle-cell'><div class='ml-battle-name'>{label}</div><div class='ml-battle-val ml-even'>—</div></div>"
+    d=h-a
+    if abs(d)<0.08: txt="EVEN"; cls="ml-even"
+    elif d>0: txt=f"{home} ADV"; cls="ml-adv-home"
+    else: txt=f"{away} ADV"; cls="ml-adv-away"
+    return f"<div class='ml-battle-cell'><div class='ml-battle-name'>{label}</div><div class='ml-battle-val {cls}'>{txt}</div></div>"
+
 def _render_moneyline_cards(cards):
     if not cards:
         st.warning("No validated NFL matchups are available for Money Line cards.")
         return
-    markup=["<div class='ml-board'>"]
+    markup=["<div class='ml-elite-board'>"]
     for card in cards:
         away=html.escape(str(card.get("away") or ""))
         home=html.escape(str(card.get("home") or ""))
-        away_badge=_moneyline_team_badge(away)
-        home_badge=_moneyline_team_badge(home)
-        matchup=html.escape(str(card.get("matchup") or ""))
+        phase=str(card.get("phase") or "REGULAR").upper()
         start=html.escape(_moneyline_time_label(card.get("scheduled_at")))
-        status=html.escape(str(card.get("status") or ("BLOCKED" if card.get("blocked") else "MODEL READY")))
-        status_class="blocked" if card.get("blocked") else "ready"
+        matchup=html.escape(str(card.get("matchup") or f"{away} @ {home}"))
+        status=html.escape(str(card.get("status") or "MODEL"))
         price_status=html.escape(str(card.get("price_status") or "MODEL ONLY"))
-        markup.append(
-            f"<section class='ml-game-card'><div class='ml-card-head'>"
-            f"<span>{start} | {matchup}</span><span class='ml-status {status_class}'>{status} | {price_status}</span></div>"
-        )
         if card.get("blocked"):
-            reasons=" | ".join(html.escape(str(reason)) for reason in card.get("blocks",[]) if reason)
-            markup.append(f"<div class='ml-block'><strong>NO OFFICIAL MODEL</strong><br>{reasons or 'Required team inputs are incomplete.'}</div></section>")
+            reasons=" • ".join(html.escape(str(x)) for x in card.get("blocks",[]) if x)
+            markup.append(f"<section class='ml-elite-card'><div class='ml-topline'><span>{start} · {matchup}</span><span>PASS · DATA BLOCKED</span></div><div style='padding:14px'><b>NO OFFICIAL MODEL</b><div class='nfl-subline'>{reasons or 'Required team inputs are incomplete.'}</div></div></section>")
             continue
 
-        away_prob=100*(safe_float(card.get("away_win_prob"),0) or 0)
-        home_prob=100*(safe_float(card.get("home_win_prob"),0) or 0)
-        favorite=html.escape(str(card.get("favorite") or ""))
-        favorite_prob=100*(safe_float(card.get("favorite_prob"),0) or 0)
-        away_projection=_fmt_num(card.get("away_projection"),1)
-        home_projection=_fmt_num(card.get("home_projection"),1)
-        model_total=_fmt_num(card.get("model_total"),1)
-        market_total=safe_float(card.get("market_total"))
-        total_edge=safe_float(card.get("total_edge"))
-        total_pick=str(card.get("total_pick") or "NO MARKET TOTAL").upper()
-        total_pick_class="pass" if total_pick in ["PASS","NO MARKET TOTAL"] else ""
-        if market_total is None:
-            total_detail="MODEL SCORE TOTAL | MARKET NOT POSTED"
-            total_call="MODEL TOTAL"
-            total_conf="NO OVER/UNDER BET WITHOUT A REAL TOTAL"
+        fav=html.escape(str(card.get("favorite") or ""))
+        football=100*(safe_float(card.get("favorite_prob"),0) or 0)
+        calibrated=100*(safe_float(card.get("calibrated_favorite_prob"),safe_float(card.get("favorite_prob"),0)) or 0)
+        away_prob=100*(safe_float(card.get("away_win_prob"),0) or 0); home_prob=100*(safe_float(card.get("home_win_prob"),0) or 0)
+        ap=_fmt_num(card.get("away_projection"),1); hp=_fmt_num(card.get("home_projection"),1)
+        margin=(safe_float(card.get("home_projection")) or 0)-(safe_float(card.get("away_projection")) or 0)
+        margin_team=home if margin>=0 else away
+        margin_txt=f"{margin_team} -{abs(margin):.1f}"
+        away_logo=html.escape(nfl_team_logo_url(away),quote=True); home_logo=html.escape(nfl_team_logo_url(home),quote=True)
+        al=f"<img src='{away_logo}' alt='{away} logo' loading='lazy' onerror=\"this.style.display='none'\">" if away_logo else ""
+        hl=f"<img src='{home_logo}' alt='{home} logo' loading='lazy' onerror=\"this.style.display='none'\">" if home_logo else ""
+        am=_format_american_odds(card.get("away_market_odds") if card.get("away_market_odds") is not None else card.get("away_model_odds"))
+        hm=_format_american_odds(card.get("home_market_odds") if card.get("home_market_odds") is not None else card.get("home_model_odds"))
+        aip=card.get("away_market_prob"); hip=card.get("home_market_prob")
+        market_edge=safe_float(card.get("calibrated_market_edge"),safe_float(card.get("market_model_edge")))
+        market_edge_txt="—" if market_edge is None else f"{market_edge*100:+.1f}%"
+        total=_fmt_num(card.get("model_total"),1); market_total=_fmt_num(card.get("market_total"),1)
+        drives=safe_float(card.get("projected_drives")); apd=(safe_float(card.get("away_projection"))/drives if drives else None); hpd=(safe_float(card.get("home_projection"))/drives if drives else None)
+        data=int(safe_float(card.get("data_score"),0) or 0); tier=_ml_tier(card)
+        ready=card.get("regular_season_readiness") or {}
+        readiness=int(safe_float(ready.get("score"),data) or data) if phase=="REGULAR" else data
+        phase_note=(f"<span class='ml-pre-note'>PRESEASON · ROTATION-AWARE</span>" if phase=="PRESEASON" else f"<span class='ml-reg-note'>REGULAR · READINESS {readiness}%</span>")
+        rot_a=card.get("away_preseason_rotation") or {}; rot_h=card.get("home_preseason_rotation") or {}
+        risk_bits=[]
+        if phase=="PRESEASON":
+            risk_bits=[f"{away} ROT {100*(safe_float(rot_a.get('confidence'),0) or 0):.0f}%",f"{home} ROT {100*(safe_float(rot_h.get('confidence'),0) or 0):.0f}%"]
         else:
-            edge_text="—" if total_edge is None else f"{total_edge:+.1f}"
-            total_detail=f"{edge_text} VS {market_total:g}"
-            total_call=total_pick
-            total_prob=safe_float(card.get("total_prob"))
-            total_conf="PASS" if total_prob is None else f"{total_prob*100:.0f}% MODEL PROB"
-
-        market_home_spread=safe_float(card.get("home_market_spread"))
-        if market_home_spread is not None:
-            spread_team=home if market_home_spread < 0 else away
-            spread_value=abs(market_home_spread)
-            spread_sub="MARKET"
-        else:
-            model_margin=(safe_float(card.get("home_projection"),0) or 0)-(safe_float(card.get("away_projection"),0) or 0)
-            spread_team=home if model_margin >= 0 else away
-            spread_value=abs(model_margin)
-            spread_sub="MODEL"
-        spread_text=f"{spread_team} -{spread_value:.1f}"
-
-        away_market=card.get("away_market_odds"); home_market=card.get("home_market_odds")
-        if away_market is not None or home_market is not None:
-            ml_value=f"{_format_american_odds(away_market)} / {_format_american_odds(home_market)}"
-            ml_sub=f"{away} / {home} LIVE"
-        else:
-            ml_value=f"{_format_american_odds(card.get('away_model_odds'))} / {_format_american_odds(card.get('home_model_odds'))}"
-            ml_sub=f"{away} / {home} MODEL"
-        away_epa=safe_float(card.get("away_off_epa")); home_epa=safe_float(card.get("home_off_epa"))
-        if away_epa is not None and home_epa is not None:
-            offense_value=f"{away_epa:+.3f} / {home_epa:+.3f}"
-            offense_sub=f"{away} / {home} EPA"
-        else:
-            offense_value=f"{_fmt_num(card.get('away_offense'),2)} / {_fmt_num(card.get('home_offense'),2)}"
-            offense_sub=f"{away} / {home} RATING"
-        plays=_fmt_num(card.get("projected_plays"),1)
-        blowout=100*(safe_float(card.get("blowout_prob"),0) or 0)
-        data_score=int(safe_float(card.get("data_score"),0) or 0)
-        sim_samples=int(safe_float(card.get("sim_samples"),0) or 0)
-        winner=favorite
-        favorite_logo=html.escape(nfl_team_logo_url(favorite),quote=True)
-        favorite_logo_html=(
-            f"<img class='ml-winner-logo' src='{favorite_logo}' alt='{favorite} winner logo' loading='lazy' decoding='async' referrerpolicy='no-referrer' onerror=\"this.style.display='none'\">"
-            if favorite_logo else f"<div class='ml-winner-fallback'>{favorite}</div>"
-        )
-
+            ai=card.get("away_injuries") or {}; hi=card.get("home_injuries") or {}
+            risk_bits=[f"INACT {'✓' if ai.get('final_inactives_confirmed') and hi.get('final_inactives_confirmed') else 'PENDING'}",f"WEATHER {str(card.get('weather_risk') or 'LOW')}",f"RELIABILITY {str(card.get('reliability') or '—')}"]
+        why=" • ".join(f"{str(k).replace('_',' ').title()} {v:+.3f}" for k,v in (card.get("top_factors") or [])[:4]) or str(card.get("model_note") or "")
+        battle="".join([
+            _ml_advantage_cell(card,"quarterback","QB"),
+            _ml_advantage_cell(card,"offense","OFFENSE"),
+            _ml_advantage_cell(card,"trench","OL / DL"),
+            _ml_advantage_cell(card,"defense","DEFENSE"),
+            _ml_advantage_cell(card,"possessions","POSSESSIONS"),
+            _ml_advantage_cell(card,"situational","RED ZONE / DOWNS"),
+            _ml_advantage_cell(card,"explosive","EXPLOSIVES"),
+            _ml_advantage_cell(card,"special_teams","SPECIAL TEAMS"),
+        ])
+        gauge=max(0,min(100,football))
         markup.append(f"""
-        <div class='ml-teams'>
-          <div class='ml-team'>{away_badge}<div class='ml-team-name'>{away}</div><div class='ml-team-proj'>{away_projection}</div><div class='ml-team-prob'>{away_prob:.0f}% win</div></div>
-          <div class='ml-center'><div class='ml-center-label'>DATA {data_score} | {plays} PLAYS</div><div class='ml-winbar'><i class='ml-winbar-away' style='width:{away_prob:.1f}%'></i><i class='ml-winbar-home' style='width:{home_prob:.1f}%'></i></div><div class='ml-wintext'><span>{away_prob:.0f}%</span><span>{home_prob:.0f}%</span></div><div class='ml-winner-lock'><div class='ml-winner-kicker'>MODEL WINNER</div>{favorite_logo_html}<div class='ml-favorite'>{favorite} FAV {favorite_prob:.0f}%</div></div></div>
-          <div class='ml-team'>{home_badge}<div class='ml-team-name'>{home}</div><div class='ml-team-proj'>{home_projection}</div><div class='ml-team-prob'>{home_prob:.0f}% win</div></div>
-        </div>
-        <div class='ml-total-band'>
-          <div><div class='ml-total-label'>GAME TOTAL PROJECTION</div><div class='ml-total-number'>{model_total}</div><div class='ml-total-edge'>{total_detail}</div></div>
-          <div class='ml-total-call'><div class='ml-total-pick {total_pick_class}'>{total_call}</div><div class='ml-total-confidence'>{total_conf}</div></div>
-        </div>
-        <div class='ml-metrics'>
-          <div class='ml-metric'><div class='ml-metric-label'>SPREAD</div><div class='ml-metric-value'>{spread_text}</div><div class='ml-metric-sub'>{spread_sub}</div></div>
-          <div class='ml-metric'><div class='ml-metric-label'>MONEYLINE</div><div class='ml-metric-value'>{ml_value}</div><div class='ml-metric-sub'>{ml_sub}</div></div>
-          <div class='ml-metric'><div class='ml-metric-label'>PACE</div><div class='ml-metric-value'>{plays}</div><div class='ml-metric-sub'>MODEL PLAYS</div></div>
-          <div class='ml-metric'><div class='ml-metric-label'>OFFENSE</div><div class='ml-metric-value'>{offense_value}</div><div class='ml-metric-sub'>{offense_sub}</div></div>
-          <div class='ml-metric'><div class='ml-metric-label'>BLOWOUT</div><div class='ml-metric-value'>{blowout:.0f}%</div><div class='ml-metric-sub'>14+ POINTS</div></div>
-        </div>
-        <div class='ml-card-foot'>{sim_samples:,} SIM | {away} {away_projection} | {home} {home_projection} | TOTAL {model_total} | WINNER {winner}</div>
-        <details class='ml-audit'><summary>WHY THIS TEAM · FOOTBALL AUDIT</summary>
-          <div class='ml-audit-grid'>
-            <div><b>DRIVES</b><br>{_fmt_num(card.get('projected_drives'),1)}</div>
-            <div><b>TURNOVERS</b><br>{away} {_fmt_num(card.get('expected_turnovers_away'),2)} · {home} {_fmt_num(card.get('expected_turnovers_home'),2)}</div>
-            <div><b>WEATHER</b><br>{html.escape(str(card.get('weather_risk') or 'LOW'))}</div>
-            <div><b>RELIABILITY</b><br>{html.escape(str(card.get('reliability') or '—'))}</div>
-            <div><b>REG READY</b><br>{html.escape(str((card.get('regular_season_readiness') or {}).get('score','—')))} {html.escape(str((card.get('regular_season_readiness') or {}).get('label','')))}</div>
-            <div><b>OFFICIAL</b><br>{'YES' if card.get('official_moneyline_ready') else 'NO / TRACK'}</div>
-            <div><b>MARKET CHECK</b><br>{'DISAGREE' if card.get('market_disagreement') else 'OK / NONE'}</div>
+        <section class='ml-elite-card'>
+          <div class='ml-topline'><span>{start} · {matchup}</span><span>{phase_note} · {status} · {price_status}</span></div>
+          <div class='ml-main-grid'>
+            <div class='ml-team-panel'>{al}<div><div class='ml-team-code'>{away}</div><div class='ml-team-score'>{ap} PTS · {away_prob:.0f}% FOOTBALL</div></div></div>
+            <div class='ml-center-panel'>
+              <div class='ml-winner-tag'>★ MODEL WINNER ★</div><div class='ml-winner-big'>{fav} {football:.0f}%</div><div class='ml-cal'>CALIBRATED {calibrated:.0f}%</div>
+              <div class='ml-scoreline'><span><b>{away} {ap}</b></span><span>PROJECTED<br><small>{margin_txt}</small></span><span><b>{home} {hp}</b></span></div>
+            </div>
+            <div class='ml-market-panel'><div class='ml-label'>MARKET LINE</div><div class='ml-market-grid'>
+              <div class='ml-mini'><div class='ml-label'>{away}</div><div class='ml-val'>{am}</div></div>
+              <div class='ml-mini'><div class='ml-label'>{home}</div><div class='ml-val'>{hm}</div></div>
+              <div class='ml-mini'><div class='ml-label'>NO-VIG</div><div class='ml-val'>{'—' if aip is None else f'{100*aip:.0f}%'} / {'—' if hip is None else f'{100*hip:.0f}%'}</div></div>
+              <div class='ml-mini'><div class='ml-label'>MODEL EDGE</div><div class='ml-val nfl-good'>{market_edge_txt}</div></div>
+            </div></div>
+            <div class='ml-gauge-panel'><div class='ml-label'>WIN PROBABILITY</div><div class='ml-gauge' style='--p:{gauge:.0f}'></div><div class='ml-gauge-num'>{football:.0f}%</div><div class='ml-cal'>{calibrated:.0f}% CAL</div><div class='ml-tier nfl-good'>{tier}</div></div>
+            <div class='ml-team-panel right'>{hl}<div><div class='ml-team-code'>{home}</div><div class='ml-team-score'>{hp} PTS · {home_prob:.0f}% FOOTBALL</div></div></div>
           </div>
-          <div class='ml-factor-list'>{html.escape(' · '.join(f"{str(k).replace('_',' ').title()} {v:+.3f}" for k,v in (card.get('top_factors') or [])[:6]))}</div>
-          <div class='ml-factor-list'>{html.escape(str(card.get('model_note') or ''))}</div>
-        </details>
+          <div class='ml-battle'>{battle}</div>
+          <div class='ml-detail-grid'>
+            <div class='ml-mini'><div class='ml-label'>DRIVES / TEAM</div><div class='ml-val'>{_fmt_num(drives,1)}</div></div>
+            <div class='ml-mini'><div class='ml-label'>PTS / DRIVE</div><div class='ml-val'>{away} {_fmt_num(apd,2)} · {home} {_fmt_num(hpd,2)}</div></div>
+            <div class='ml-mini'><div class='ml-label'>MODEL TOTAL</div><div class='ml-val'>{total}</div></div>
+            <div class='ml-mini'><div class='ml-label'>MARKET TOTAL</div><div class='ml-val'>{market_total}</div></div>
+            <div class='ml-mini'><div class='ml-label'>EXPECTED TO</div><div class='ml-val'>{away} {_fmt_num(card.get('expected_turnovers_away'),2)} · {home} {_fmt_num(card.get('expected_turnovers_home'),2)}</div></div>
+            <div class='ml-mini'><div class='ml-label'>DATA / STATUS</div><div class='ml-val'>{data}% · {'OFFICIAL' if card.get('official_moneyline_ready') else 'TRACK'}</div></div>
+          </div>
+          <div class='nfl-risk-strip' style='padding:0 10px 6px'>{''.join(f"<span class='nfl-risk-chip'>{html.escape(x)}</span>" for x in risk_bits)}</div>
+          <div class='ml-why'><b>WHY {fav}:</b> {html.escape(why)}</div>
         </section>
         """)
     markup.append("</div>")
@@ -11285,140 +11915,111 @@ def _render_moneyline_cards(cards):
 
 def _render_player_cards(rows, limit=None, header=None):
     if header:
-        st.markdown(f"<div class='section-title-pro'>{header}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='section-title-pro'>{html.escape(str(header))}</div>", unsafe_allow_html=True)
     if not rows:
         st.warning("No player cards available in this view.")
         return
-    page_size = int(limit or st.session_state.get("nfl_card_page_size", 12) or 12)
-    page_size = max(4, min(page_size, 50))
-    safe_key = re.sub(r"[^a-z0-9]+", "_", str(header or (rows[0].get("prop") if rows else "cards")).lower()).strip("_") or "cards"
-    pages = max(1, math.ceil(len(rows) / page_size))
-    page = st.number_input("Card page", min_value=1, max_value=pages, value=min(int(st.session_state.get(f"{safe_key}_card_page", 1) or 1), pages), step=1, key=f"{safe_key}_card_page")
-    lo=(int(page)-1)*page_size; hi=min(len(rows), lo+page_size)
-    shown = rows[lo:hi]
-    st.caption(f"Showing cards {lo+1}-{hi} of {len(rows)}. Only this page is rendered for speed.")
-    for i,p in enumerate(shown):
-        badge_class="good-badge" if p.get("pick")=="OVER" else "red-badge" if p.get("pick")=="UNDER" else "yellow-badge"
-        fair = '' if p.get('fair_prob') is None else str(round(p.get('fair_prob')*100,1))+'%'
-        data_w = _score_width(p.get('data_score'))
-        stab_w = _score_width(p.get('stability_score'))
-        opp_w = _score_width(p.get('opportunity_score'))
-        val_w = _score_width((p.get('fair_prob') or 0) * 100)
-        data_cls = _meter_class(p.get('data_score'))
-        stab_cls = _meter_class(p.get('stability_score'))
-        opp_cls = _meter_class(p.get('opportunity_score'))
-        val_cls = _meter_class((p.get('fair_prob') or 0) * 100)
-        mini_bars = _mini_recent_bars_from_player(p)
-        audit_label = p.get("audit_label") or "Partial"
-        savant_status=p.get("savant_status") or "MISSING"
-        market_txt = p.get("market_compare") or "Market: not loaded"
-        recent_txt = p.get("recent_form") or "Recent form: not loaded"
-        st.markdown(f"""
-        <div class='pick-card'>
-          <div class='player-name'>{p['player']} <span class='small-muted'>({p.get('position','')} · {p.get('team','')})</span></div>
-          <span class='badge'>{p.get('prop')}</span><span class='badge'>{p.get('matchup','')}</span><span class='badge {badge_class}'>{p.get('signal')}</span><span class='badge yellow-badge'>Audit {audit_label}</span><span class='badge'>Savant {savant_status}</span><span class='badge'>Upside {p.get('pure_upside')}</span><span class='badge'>Vol {p.get('volatility')}</span>
-          <div class='small-muted'>{market_txt}</div>
-          <div class='small-muted'>{recent_txt}</div>
-          <div class='trust-strip'>
-            <div class='trust-box'><div class='trust-label'>Data IQ</div><div class='trust-value'>{p.get('data_score')}</div><div class='progress-wrap'><div class='{data_cls}' style='width:{data_w}%'></div></div></div>
-            <div class='trust-box'><div class='trust-label'>Stability</div><div class='trust-value'>{p.get('stability_score')}</div><div class='progress-wrap'><div class='{stab_cls}' style='width:{stab_w}%'></div></div></div>
-            <div class='trust-box'><div class='trust-label'>Opportunity</div><div class='trust-value'>{p.get('opportunity_score')}</div><div class='progress-wrap'><div class='{opp_cls}' style='width:{opp_w}%'></div></div></div>
-            <div class='trust-box'><div class='trust-label'>Fair Prob</div><div class='trust-value'>{fair or '—'}</div><div class='progress-wrap'><div class='{val_cls}' style='width:{val_w}%'></div></div></div>
+    page_size=int(limit or st.session_state.get("nfl_card_page_size",12) or 12)
+    page_size=max(4,min(page_size,50))
+    safe_key=re.sub(r"[^a-z0-9]+","_",str(header or (rows[0].get("prop") if rows else "cards")).lower()).strip("_") or "cards"
+    pages=max(1,math.ceil(len(rows)/page_size))
+    page=st.number_input("Card page",min_value=1,max_value=pages,value=min(int(st.session_state.get(f"{safe_key}_card_page",1) or 1),pages),step=1,key=f"{safe_key}_card_page")
+    lo=(int(page)-1)*page_size; shown=rows[lo:min(len(rows),lo+page_size)]
+    st.caption(f"Showing cards {lo+1}-{lo+len(shown)} of {len(rows)}. PRESEASON uses rotation/workload uncertainty; REGULAR uses current-role/readiness context.")
+    cards=["<div class='nfl-elite-board'>"]
+    for idx,p in enumerate(shown,start=lo+1):
+        player=html.escape(str(p.get("player") or ""))
+        team=html.escape(str(p.get("team") or ""))
+        pos=html.escape(str(p.get("position") or ""))
+        opp=html.escape(str(p.get("opp") or ""))
+        matchup=html.escape(str(p.get("matchup") or ""))
+        phase=season_mode_for_row(p)
+        logo=html.escape(nfl_team_logo_url(team),quote=True)
+        logo_html=f"<img class='nfl-logo' src='{logo}' alt='{team} logo' loading='lazy' decoding='async' onerror=\"this.style.display='none'\">" if logo else "<div></div>"
+        rank_cls="top1" if idx==1 else "top2" if idx==2 else "top3" if idx==3 else ""
+        prop=html.escape(str(ACTIVE_NFL_MARKET_LABELS.get(p.get("prop"),p.get("prop") or "")))
+        pick=str(p.get("pick") or "PASS").upper()
+        line=_fmt_num(p.get("line"),1); proj=_fmt_num(p.get("projection"),1)
+        edge=safe_float(p.get("edge")); edge_txt="—" if edge is None else f"{edge:+.1f}"
+        fair=_ui_pct(p.get("fair_prob")); fair_txt="—" if fair is None else f"{fair:.0f}%"
+        data=_ui_pct(p.get("data_score")); data=0 if data is None else data
+        stability=_ui_pct(p.get("stability_score")); stability=0 if stability is None else stability
+        oppscore=_ui_pct(p.get("opportunity_score")); oppscore=0 if oppscore is None else oppscore
+        matchup_factor=safe_float(p.get("matchup_factor")); grade=_ui_grade_from_factor(matchup_factor)
+        grade_cls="nfl-good" if grade.startswith("A") else "nfl-warn" if grade.startswith("B") else "nfl-bad"
+        action=_ui_action_label(p)
+        action_cls="nfl-good" if "ELITE" in action or "STRONG" in action else "nfl-warn" if "LEAN" in action or "TRACK" in action else "nfl-bad"
+        env=p.get("env") or {}; exp=p.get("expected_opportunity") or {}
+        total=_fmt_num(p.get("game_total",env.get("game_total")),1)
+        spread=_fmt_num(p.get("spread",env.get("spread")),1)
+        plays=_fmt_num(exp.get("plays_pg",p.get("plays_pg")),1)
+        weather=html.escape(str(p.get("weather_risk") or env.get("weather_risk") or env.get("weather") or "—"))
+        opp_fields=_ui_opp_fields(p)
+        opp_html="".join(f"<div class='nfl-opp-box'><div class='nfl-label'>{html.escape(str(lbl))}</div><div class='nfl-val'>{html.escape(str(val))}</div></div>" for lbl,val in opp_fields)
+        p25=_fmt_num(p.get("p25"),1); p50=_fmt_num(p.get("p50"),1); p75=_fmt_num(p.get("p75"),1)
+        role=p.get("role") or {}
+        phase_extra=""
+        chips=[]
+        if phase=="PRESEASON":
+            wsrc=html.escape(str(p.get("preseason_workload_source") or "ROTATION MODEL"))
+            rc=p.get("preseason_role_confidence",p.get("preseason_rotation_confidence"))
+            rc_txt="—" if safe_float(rc) is None else f"{_ui_pct(rc):.0f}%"
+            phase_extra=f"<div class='nfl-context-lines'><b>PRESEASON</b><br>Workload: {wsrc}<br>Rotation confidence: {rc_txt}</div>"
+            chips.extend(["PRESEASON","ROTATION-AWARE",f"DATA {data:.0f}%"])
+        else:
+            curr="CURRENT ✓" if p.get("has_current_usage") or p.get("current_context_source") else "CURRENT PRIOR / FALLBACK"
+            phase_extra=f"<div class='nfl-context-lines'><b>REGULAR</b><br>{html.escape(curr)}<br>Role bucket: {html.escape(str(p.get('role_bucket') or '—'))}</div>"
+            chips.extend(["REGULAR",curr,f"DATA {data:.0f}%"])
+        if p.get("injury_risk"): chips.append(f"INJ {str(p.get('injury_risk')).upper()}")
+        if p.get("game_script_risk"): chips.append(f"SCRIPT {str(p.get('game_script_risk')).upper()}")
+        if weather!="—": chips.append(f"WX {weather}")
+        why=html.escape(_ui_player_why(p))
+        cards.append(f"""
+        <section class='nfl-elite-card'>
+          <div class='nfl-card-grid'>
+            <div>
+              <div class='nfl-ident'><div class='nfl-rank {rank_cls}'>#{idx}</div>{logo_html}<div><div class='nfl-player-name'>{player}</div><div class='nfl-subline'>{team} {('VS '+opp) if opp else ''} · {pos} · {matchup}</div></div></div>
+              <div class='nfl-readiness'><div class='nfl-mini-box'><div class='nfl-label'>DATA READINESS</div><div class='nfl-val'>{data:.0f}%</div><div class='nfl-meter'><i style='width:{data:.0f}%'></i></div></div>
+              <div class='nfl-mini-box'><div class='nfl-label'>ROLE CERTAINTY</div><div class='nfl-val'>{stability:.0f}%</div><div class='nfl-meter'><i style='width:{stability:.0f}%'></i></div></div></div>
+            </div>
+            <div class='nfl-market-panel'>
+              <div class='nfl-market-main'><div class='nfl-market-name'>{prop}</div><div class='nfl-line'>{pick} {line}</div><div class='nfl-dist'><div><div class='nfl-label'>P25</div><b>{p25}</b></div><div><div class='nfl-label'>PROJ</div><b>{proj}</b></div><div><div class='nfl-label'>P75</div><b>{p75}</b></div></div></div>
+              <div class='nfl-stat-box'><div class='nfl-label'>EDGE</div><div class='nfl-val {'nfl-good' if (edge or 0)>0 else 'nfl-bad' if (edge or 0)<0 else ''}'>{edge_txt}</div></div>
+              <div class='nfl-stat-box'><div class='nfl-label'>OPP SCORE</div><div class='nfl-val'>{oppscore:.0f}</div></div>
+              <div class='nfl-stat-box'><div class='nfl-label'>VOLATILITY</div><div class='nfl-val'>{html.escape(str(p.get('volatility') or '—'))}</div></div>
+            </div>
+            <div>
+              <div class='nfl-opportunity'><div class='nfl-opp-title'>OPPORTUNITY — PROJECTED / REAL INPUTS</div>{opp_html}</div>
+              <div class='nfl-context-row'><div class='nfl-risk-box'><div class='nfl-label'>MATCHUP GRADE</div><div class='nfl-match-grade {grade_cls}'>{grade}</div><div class='nfl-context-lines'>Factor {_fmt_num(matchup_factor,3)}<br>Defense risk {html.escape(str(p.get('defense_risk') or '—'))}</div></div>
+              <div class='nfl-risk-box'><div class='nfl-label'>GAME ENVIRONMENT</div><div class='nfl-context-lines'>Total {total} · Spread {spread}<br>Projected plays {plays}<br>Weather {weather}</div>{phase_extra}</div></div>
+            </div>
+            <div class='nfl-likely'><div><div class='nfl-label'>LIKELY</div><div class='pct'>{fair_txt}</div><div class='nfl-subline'>MODEL FAIR PROB</div></div><div class='nfl-action {action_cls}'>{action}</div></div>
           </div>
-          {mini_bars}
-          <div class='kpi-strip'>
-            <div class='metric-card'><div class='kpi-label'>Line</div><div class='kpi-value'>{p.get('line')}</div></div>
-            <div class='metric-card'><div class='kpi-label'>Projection</div><div class='kpi-value'>{p.get('projection')}</div></div>
-            <div class='metric-card'><div class='kpi-label'>Edge</div><div class='kpi-value'>{p.get('edge')}</div></div>
-            <div class='metric-card'><div class='kpi-label'>Fair Prob</div><div class='kpi-value'>{fair}</div></div>
-            <div class='metric-card'><div class='kpi-label'>P75</div><div class='kpi-value'>{p.get('p75')}</div></div>
-            <div class='metric-card'><div class='kpi-label'>P90 Ceiling</div><div class='kpi-value'>{p.get('p90')}</div></div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
-        with st.expander(f"View More — {p['player']} {p['prop']}"):
+          <div class='nfl-risk-strip'>{''.join(f"<span class='nfl-risk-chip'>{html.escape(str(x))}</span>" for x in chips)}</div>
+          <div class='nfl-why'><b>WHY:</b> {why}</div>
+        </section>
+        """)
+    cards.append("</div>")
+    st.markdown("".join(cards),unsafe_allow_html=True)
+
+    for p in shown:
+        with st.expander(f"Full Audit — {p.get('player','')} {p.get('prop','')}"):
             c1,c2,c3=st.columns(3)
             with c1:
-                st.subheader("Usage")
-                role=p.get("role", {})
-                st.write(f"Snap Share: **{role.get('snap','')}%**")
-                st.write(f"Route Participation: **{role.get('route','')}%**")
-                st.write(f"Target Share: **{role.get('target','')}%**")
-                st.write(f"Carry Share: **{role.get('carry','')}%**")
-                st.write(f"Red-Zone Usage: **{role.get('rz','')}%**")
-                opp_ctx=p.get("expected_opportunity", {}) or {}
-                if opp_ctx:
-                    st.write("---")
-                    st.write(f"Expected Plays: **{opp_ctx.get('plays_pg','')}**")
-                    st.write(f"Dropbacks: **{opp_ctx.get('dropbacks_pg','')}**")
-                    st.write(f"Routes: **{opp_ctx.get('routes_pg','')}**")
-                    st.write(f"Targets Est: **{opp_ctx.get('targets_pg_est','')}**")
-                    st.write(f"Carries Est: **{opp_ctx.get('carries_pg_est','')}**")
+                st.subheader("Usage / Opportunity")
+                st.json({"role":p.get("role") or {},"expected_opportunity":p.get("expected_opportunity") or {},"current_week_role":p.get("current_week_role") or {}},expanded=False)
             with c2:
-                st.subheader("Environment")
-                env=p.get("env", {})
-                st.write(f"Stadium: **{env.get('stadium','')}**")
-                st.write(f"Venue Team: **{env.get('home_team','')}** · Player: **{env.get('home_away','') or 'SITE TBD'}**")
-                st.write(f"Crowd Noise: **{env.get('crowd','')}**")
-                st.write(f"Roof: **{env.get('roof','')}**")
-                st.write(f"Surface: **{env.get('surface','')}**")
-                st.write(f"Altitude: **{env.get('altitude','')} ft**")
+                st.subheader("Environment / Matchup")
+                st.json({"env":p.get("env") or {},"matchup_factor":p.get("matchup_factor"),"offense_defense_rank_context":p.get("offense_defense_rank_context") or {},"advanced_context":p.get("advanced_context") or {}},expanded=False)
             with c3:
-                st.subheader("Risk Notes")
+                st.subheader("Audit / Risk")
+                st.write(f"Data Score: **{p.get('data_score','—')}** · Stability: **{p.get('stability_score','—')}** · Action: **{p.get('action_tier','—')}**")
+                st.write(f"Season Mode: **{season_mode_for_row(p)}** · Calibration: **{p.get('calibration_status','—')}**")
                 for n in p.get("notes",[]): st.write("- "+str(n))
-                st.write(f"Data Score: **{p.get('data_score')}/99**")
-                st.write(f"Opportunity Score: **{p.get('opportunity_score')}**")
-                st.write(f"Matchup Factor: **{p.get('matchup_factor')}**")
-                st.write(f"Offense/Defense Rank Factor: **{p.get('offense_defense_rank_factor')}**")
-                st.write(f"Game Script Factor: **{p.get('game_script_factor')}**")
-                st.write(f"Blowout Prob: **{p.get('blowout_prob')}**")
-                st.write(f"Advanced Factor: **{p.get('advanced_factor')}**")
-                shadow=p.get("savant_shadow") or {}
-                st.write(f"Savant Player Match: **{'YES' if p.get('savant_player_match') else 'NO'}**")
-                st.write(f"Savant Team Match: **{'YES' if p.get('savant_team_match') else 'NO'}**")
-                st.write(f"Savant Sample: **{p.get('savant_sample_size',0)}** · Reliability: **{p.get('savant_reliability',0)}**")
-                st.write(f"Savant Season: **{p.get('savant_season','')}** · Mode: **{p.get('savant_projection_mode','SHADOW_ONLY')}**")
-                st.write(f"Legacy / Savant Shadow: **{p.get('legacy_projection_pre_savant')} / {p.get('savant_shadow_projection')}**")
-                st.write(f"Workload Source: **{p.get('preseason_workload_source') or 'REGULAR_ROLE_ENGINE'}**")
-                if shadow:
-                    st.write("Savant Composite Audit:")
-                    st.json(shadow)
-                conflict=p.get("distribution_conflict") or {}
-                if conflict.get("conflict"):
-                    st.warning(f"DISTRIBUTION CONFLICT · mean {conflict.get('expected_mean')} · P50 {conflict.get('p50_fair_line')} · pick {conflict.get('pick_side')}")
-                audit=p.get("projection_audit") or {}
-                st.write(f"Projection Audit: **{audit.get('label', p.get('audit_label',''))}** ({audit.get('score', p.get('audit_score',''))}/{audit.get('max_score', 11)})")
-                hard_blocks=audit.get("hard_blocks") or []
-                if hard_blocks:
-                    st.write("Hard Blocks:")
-                    for hb in hard_blocks: st.write("- "+str(hb))
-                if p.get("market_compare"):
-                    st.write(f"Market: **{p.get('market_compare')}**")
-                if p.get("recent_form"):
-                    st.write(f"Recent Form: **{p.get('recent_form')}**")
-                if p.get("factor_stack"):
-                    st.write("Factor Stack:")
-                    st.json(p.get("factor_stack"))
-                if p.get('xgb_assist'):
-                    st.write(f"XGBoost Assist: **{(p.get('xgb_assist') or {}).get('status','OFF')}**")
-                    st.write(f"Bayesian/Markov Assist: **{(p.get('bayes_markov_assist') or {}).get('status','OFF')}**")
-                    st.write(f"Ensemble ML Assist: **{(p.get('ensemble_ml_assist') or {}).get('status','OFF')}**")
-                    st.write("Advanced context:")
-                    st.json({"xgb_assist": p.get('xgb_assist'), "bayes_markov_assist": p.get('bayes_markov_assist'), "ensemble_ml_assist": p.get('ensemble_ml_assist'), "line_sanity": p.get('line_sanity'), "projection_breakdown": p.get('projection_breakdown'), "qb_tier": p.get('qb_tier'), "offense_defense_rank_context": p.get('offense_defense_rank_context'), "advanced_context": p.get('advanced_context')})
-                st.write(f"Stability Score: **{p.get('stability_score')} /100**")
-                st.write(f"Action Tier: **{p.get('action_tier')}**")
-                if p.get('game_script_branches'):
-                    st.write("Game Script Branches:")
-                    st.json(p.get('game_script_branches'))
-                rejects=p.get('official_rejections') or []
-                if rejects:
-                    st.write("Official Filter Rejections:")
-                    for rr in rejects: st.write("- "+str(rr))
-                st.write(f"CLV Line Delta: **{p.get('line_delta')}**")
-                st.write(f"Source: **{p.get('source')}**")
+            st.subheader("Distribution / Models")
+            st.json({"p10":p.get("p10"),"p50":p.get("p50"),"p75":p.get("p75"),"p90":p.get("p90"),"passing_yards_model":p.get("passing_yards_model"),"receiving_yards_model":p.get("receiving_yards_model"),"rushing_yards_model":p.get("rushing_yards_model"),"projection_breakdown":p.get("projection_breakdown")},expanded=False)
             st.subheader("Alt Ladder")
-            st.dataframe(alt_ladder(p), use_container_width=True, hide_index=True)
-
+            st.dataframe(alt_ladder(p),use_container_width=True,hide_index=True)
 
 def _render_position_board(rows, position_name):
     st.markdown(f"<div class='section-title-pro'>{position_name} Prop Board</div>", unsafe_allow_html=True)
@@ -12122,13 +12723,21 @@ def _render_closing_review(rows):
     c3.metric("Model", MODEL_VERSION)
     st.dataframe(rdf.sort_values(["ready","fair_prob"], ascending=[False,False]), use_container_width=True, hide_index=True)
 
+
 def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh=True):
-    """Save current-season nflverse player/team context into the app's live context files."""
+    """Save current-season player + deep team context.
+
+    Player weekly/snap data provide role and volume. Full current-season PBP, when
+    available, supplies the five football data modules used by Moneyline:
+    possessions, trenches, hidden yards/special teams, game state/coaching, and
+    opponent-adjusted defense inputs. Missing PBP never invents values; the saved
+    last-season baseline remains the prior until real current-season data exists.
+    """
     season=int(season)
     weekly=fetch_nflverse_player_weekly_stats(season, force_refresh=force_refresh)
     if weekly.empty:
         request_log("AUTO_CURRENT_CONTEXT", "NO_DATA", f"season={season}")
-        return {"status":"NO_DATA", "season":season, "players":0, "teams":0}
+        return {"status":"NO_DATA", "season":season, "players":0, "teams":0, "pbp_rows":0}
     logs=weekly.copy()
     if "player_display_name" in logs.columns and "player" not in logs.columns:
         logs["player"]=logs["player_display_name"]
@@ -12137,11 +12746,11 @@ def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh
     if "position" not in logs.columns:
         logs["position"]=""
     for c in ["attempts","completions","passing_yards","targets","receptions","receiving_yards","air_yards","carries","rushing_yards"]:
-        if c not in logs.columns:
-            logs[c]=0
+        if c not in logs.columns: logs[c]=0
         logs[c]=pd.to_numeric(logs[c], errors="coerce").fillna(0)
     logs["week_num"]=pd.to_numeric(logs["week"], errors="coerce").fillna(0) if "week" in logs.columns else np.arange(len(logs))
-    # nflverse snap counts add the most important current-week role signal.
+
+    # Current offensive snap share.
     snap_bank={}
     try:
         snaps=fetch_nflverse_snap_counts(season, force_refresh=force_refresh)
@@ -12153,45 +12762,124 @@ def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh
             if pcol and tcol and pctcol:
                 s["_pct"]=pd.to_numeric(s[pctcol],errors="coerce")
                 s.loc[s["_pct"]<=1.01,"_pct"]*=100
-                if "week" in s.columns: s["_week"]=pd.to_numeric(s["week"],errors="coerce").fillna(0)
-                else: s["_week"]=np.arange(len(s))
+                s["_week"]=pd.to_numeric(s["week"],errors="coerce").fillna(0) if "week" in s.columns else np.arange(len(s))
                 for (pl,tm),sg in s.groupby([pcol,tcol],dropna=False):
                     sg=sg.sort_values("_week"); vals=sg["_pct"].dropna()
-                    if len(vals): snap_bank[(norm(pl),str(tm or ""))]={"snap_share":round(float(vals.mean()),2),"last3_snap_share":round(float(vals.tail(3).mean()),2),"last5_snap_share":round(float(vals.tail(5).mean()),2)}
+                    if len(vals):
+                        snap_bank[(norm(pl),str(tm or ""))]={
+                            "snap_share":round(float(vals.mean()),2),
+                            "last3_snap_share":round(float(vals.tail(3).mean()),2),
+                            "last5_snap_share":round(float(vals.tail(5).mean()),2),
+                        }
     except Exception as e:
         request_log("AUTO_CURRENT_SNAPS","ERROR",str(e)[:180])
+
+    # Offensive-line continuity: compare last year's five highest-snap OL with the
+    # current roster. This is a real continuity signal, not a generic OL ranking.
+    ol_continuity={}
+    try:
+        cur_roster=_normalize_roster_frame(fetch_nflverse_rosters(season,force_refresh=force_refresh))
+        prev_snaps=fetch_nflverse_snap_counts(int(season)-1,force_refresh=False)
+        if not cur_roster.empty and not prev_snaps.empty:
+            ps=prev_snaps.copy()
+            pcol=next((c for c in ["player","player_name","pfr_player_name"] if c in ps.columns),None)
+            tcol=next((c for c in ["team","recent_team"] if c in ps.columns),None)
+            poscol=next((c for c in ["position","pos"] if c in ps.columns),None)
+            snapcol=next((c for c in ["offense_snaps","offense","offense_snap_count"] if c in ps.columns),None)
+            pctcol=next((c for c in ["offense_pct","offense_snap_pct","offense_percentage"] if c in ps.columns),None)
+            if pcol and tcol:
+                if snapcol:
+                    ps["_ol_volume"]=pd.to_numeric(ps[snapcol],errors="coerce").fillna(0)
+                elif pctcol:
+                    ps["_ol_volume"]=pd.to_numeric(ps[pctcol],errors="coerce").fillna(0)
+                else:
+                    ps["_ol_volume"]=1.0
+                if poscol:
+                    olmask=ps[poscol].astype(str).str.upper().isin(["C","G","OG","LG","RG","T","OT","LT","RT","OL"])
+                    ps=ps[olmask]
+                current_names_by_team={}
+                for tm,rg in cur_roster.groupby("team") if "team" in cur_roster.columns else []:
+                    if "position" in rg.columns:
+                        rg=rg[rg["position"].astype(str).str.upper().isin(["C","G","OG","LG","RG","T","OT","LT","RT","OL"])]
+                    current_names_by_team[str(tm)]={norm(x) for x in rg["player"].tolist() if norm(x)}
+                for tm,sg in ps.groupby(tcol):
+                    tm=_normalize_nfl_team(tm)
+                    if not tm: continue
+                    agg=sg.groupby(pcol)["_ol_volume"].sum().sort_values(ascending=False).head(5)
+                    prior=[norm(x) for x in agg.index if norm(x)]
+                    retained=sum(1 for x in prior if x in current_names_by_team.get(tm,set()))
+                    ol_continuity[tm]={
+                        "ol_returning_starters_pct":round(100*retained/max(1,len(prior)),1),
+                        "ol_returning_core_count":retained,
+                        "ol_prior_core_count":len(prior),
+                    }
+    except Exception as e:
+        request_log("AUTO_OL_CONTINUITY","ERROR",str(e)[:180])
+
+    # Current-season play-by-play provides real QB rush decomposition and the
+    # team-level possession/trench/special-teams/game-state modules.
+    pbp=pd.DataFrame(); pbp_team_context={}; pbp_player_rush={}
+    try:
+        pbp=fetch_nflverse_pbp(season, force_refresh=force_refresh)
+        if not pbp.empty:
+            pbp_team_context, _, defense_adv, _, _, trench = _build_pbp_context(pbp)
+            # Merge defense rows and trench rows into the same current-team bank.
+            if isinstance(pbp_team_context,dict):
+                for _,r in defense_adv.iterrows() if isinstance(defense_adv,pd.DataFrame) and not defense_adv.empty else []:
+                    tm=_normalize_nfl_team(r.get("team"))
+                    if tm: pbp_team_context.setdefault(tm,{}).update({k:v for k,v in r.to_dict().items() if k!="team" and _usable_context_value(v)})
+                for _,r in trench.iterrows() if isinstance(trench,pd.DataFrame) and not trench.empty else []:
+                    tm=_normalize_nfl_team(r.get("team"))
+                    if tm: pbp_team_context.setdefault(tm,{}).update({k:v for k,v in r.to_dict().items() if k!="team" and _usable_context_value(v)})
+            # QB designed runs / scrambles / kneels from real PBP.
+            p=pbp.copy()
+            for c in ["qb_scramble","qb_kneel","rush_attempt","pass_attempt"]:
+                if c in p.columns: p[c]=pd.to_numeric(p[c],errors="coerce").fillna(0)
+            rusher_col=next((c for c in ["rusher_player_name","rusher"] if c in p.columns),None)
+            team_col="posteam" if "posteam" in p.columns else None
+            if rusher_col and team_col:
+                for (pl,tm),g in p.dropna(subset=[rusher_col,team_col]).groupby([rusher_col,team_col]):
+                    games=max(1,g["game_id"].nunique() if "game_id" in g.columns else g["week"].nunique() if "week" in g.columns else 1)
+                    kneels=float(g["qb_kneel"].sum()) if "qb_kneel" in g.columns else float(g.get("desc",pd.Series(dtype=str)).astype(str).str.contains("kneel",case=False,na=False).sum()) if "desc" in g.columns else 0.0
+                    scr=float(g["qb_scramble"].sum()) if "qb_scramble" in g.columns else float(g.get("desc",pd.Series(dtype=str)).astype(str).str.contains("scrambl",case=False,na=False).sum()) if "desc" in g.columns else 0.0
+                    rush=float(g["rush_attempt"].sum()) if "rush_attempt" in g.columns else len(g)
+                    designed=max(0.0,rush-scr-kneels)
+                    pbp_player_rush[(norm(pl),str(tm))]={
+                        "qb_scrambles_pg":round(scr/games,3),
+                        "qb_designed_runs_pg":round(designed/games,3),
+                        "qb_kneels_pg":round(kneels/games,3),
+                    }
+    except Exception as e:
+        request_log("AUTO_CURRENT_PBP","ERROR",str(e)[:180])
+
     player_rows=[]
     for (player, team, pos), g in logs.groupby(["player","team","position"], dropna=False):
         player=str(player or "").strip()
-        if not player:
-            continue
-        g=g.sort_values("week_num")
-        gp=max(1, len(g))
-        tail3=g.tail(3); tail5=g.tail(5)
-        targets=float(g["targets"].sum())
-        air=float(g["air_yards"].sum())
+        if not player: continue
+        g=g.sort_values("week_num"); gp=max(1,len(g)); tail3=g.tail(3); tail5=g.tail(5)
+        targets=float(g["targets"].sum()); air=float(g["air_yards"].sum())
         team_targets=logs[logs["team"].astype(str)==str(team)]["targets"].sum()
         snap_ctx=snap_bank.get((norm(player),str(team or "")),{})
-        player_rows.append({
-            "player":player,
-            "team":str(team or ""),
-            "position":str(pos or ""),
-            "snap_share":snap_ctx.get("snap_share",""),
-            "last3_snap_share":snap_ctx.get("last3_snap_share",""),
-            "last5_snap_share":snap_ctx.get("last5_snap_share",""),
-            "route_participation":"",
-            "target_share":round(100*targets/max(1.0, float(team_targets)),2) if team_targets else "",
-            "air_yards_share":"",
-            "red_zone_touch_share":"",
-            "targets_pg":round(targets/gp,3),
-            "receptions_pg":round(float(g["receptions"].sum())/gp,3),
-            "pass_attempts_pg":round(float(g["attempts"].sum())/gp,3),
-            "completions_pg":round(float(g["completions"].sum())/gp,3),
-            "receiving_yards_pg":round(float(g["receiving_yards"].sum())/gp,3),
-            "passing_yards_pg":round(float(g["passing_yards"].sum())/gp,3),
-            "rush_attempts_pg":round(float(g["carries"].sum())/gp,3),
-            "rushing_yards_pg":round(float(g["rushing_yards"].sum())/gp,3),
-            "yards_per_carry":round(float(g["rushing_yards"].sum())/max(1.0, float(g["carries"].sum())),3),
+        qb_rush=pbp_player_rush.get((norm(player),str(team or "")),{})
+        target_share=round(100*targets/max(1.0,float(team_targets)),2) if team_targets else ""
+        # A transparent route proxy is retained separately. We do NOT label snap share
+        # as actual route participation.
+        snap=safe_float(snap_ctx.get("snap_share"))
+        route_proxy=None
+        if snap is not None and str(pos or "").upper() in {"WR","TE","RB"}:
+            scale=0.97 if str(pos or "").upper()=="WR" else 0.84 if str(pos or "").upper()=="TE" else 0.63
+            route_proxy=round(float(clamp(snap*scale,0,100)),2)
+        row={
+            "player":player,"team":str(team or ""),"position":str(pos or ""),
+            "snap_share":snap_ctx.get("snap_share",""),"last3_snap_share":snap_ctx.get("last3_snap_share",""),
+            "last5_snap_share":snap_ctx.get("last5_snap_share",""),"route_participation":"",
+            "route_participation_proxy":route_proxy if route_proxy is not None else "",
+            "target_share":target_share,"air_yards_share":"","red_zone_touch_share":"",
+            "targets_pg":round(targets/gp,3),"receptions_pg":round(float(g["receptions"].sum())/gp,3),
+            "pass_attempts_pg":round(float(g["attempts"].sum())/gp,3),"completions_pg":round(float(g["completions"].sum())/gp,3),
+            "receiving_yards_pg":round(float(g["receiving_yards"].sum())/gp,3),"passing_yards_pg":round(float(g["passing_yards"].sum())/gp,3),
+            "rush_attempts_pg":round(float(g["carries"].sum())/gp,3),"rushing_yards_pg":round(float(g["rushing_yards"].sum())/gp,3),
+            "yards_per_carry":round(float(g["rushing_yards"].sum())/max(1.0,float(g["carries"].sum())),3),
             "current_games":int(gp),
             "last3_pass_attempts_pg":round(float(tail3["attempts"].mean()),3) if not tail3.empty else "",
             "last3_passing_yards_pg":round(float(tail3["passing_yards"].mean()),3) if not tail3.empty else "",
@@ -12209,30 +12897,36 @@ def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh
             "last5_rush_attempts_pg":round(float(tail5["carries"].mean()),3) if not tail5.empty else "",
             "last5_receiving_yards_pg":round(float(tail5["receiving_yards"].mean()),3) if not tail5.empty else "",
             "last5_rushing_yards_pg":round(float(tail5["rushing_yards"].mean()),3) if not tail5.empty else "",
-            "updated_at":now_iso(),
-        })
-    team_context={}
-    for team, g in logs.groupby("team", dropna=False):
-        team=str(team or "").strip()
-        if not team:
-            continue
-        weeks=max(1, g["week_num"].nunique())
-        pass_att=float(g["attempts"].sum())
-        rush_att=float(g["carries"].sum())
-        plays=pass_att+rush_att
-        team_context[team]={
-            "current_plays_pg":round(plays/weeks,2),
-            "current_pass_rate":round(100*pass_att/max(1.0, plays),2),
-            "current_rush_rate":round(100*rush_att/max(1.0, plays),2),
-            "updated_at":now_iso(),
-            "source":f"nflverse_player_weekly_{season}",
+            "updated_at":now_iso(),"source":f"nflverse_current_{season}",
         }
-    if player_rows:
-        pd.DataFrame(player_rows).to_csv(CURRENT_USAGE_FILE, index=False)
-    if team_context:
-        save_json(CURRENT_TEAM_CONTEXT_FILE, team_context)
-    request_log("AUTO_CURRENT_CONTEXT", "SAVED", f"season={season} players={len(player_rows)} teams={len(team_context)}")
-    return {"status":"SAVED", "season":season, "players":len(player_rows), "teams":len(team_context), "files":[CURRENT_USAGE_FILE.name, CURRENT_TEAM_CONTEXT_FILE.name]}
+        row.update(qb_rush); player_rows.append(row)
+
+    # Weekly stats are enough for pace. PBP enriches the same team rows with the
+    # deeper modules instead of replacing them.
+    team_context={}
+    for team,g in logs.groupby("team",dropna=False):
+        team=_normalize_nfl_team(team)
+        if not team: continue
+        weeks=max(1,g["week_num"].nunique()); pass_att=float(g["attempts"].sum()); rush_att=float(g["carries"].sum()); plays=pass_att+rush_att
+        ctx={
+            "current_plays_pg":round(plays/weeks,2),"current_pass_rate":round(100*pass_att/max(1.0,plays),2),
+            "current_rush_rate":round(100*rush_att/max(1.0,plays),2),"current_games":int(weeks),
+            "updated_at":now_iso(),"source":f"nflverse_player_weekly_{season}",
+        }
+        pctx=(pbp_team_context or {}).get(team,{}) if isinstance(pbp_team_context,dict) else {}
+        if isinstance(pctx,dict) and pctx:
+            ctx.update({k:v for k,v in pctx.items() if _usable_context_value(v)})
+            ctx["source"]=f"nflverse_current_pbp_{season}"
+            ctx["current_pbp_rows"]=int(len(pbp))
+        if team in ol_continuity:
+            ctx.update(ol_continuity[team])
+        team_context[team]=ctx
+
+    if player_rows: pd.DataFrame(player_rows).to_csv(CURRENT_USAGE_FILE,index=False)
+    if team_context: save_json(CURRENT_TEAM_CONTEXT_FILE,team_context)
+    request_log("AUTO_CURRENT_CONTEXT","SAVED",f"season={season} players={len(player_rows)} teams={len(team_context)} pbp={len(pbp)}")
+    return {"status":"SAVED","season":season,"players":len(player_rows),"teams":len(team_context),"pbp_rows":int(len(pbp)),
+            "deep_modules":bool(len(pbp)),"files":[CURRENT_USAGE_FILE.name,CURRENT_TEAM_CONTEXT_FILE.name]}
 
 def _vendor_endpoint_map(cfg):
     endpoints=cfg.get("endpoints") if isinstance(cfg.get("endpoints"), dict) else {}
@@ -12354,11 +13048,13 @@ def run_game_day_refresh():
         fetch_underdog_nfl_props.clear(); fetch_underdog_nfl_moneylines.clear(); safe_get_json.clear()
     except Exception:
         pass
-    try:
-        savant_refresh=refresh_nfl_savant_data(NFL_LAST_SEASON,SAVANT_DIR,force=False)
-    except Exception as exc:
-        savant_refresh=[{"board":"ALL","season":NFL_LAST_SEASON,"status":"LAST_GOOD_OR_MISSING","rows":0,"detail":str(exc)[:180]}]
-        request_log("NFL_SAVANT_REFRESH","ERROR",str(exc)[:180])
+    savant_refresh=[]
+    for savant_season in [NFL_CURRENT_SEASON,NFL_LAST_SEASON]:
+        try:
+            savant_refresh.extend(refresh_nfl_savant_data(savant_season,SAVANT_DIR,force=False))
+        except Exception as exc:
+            savant_refresh.append({"board":"ALL","season":savant_season,"status":"LAST_GOOD_OR_MISSING","rows":0,"detail":str(exc)[:180]})
+            request_log("NFL_SAVANT_REFRESH","ERROR",f"{savant_season}: {str(exc)[:180]}")
     cache_bust=int(time.time())
     props=fetch_underdog_nfl_props(cache_bust)
     moneylines=fetch_underdog_nfl_moneylines(cache_bust)
@@ -12540,6 +13236,7 @@ def _render_preseason_rotation_panel():
         st.dataframe(pd.DataFrame(list(saved.values())),use_container_width=True,hide_index=True)
 
 
+
 def regular_season_readiness_panel():
     """Visible regular-season data health panel; never mixes preseason grades."""
     db=projection_database_readiness()
@@ -12550,22 +13247,56 @@ def regular_season_readiness_panel():
     finals=load_final_inactives_context()
     weather=load_weather_context()
     try:
-        savant=_savant_banks(SAVANT_DIR,NFL_LAST_SEASON)
+        selected=int(NFL_CURRENT_SEASON)
+        savant=_savant_banks(SAVANT_DIR,selected)
         savant_players=len(savant.get("players",{})); savant_teams=len(savant.get("teams",{}))
+        if not savant_players and not savant_teams:
+            selected=int(NFL_LAST_SEASON); savant=_savant_banks(SAVANT_DIR,selected)
+            savant_players=len(savant.get("players",{})); savant_teams=len(savant.get("teams",{}))
     except Exception:
-        savant_players=0; savant_teams=0
+        selected=int(NFL_LAST_SEASON); savant_players=0; savant_teams=0
+
+    deep_fields={
+        "Possessions":["drives_pg","points_per_drive","yards_per_drive","plays_per_drive","third_down_conversion_rate","red_zone_trips_pg"],
+        "Trenches":["pressure_allowed_rate","sack_given_pressure_rate","def_pressure_rate","def_sack_given_pressure_rate","ol_returning_starters_pct"],
+        "Hidden yards":["return_yards_pg","punt_return_yards_pg","net_punt_yards","fg_over_expected_per_attempt","penalty_yards_pg"],
+        "Game state":["neutral_epa_per_play","neutral_success_rate","neutral_pass_rate","def_neutral_epa_allowed"],
+    }
+    deep_scores={}
+    if current_teams:
+        for label,fields in deep_fields.items():
+            total=max(1,len(current_teams)*len(fields))
+            have=sum(1 for ctx in current_teams.values() if isinstance(ctx,dict) for f in fields if _usable_context_value(ctx.get(f)))
+            deep_scores[label]=100*have/total
+    else:
+        deep_scores={k:0 for k in deep_fields}
+    route_have=0
+    if current_players:
+        route_have=sum(1 for r in current_players.values() if isinstance(r,dict) and (
+            _usable_context_value(r.get("route_participation")) or _usable_context_value(r.get("route_participation_proxy"))
+        ))
+    skill_score=min(100,100*route_have/max(1,len(current_players))) if current_players else 0
+
     checks=[
         ("Historical core",100 if db.get("ready") else 55),
         ("Current player usage",min(100,100*len(current_players)/350) if current_players else 0),
         ("Current team context",min(100,100*len(current_teams)/32) if current_teams else 0),
+        ("Possession / drive data",deep_scores.get("Possessions",0)),
+        ("OL/DL + pressure data",deep_scores.get("Trenches",0)),
+        ("Hidden yards / special teams",deep_scores.get("Hidden yards",0)),
+        ("Neutral game-state data",deep_scores.get("Game state",0)),
+        ("Skill-role / route coverage",skill_score),
         ("Depth charts",min(100,100*len(depth)/500) if depth else 0),
         ("Injuries",min(100,100*len(injuries)/120) if injuries else 0),
         ("Final inactives",100 if isinstance(finals,dict) and (finals.get("teams") or finals.get("confirmed_matchups")) else 35),
-        ("NGS / Savant",min(100,55+min(45,savant_teams*1.4)) if savant_players or savant_teams else 0),
+        (f"NGS / Savant ({selected})",min(100,55+min(45,savant_teams*1.4)) if savant_players or savant_teams else 0),
         ("Weather",100 if weather else 55),
     ]
+    # Core/deep modules matter more than optional live hooks in the global score.
     score=int(round(np.mean([v for _,v in checks]))) if checks else 0
-    return {"score":score,"checks":checks,"label":"STRONG" if score>=82 else "USABLE" if score>=70 else "BUILDING"}
+    deep_floor=min(deep_scores.values()) if deep_scores else 0
+    if deep_floor<35: score=min(score,79)
+    return {"score":score,"checks":checks,"deep_scores":deep_scores,"label":"STRONG" if score>=82 else "USABLE" if score>=70 else "BUILDING"}
 
 st.markdown(f"""
 <div class='hero-panel'>
@@ -13174,6 +13905,21 @@ elif active_page == 'Money Line':
     elif moneyline_cards:
         st.info("MODEL ONLY: the live Underdog NFL feed has matchups but no team moneyline prices. Model odds are labeled; no sportsbook price is fabricated.")
     _render_moneyline_cards(moneyline_cards)
+    if active_season_mode=="REGULAR" and moneyline_cards:
+        st.subheader("Regular-Season Moneyline Save + Grade")
+        c1,c2=st.columns(2)
+        if c1.button("Save REGULAR Moneyline Board",use_container_width=True,key="save_regular_ml_board_v746"):
+            n,sid=save_moneyline_snapshot(moneyline_cards,"BEFORE")
+            st.success(f"Saved {n} regular-season Moneyline games · {sid}")
+        ml_results_file=c2.file_uploader("Grade Moneyline CSV (away, home, away_score, home_score)",type=["csv"],key="ml_grade_csv_v746")
+        if ml_results_file is not None and st.button("Grade Saved REGULAR Moneylines",use_container_width=True,key="grade_regular_ml_v746"):
+            graded=grade_moneyline_results_csv(ml_results_file)
+            st.success(f"Graded {len(graded)} regular-season Moneyline games.") if graded else st.warning("No saved Moneyline games matched that results file.")
+        ml_cal=moneyline_calibration_summary()
+        if ml_cal:
+            q1,q2,q3,q4,q5=st.columns(5)
+            q1.metric("ML Games",ml_cal.get("games",0)); q2.metric("Win Rate",f"{100*ml_cal.get('win_rate',0):.1f}%")
+            q3.metric("Brier",f"{ml_cal.get('brier',0):.3f}"); q4.metric("Log Loss",f"{ml_cal.get('log_loss',0):.3f}"); q5.metric("Margin MAE",f"{ml_cal.get('margin_mae',0):.1f}")
     if active_moneylines:
         with st.expander("Exact moneyline feed rows",expanded=False):
             st.dataframe(pd.DataFrame(active_moneylines),use_container_width=True,hide_index=True)
