@@ -38,8 +38,14 @@ SAVANT_BOARD_ENDPOINTS = {
     "league": "/api/league",
 }
 SAVANT_REQUIRED_BOARDS = {
-    "receiving", "ngs-receiving", "route-tree", "passing", "ngs-passing",
+    "receiving", "ngs-receiving", "passing", "ngs-passing",
     "rushing", "ngs-rushing", "pressure", "penalties",
+}
+SAVANT_OPTIONAL_BOARDS = {"route-tree", "league", "movers", "charting"}
+NFLVERSE_NGS_FALLBACK_URLS = {
+    "ngs-passing": "https://github.com/nflverse/nflverse-data/releases/download/nextgen_stats/ngs_passing.csv",
+    "ngs-receiving": "https://github.com/nflverse/nflverse-data/releases/download/nextgen_stats/ngs_receiving.csv",
+    "ngs-rushing": "https://github.com/nflverse/nflverse-data/releases/download/nextgen_stats/ngs_rushing.csv",
 }
 
 BOARD_FILENAME_HINTS = {
@@ -508,6 +514,27 @@ def _request_json(session, url, timeout=(4.0, 14.0), attempts=3):
     raise RuntimeError(str(last_error))
 
 
+def _fetch_nflverse_ngs_fallback(client, board, season):
+    """Official nflverse NGS fallback. Keeps NGS independent from fragile nflsavant endpoints."""
+    url=NFLVERSE_NGS_FALLBACK_URLS.get(board)
+    if not url: raise ValueError("no nflverse fallback configured")
+    resp=client.get(url,timeout=45)
+    resp.raise_for_status()
+    raw=resp.content
+    frame=read_savant_csv(raw)
+    prepared=_prepare_savant_frame(frame,board,int(season))
+    # nflverse column compatibility names
+    if "player" not in prepared.columns and "player_display_name" in prepared.columns:
+        prepared["player"]=prepared["player_display_name"]
+    if "team" not in prepared.columns and "team_abbr" in prepared.columns:
+        prepared["team"]=prepared["team_abbr"]
+    if "position" not in prepared.columns and "player_position" in prepared.columns:
+        prepared["position"]=prepared["player_position"]
+    prepared=_normalized_frame(prepared,board,int(season))
+    valid,detail=_frame_is_valid(prepared,board)
+    if not valid: raise ValueError(detail)
+    return prepared,raw,url
+
 def refresh_nfl_savant_data(season, savant_dir, force=False, ttl_hours=12, session=None) -> list[dict]:
     """Refresh stable Savant JSON endpoints; preserve last-good files on every error."""
     season = int(season)
@@ -560,7 +587,24 @@ def refresh_nfl_savant_data(season, savant_dir, force=False, ttl_hours=12, sessi
             entries.append(entry)
             results.append({"board": board, "season": season, "status": "SAVED", "rows": len(frame), "detail": url})
         except Exception as exc:
-            fallback = "LAST_GOOD" if existing and Path(str(existing.get("normalized_path") or "")).exists() else "UPLOAD_REQUIRED"
+            if board in NFLVERSE_NGS_FALLBACK_URLS:
+                try:
+                    frame,raw,fallback_url=_fetch_nflverse_ngs_fallback(client,board,season)
+                    raw_dir=root / "raw" / str(season); norm_dir=root / "normalized" / str(season)
+                    raw_dir.mkdir(parents=True,exist_ok=True); norm_dir.mkdir(parents=True,exist_ok=True)
+                    raw_path=raw_dir / f"{board}_nflverse.csv"; norm_path=norm_dir / f"{board}.csv"
+                    raw_path.write_bytes(raw); frame.to_csv(norm_path,index=False)
+                    entry={"board":board,"season":season,"source_filename":raw_path.name,"source_url":fallback_url,
+                           "pulled_at":_now_iso(),"checksum":hashlib.sha256(raw).hexdigest(),"rows":int(len(frame)),
+                           "columns":int(len(frame.columns)),"parse_status":"VALID","raw_path":str(raw_path),
+                           "normalized_path":str(norm_path),"source_family":"nflverse_ngs_fallback"}
+                    entries=[e for e in entries if not (e.get("season")==season and e.get("board")==board)]
+                    entries.append(entry)
+                    results.append({"board":board,"season":season,"status":"SAVED_NFLVERSE","rows":len(frame),"detail":fallback_url})
+                    continue
+                except Exception as ngs_exc:
+                    exc=RuntimeError(f"Savant failed: {str(exc)[:90]} | nflverse NGS failed: {str(ngs_exc)[:90]}")
+            fallback = "LAST_GOOD" if existing and Path(str(existing.get("normalized_path") or "")).exists() else ("OPTIONAL_UNAVAILABLE" if board in SAVANT_OPTIONAL_BOARDS else "UPLOAD_REQUIRED")
             results.append({"board": board, "season": season, "status": fallback, "rows": existing.get("rows", 0), "detail": str(exc)[:180]})
     save_savant_manifest(root, entries)
     clear_savant_runtime_cache()
@@ -828,10 +872,14 @@ def savant_data_readiness(savant_dir, season=None) -> dict:
     selected_entries = [entry for entry in entries if selected is not None and int(entry.get("season", -1)) == selected]
     boards = {entry.get("board") for entry in selected_entries}
     missing = sorted(SAVANT_REQUIRED_BOARDS - boards)
+    required_present=sorted(SAVANT_REQUIRED_BOARDS & boards)
+    optional_present=sorted(SAVANT_OPTIONAL_BOARDS & boards)
+    optional_missing=sorted(SAVANT_OPTIONAL_BOARDS - boards)
     rows = sum(int(entry.get("rows", 0) or 0) for entry in selected_entries)
     status = "FULL" if not missing else "PARTIAL" if boards else "MISSING"
     return {"status": status, "season": selected, "boards": sorted(boards), "missing": missing,
-            "board_count": len(boards), "required_count": len(SAVANT_REQUIRED_BOARDS),
+            "board_count": len(required_present), "required_count": len(SAVANT_REQUIRED_BOARDS),
+            "required_present":required_present,"optional_present":optional_present,"optional_missing":optional_missing,
             "rows": rows, "updated_at": manifest.get("updated_at")}
 
 
@@ -1103,8 +1151,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.51.2 — PRODUCTION PACK AUTO-ROUTE + ROLE INTEGRITY"
-MODEL_VERSION = "nfl-prop-engine-v7.51.2"
+APP_VERSION = "NFL v7.52 — CORE DATA COMPLETE + MARKET CACHE FIX"
+MODEL_VERSION = "nfl-prop-engine-v7.52.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -13623,9 +13671,9 @@ def _render_nfl_savant_admin():
     readiness=savant_data_readiness(SAVANT_DIR,NFL_LAST_SEASON)
     c1,c2,c3=st.columns(3)
     c1.metric("Status",readiness.get("status","MISSING"))
-    c2.metric("Boards",f"{readiness.get('board_count',0)}/{readiness.get('required_count',9)}")
+    c2.metric("Core boards",f"{readiness.get('board_count',0)}/{readiness.get('required_count',8)}")
     c3.metric("Rows",readiness.get("rows",0))
-    st.caption("Supplemental player efficiency and matchup context. Production picks remain on the V7.32 baseline while Savant runs in shadow mode.")
+    st.caption("Core efficiency context: passing/receiving/rushing + NGS + pressure + penalties. Route-tree is tracked separately as optional because no dependable public season-board feed is required by the core projection engine.")
     st.info("Savant boards and the v7.51 Production Data Pack are different. You can now upload either here; the app will auto-route the production override ZIP instead of misreading it as Savant data.")
     uploads=st.file_uploader(
         "Savant board ZIP/CSV OR v7.51 Production Data Pack",type=["zip","csv"],accept_multiple_files=True,
@@ -13670,7 +13718,9 @@ def _render_nfl_savant_admin():
     backup=build_savant_backup_zip(SAVANT_DIR)
     st.download_button("Download Current Savant Pack",data=backup,file_name=f"nfl_savant_pack_{NFL_LAST_SEASON}.zip",mime="application/zip",use_container_width=True,key="download_savant_pack")
     if readiness.get("missing"):
-        st.caption("Upload fallback still needed for: "+", ".join(readiness.get("missing") or []))
+        st.caption("Core fallback still needed for: "+", ".join(readiness.get("missing") or []))
+    if readiness.get("optional_present") or readiness.get("optional_missing"):
+        st.caption("Optional boards present: "+(", ".join(readiness.get("optional_present") or []) or "none")+" · optional unavailable/not loaded: "+(", ".join(readiness.get("optional_missing") or []) or "none"))
     override_status=[]
     for fn,target in PRODUCTION_OVERRIDE_TARGETS.items():
         p=Path(target)
@@ -14051,7 +14101,8 @@ if not board_readiness.get("ready") and active_season_mode=="REGULAR":
         st.caption(f"{len(blocked_live_rows)} live lines were received but are not being projected from fallback baselines.")
 elif not board_readiness.get("ready") and active_season_mode=="PRESEASON":
     st.warning("Historical coverage is partial. Rotation-first preseason estimates remain visible, but weak rows are PASS-gated.")
-projection_cache_key = f"{active_season_mode}|" + _board_projection_cache_key(raw, primary_lines_only)
+_market_cache_scope=",".join(sorted(str(x) for x in (prop_filter or [])))
+projection_cache_key = f"{active_season_mode}|{_market_cache_scope}|" + _board_projection_cache_key(raw, primary_lines_only)
 projection_cache=st.session_state.setdefault("nfl_projection_cache",{})
 cache_entry=projection_cache.get(projection_cache_key)
 cache_hit=isinstance(cache_entry,dict) and isinstance(cache_entry.get("rows"),list)
@@ -14132,7 +14183,7 @@ if not side_audit.empty:
 if live:
     cached_meta = load_last_pulled_board()
     build_note = "cached projections reused" if cache_hit else f"built in {st.session_state.get('nfl_projection_cache_seconds','—')}s"
-    st.success(f"🟢 Underdog NFL feed: {len(live)} valid rows · {len(raw)} projected rows · {build_note}. Last board pull: {cached_meta.get('pulled_at') or 'current refresh'}.")
+    st.success(f"🟢 Underdog NFL feed: {len(live)} valid rows · {len(projected_base)} projected in this market view · {build_note}. Last board pull: {cached_meta.get('pulled_at') or 'current refresh'}.")
 else:
     st.warning("No live Underdog NFL rows were detected. Click 🔄 Pull Fresh Underdog Lines in the sidebar when props are posted.")
 
@@ -14503,7 +14554,22 @@ def _v749_build_audit_zip():
         put('00_META.json',meta); put('01_LIVE_UNDERDOG_ROWS.json',live_rows); put('02_ACTIVE_ROWS.json',active_rows)
         put('03_MERGED_MODEL_INPUTS.json',merged); put('04_LOADED_DATA_BANKS.json',banks); put('05_LOADER_ERRORS.json',loader_errors)
         put('06_MERGE_ERRORS.json',merge_errors); put('07_READINESS.json',readiness); put('08_MODEL_SETTINGS.json',settings)
-        put('09_PROJECTION_CACHE.json',st.session_state.get('nfl_projection_cache',{})); put('10_MONEYLINE_ROWS.json',globals().get('moneylines',[]))
+        _pcache=st.session_state.get('nfl_projection_cache',{})
+        put('09_PROJECTION_CACHE.json',_pcache); put('10_MONEYLINE_ROWS.json',globals().get('moneylines',[]))
+        _all_proj=[]; _all_err=[]; _seen=set()
+        for _ck,_ce in (_pcache.items() if isinstance(_pcache,dict) else []):
+            if not isinstance(_ce,dict): continue
+            for _pr in _ce.get('rows',[]) or []:
+                _id=(str(_pr.get('player')),str(_pr.get('prop')),str(_pr.get('line')),str(_pr.get('team')),str(_pr.get('opponent')))
+                if _id not in _seen:
+                    _seen.add(_id); _all_proj.append(_pr)
+            _all_err.extend(_ce.get('errors',[]) or [])
+        _market_counts={}
+        for _pr in _all_proj:
+            _mk=str(_pr.get('prop') or 'UNKNOWN'); _market_counts[_mk]=_market_counts.get(_mk,0)+1
+        put('09B_ALL_CACHED_PROJECTIONS.json',_all_proj)
+        put('09C_PROJECTION_ERRORS_ALL.json',_all_err)
+        put('09D_PROJECTION_MARKET_COUNTS.json',_market_counts)
         # Actual loaded Savant/NGS pack used by the app, current + prior season.
         savant_dir=globals().get('SAVANT_DIR'); pack_fn=globals().get('load_savant_pack'); manifest_fn=globals().get('load_savant_manifest')
         if callable(manifest_fn) and savant_dir is not None:
@@ -14540,4 +14606,4 @@ with st.sidebar.expander('🧪 FULL LIVE AUDIT DOWNLOAD', expanded=False):
                     st.error(f'Audit failed safely: {str(e)[:600]}')
         if st.session_state.get('v749_audit_blob'):
             _stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
-            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v749_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
+            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v752_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
