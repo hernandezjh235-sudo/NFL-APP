@@ -1103,8 +1103,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.51 — PRODUCTION DATA + ROLE INTEGRITY"
-MODEL_VERSION = "nfl-prop-engine-v7.51.0"
+APP_VERSION = "NFL v7.51.1 — PRODUCTION PACK AUTO-ROUTE + ROLE INTEGRITY"
+MODEL_VERSION = "nfl-prop-engine-v7.51.1"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -13564,6 +13564,61 @@ def _render_manual_override_panel():
     if data and st.checkbox("Show current manual overrides", value=False, key="show_current_manual_overrides"):
         st.json(data)
 
+PRODUCTION_OVERRIDE_TARGETS = {
+    "injury_overrides.csv": INJURY_OVERRIDE_CSV,
+    "final_inactives.csv": FINAL_INACTIVES_CSV,
+    "role_overrides.csv": ROLE_OVERRIDE_CSV,
+    "defensive_injury_overrides.csv": DEF_INJURY_OVERRIDE_CSV,
+}
+
+def _route_production_override_uploads(uploaded_files):
+    """Accept the v7.51 production-data ZIP anywhere in Admin and route exact files."""
+    results=[]
+    for item in uploaded_files or []:
+        name=Path(getattr(item,"name","upload")).name
+        raw=_raw_bytes(item)
+        members=[]
+        if name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                    for member in z.infolist():
+                        if member.is_dir(): continue
+                        members.append((Path(member.filename).name,z.read(member)))
+            except Exception as exc:
+                results.append({"file":name,"status":"ERROR","detail":f"zip read failed: {str(exc)[:120]}"})
+                continue
+        else:
+            members=[(name,raw)]
+        for clean_name,data in members:
+            target=PRODUCTION_OVERRIDE_TARGETS.get(clean_name)
+            if target is None:
+                continue
+            try:
+                pd.read_csv(io.BytesIO(data),nrows=5)
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_bytes(data)
+                results.append({"file":clean_name,"status":"SAVED","target":target.name,
+                                "detail":"production override routed"})
+            except Exception as exc:
+                results.append({"file":clean_name,"status":"ERROR","target":target.name,
+                                "detail":str(exc)[:120]})
+    return results
+
+def _contains_production_override_files(uploaded_files):
+    wanted=set(PRODUCTION_OVERRIDE_TARGETS)
+    for item in uploaded_files or []:
+        name=Path(getattr(item,"name","upload")).name
+        raw=_raw_bytes(item)
+        if name in wanted: return True
+        if name.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                    names={Path(m.filename).name for m in z.infolist() if not m.is_dir()}
+                if names & wanted: return True
+            except Exception:
+                pass
+    return False
+
 def _render_nfl_savant_admin():
     readiness=savant_data_readiness(SAVANT_DIR,NFL_LAST_SEASON)
     c1,c2,c3=st.columns(3)
@@ -13571,18 +13626,29 @@ def _render_nfl_savant_admin():
     c2.metric("Boards",f"{readiness.get('board_count',0)}/{readiness.get('required_count',9)}")
     c3.metric("Rows",readiness.get("rows",0))
     st.caption("Supplemental player efficiency and matchup context. Production picks remain on the V7.32 baseline while Savant runs in shadow mode.")
+    st.info("Savant boards and the v7.51 Production Data Pack are different. You can now upload either here; the app will auto-route the production override ZIP instead of misreading it as Savant data.")
     uploads=st.file_uploader(
-        "Savant ZIP or CSV files",type=["zip","csv"],accept_multiple_files=True,
+        "Savant board ZIP/CSV OR v7.51 Production Data Pack",type=["zip","csv"],accept_multiple_files=True,
         key="nfl_savant_pack_upload",
     )
-    if st.button("Import NFL Savant Data Pack",use_container_width=True,key="import_nfl_savant_pack"):
+    if st.button("Import / Auto-Route Data Pack",use_container_width=True,key="import_nfl_savant_pack"):
         if not uploads:
-            st.warning("Choose a ZIP or one or more Savant CSV files first.")
+            st.warning("Choose a ZIP or one or more CSV files first.")
+        elif _contains_production_override_files(uploads):
+            routed=_route_production_override_uploads(uploads)
+            st.session_state["nfl_savant_import_results"]=routed
+            clear_projection_result_cache()
+            saved=sum(1 for r in routed if r.get("status")=="SAVED")
+            if saved:
+                st.success(f"Recognized the v7.51 Production Data Pack and routed {saved} override files to Projection Data. This ZIP is not a Savant board pack.")
+            else:
+                st.warning("Production override filenames were detected, but none were saved.")
         else:
             results=import_savant_payloads(uploads,SAVANT_DIR,NFL_LAST_SEASON)
             st.session_state["nfl_savant_import_results"]=results
             clear_projection_result_cache()
-            st.success(f"Processed {len(results)} Savant files.")
+            valid=sum(1 for r in results if r.get("valid"))
+            st.success(f"Processed {len(results)} Savant files · {valid} valid board files.")
     import_results=st.session_state.get("nfl_savant_import_results") or []
     if import_results:
         st.dataframe(pd.DataFrame(import_results),use_container_width=True,hide_index=True)
@@ -13605,6 +13671,17 @@ def _render_nfl_savant_admin():
     st.download_button("Download Current Savant Pack",data=backup,file_name=f"nfl_savant_pack_{NFL_LAST_SEASON}.zip",mime="application/zip",use_container_width=True,key="download_savant_pack")
     if readiness.get("missing"):
         st.caption("Upload fallback still needed for: "+", ".join(readiness.get("missing") or []))
+    override_status=[]
+    for fn,target in PRODUCTION_OVERRIDE_TARGETS.items():
+        p=Path(target)
+        rows=0
+        if p.exists():
+            try: rows=len(pd.read_csv(p))
+            except Exception: rows=0
+        override_status.append({"override_file":fn,"installed":p.exists(),"rows":rows})
+    with st.expander("Production override pack status",expanded=False):
+        st.dataframe(pd.DataFrame(override_status),use_container_width=True,hide_index=True)
+        st.caption("0 rows is valid for a blank template. Only verified real rows should be added; blank templates do not raise readiness by themselves.")
 
 def _render_preseason_rotation_panel():
     st.caption("Coach-plan inputs own preseason workload. Saved shares are reconciled within each position room.")
