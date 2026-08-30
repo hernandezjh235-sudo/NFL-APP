@@ -232,6 +232,10 @@ def _schema_score(frame: pd.DataFrame, board: str) -> int:
 
 def detect_savant_board(filename: str, frame: pd.DataFrame) -> str | None:
     name = Path(str(filename or "")).name.lower().replace("_", "-")
+    # Verified/full nflverse NGS exports overlap in schema, so filename identity wins.
+    for board in ("ngs-passing", "ngs-receiving", "ngs-rushing"):
+        if board in name:
+            return board
     hinted = []
     for board, hints in BOARD_FILENAME_HINTS.items():
         if any(hint in name for hint in hints):
@@ -1151,8 +1155,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.52 — CORE DATA COMPLETE + MARKET CACHE FIX"
-MODEL_VERSION = "nfl-prop-engine-v7.52.0"
+APP_VERSION = "NFL v7.52.1 — VERIFIED NGS IMPORT + MARKET CACHE FIX"
+MODEL_VERSION = "nfl-prop-engine-v7.52.1"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -13679,6 +13683,22 @@ def _render_nfl_savant_admin():
         "Savant board ZIP/CSV OR v7.51 Production Data Pack",type=["zip","csv"],accept_multiple_files=True,
         key="nfl_savant_pack_upload",
     )
+    if uploads and not _contains_production_override_files(uploads):
+        _preflight=[]
+        for _nm,_payload in _iter_payloads(uploads):
+            if isinstance(_payload,Exception):
+                _preflight.append({"file":_nm,"board":"ZIP_ERROR","season":"","rows":0,"valid":False,"detail":str(_payload)[:100]})
+                continue
+            try:
+                _fr=read_savant_csv(_payload); _bd=detect_savant_board(_nm,_fr); _ss=_season_from_name(_nm,NFL_LAST_SEASON)
+                _pp=_prepare_savant_frame(_fr,_bd,_ss) if _bd else _fr
+                _ok,_why=_frame_is_valid(_pp,_bd) if _bd else (False,"unknown board")
+                _preflight.append({"file":_nm,"board":_bd or "UNKNOWN","season":_ss,"rows":len(_pp),"columns":len(_pp.columns),"valid":bool(_ok),"detail":_why})
+            except Exception as _exc:
+                _preflight.append({"file":_nm,"board":"ERROR","season":"","rows":0,"columns":0,"valid":False,"detail":str(_exc)[:120]})
+        if _preflight:
+            st.caption("Upload preflight — verify these rows BEFORE importing:")
+            st.dataframe(pd.DataFrame(_preflight),use_container_width=True,hide_index=True)
     if st.button("Import / Auto-Route Data Pack",use_container_width=True,key="import_nfl_savant_pack"):
         if not uploads:
             st.warning("Choose a ZIP or one or more CSV files first.")
@@ -13696,7 +13716,11 @@ def _render_nfl_savant_admin():
             st.session_state["nfl_savant_import_results"]=results
             clear_projection_result_cache()
             valid=sum(1 for r in results if r.get("valid"))
-            st.success(f"Processed {len(results)} Savant files · {valid} valid board files.")
+            saved=sorted({str(r.get("detected_board")) for r in results if r.get("valid") and r.get("saved_path")})
+            if saved:
+                st.success(f"Processed {len(results)} Savant files · {valid} valid · SAVED: "+", ".join(saved)+".")
+            else:
+                st.error(f"Processed {len(results)} files but saved 0 boards. Do not rebuild the feature store; inspect the import table below.")
     import_results=st.session_state.get("nfl_savant_import_results") or []
     if import_results:
         st.dataframe(pd.DataFrame(import_results),use_container_width=True,hide_index=True)
@@ -14606,4 +14630,4 @@ with st.sidebar.expander('🧪 FULL LIVE AUDIT DOWNLOAD', expanded=False):
                     st.error(f'Audit failed safely: {str(e)[:600]}')
         if st.session_state.get('v749_audit_blob'):
             _stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
-            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v752_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
+            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v7521_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
