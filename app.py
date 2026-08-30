@@ -995,6 +995,59 @@ def attach_best_savant_context(row, savant_dir):
     out["savant_prior_fallback"]=bool(season!=int(NFL_CURRENT_SEASON))
     return out
 
+def _apply_prior_savant_td_role(row):
+    """Bridge verified Savant red-zone usage into Anytime TD role inputs.
+
+    Receiving board supplies RZ targets/share and goal-line targets; rushing board
+    supplies RZ carries/share and goal-line carries. Current PBP always wins.
+    """
+    out=dict(row or {})
+    current_games=safe_float(out.get("current_games"),0) or 0
+    if current_games>=1 and str(out.get("red_zone_data_quality") or "").upper()=="CURRENT_PBP":
+        return out
+    pctx=out.get("savant_player_context") or {}
+    if not isinstance(pctx,dict) or not pctx.get("matched"):
+        return out
+
+    rz_targets=safe_float(pctx.get("receiving__rzt"),0) or 0
+    rz_target_share=safe_float(pctx.get("receiving__rzt_share"))
+    gl_targets=safe_float(pctx.get("receiving__glt"),0) or 0
+    rz_carries=safe_float(pctx.get("rushing__rz_carries"),0) or 0
+    rz_carry_share=safe_float(pctx.get("rushing__rz_carry_share"))
+    gl_carries=safe_float(pctx.get("rushing__goal_line_carries"),0) or 0
+    if rz_targets<=0 and rz_carries<=0 and gl_targets<=0 and gl_carries<=0:
+        return out
+
+    prior_team=_normalize_nfl_team(pctx.get("team") or out.get("team"))
+    team_ctx=load_team_context().get(prior_team,{}) if prior_team else {}
+    rz_pass_pct=safe_float(team_ctx.get("red_zone_pass_rate"),50.0)
+    rz_pass_weight=clamp((rz_pass_pct or 50.0)/100.0,0.20,0.80)
+    shares=[]
+    if rz_target_share is not None:
+        shares.append(float(rz_target_share)*rz_pass_weight)
+    if rz_carry_share is not None:
+        shares.append(float(rz_carry_share)*(1.0-rz_pass_weight))
+    combined_share=sum(shares) if shares else None
+
+    # Fill only absent prior-role fields. These are prior-season counts/shares, never
+    # presented as current-season usage.
+    if (safe_float(out.get("red_zone_targets"),0) or 0)<=0 and rz_targets>0:
+        out["red_zone_targets"]=rz_targets
+    if (safe_float(out.get("red_zone_carries"),0) or 0)<=0 and rz_carries>0:
+        out["red_zone_carries"]=rz_carries
+    if (safe_float(out.get("goal_line_touches"),0) or 0)<=0 and (gl_targets+gl_carries)>0:
+        out["goal_line_touches"]=gl_targets+gl_carries
+    if (safe_float(out.get("red_zone_touch_share"),0) or 0)<=0 and combined_share is not None and combined_share>0:
+        out["red_zone_touch_share"]=round(clamp(combined_share,0,100),2)
+        out["red_zone_touch_share_is_proxy"]=True
+        out["red_zone_touch_share_source"]="SAVANT_WEIGHTED_RZ_TARGET_CARRY_SHARE"
+    season=int(safe_float(out.get("savant_selected_season"),NFL_LAST_SEASON) or NFL_LAST_SEASON)
+    out["red_zone_data_quality"]="CURRENT_SAVANT_RZ" if season==int(NFL_CURRENT_SEASON) else "PRIOR_SAVANT_RZ"
+    out["red_zone_source_season"]=season
+    out["savant_red_zone_evidence"]=True
+    return out
+
+
 def savant_shadow_projection(row, legacy_projection, season_mode="REGULAR") -> dict:
     """Create a line-independent, bounded shadow projection from Savant composites."""
     projection = max(0.0, _finite(legacy_projection, 0.0) or 0.0)
@@ -1155,8 +1208,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.53 — SELF-CONTAINED VERIFIED NGS + DATA INTEGRITY"
-MODEL_VERSION = "nfl-prop-engine-v7.53.0"
+APP_VERSION = "NFL v7.54 — FINAL DATA SANITY + TD ROLE + READINESS"
+MODEL_VERSION = "nfl-prop-engine-v7.54.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1192,6 +1245,7 @@ INJURY_OVERRIDE_CSV = LOCAL_DIR / "injury_overrides.csv"
 FINAL_INACTIVES_CSV = LOCAL_DIR / "final_inactives.csv"
 ROLE_OVERRIDE_CSV = LOCAL_DIR / "role_overrides.csv"
 DEF_INJURY_OVERRIDE_CSV = LOCAL_DIR / "defensive_injury_overrides.csv"
+ROSTER_AVAILABILITY_FILE = LOCAL_DIR / "nfl_roster_availability.json"
 MANUAL_OVERRIDE_FILE = LOCAL_DIR / "nfl_manual_overrides.json"
 PRESEASON_ROTATION_FILE = LOCAL_DIR / "nfl_preseason_rotations.json"
 PRESEASON_PRIOR_FILE = LOCAL_DIR / "nfl_preseason_efficiency_priors.csv"
@@ -1427,7 +1481,7 @@ NFL_TEAM_ABBRS = {
     "PHI","PIT","SEA","SF","TB","TEN","WSH"
 }
 NFL_TEAM_ALIASES = {
-    "JAC":"JAX", "WAS":"WSH", "OAK":"LV", "SD":"LAC", "STL":"LAR",
+    "JAC":"JAX", "WAS":"WSH", "LA":"LAR", "OAK":"LV", "SD":"LAC", "STL":"LAR",
 }
 NFL_TEAM_NAME_ALIASES = {
     "ARIZONA CARDINALS":"ARI", "ATLANTA FALCONS":"ATL", "BALTIMORE RAVENS":"BAL",
@@ -2546,9 +2600,9 @@ def official_inactives_safety_gate(row, prop=None):
     hard=[]; review=[]
     if nfl_game_phase(row) == "PRESEASON":
         hard.append("Preseason props require a separate workload model and are disabled")
-    player_status=" ".join(str(row.get(k) or "") for k in ["final_inactive_status","inactive_status","injury_status","manual_override_status"]).upper()
+    player_status=" ".join(str(row.get(k) or "") for k in ["final_inactive_status","inactive_status","injury_status","manual_override_status","roster_availability_status"]).upper()
     practice=str(row.get("practice_status") or "").upper()
-    if any(x in player_status for x in ["INACTIVE"," OUT","OUT ","IR","PUP","SUSPENDED","NFI"]):
+    if any(x in player_status for x in ["INACTIVE"," OUT","OUT ","IR","PUP","SUSPENDED","NFI","CUT","WAIVED","RELEASED","RETIRED"]):
         hard.append("Official/player status: inactive or unavailable")
     elif "DOUBTFUL" in player_status:
         hard.append("Player listed doubtful")
@@ -4807,6 +4861,20 @@ def _build_pbp_context(pbp):
     else:
         df["model_drive_result"] = ""
 
+    # Drive numbers reset every game. A season-level nunique(fixed_drive) is therefore
+    # invalid. Always key drives by game_id + drive number so possession rates cannot
+    # collapse to ~1 drive/game or create impossible points/red-zone rates.
+    df["model_drive_key"] = pd.Series([None]*len(df),index=df.index,dtype="object")
+    _drive_ok = df["model_drive"].notna()
+    if _drive_ok.any():
+        if "game_id" in df.columns:
+            df.loc[_drive_ok,"model_drive_key"] = (
+                df.loc[_drive_ok,"game_id"].astype(str) + "::" +
+                df.loc[_drive_ok,"model_drive"].astype(str)
+            )
+        else:
+            df.loc[_drive_ok,"model_drive_key"] = df.loc[_drive_ok,"model_drive"].astype(str)
+
     team_context = {}
     team_rows = []
     if "posteam" in df.columns:
@@ -4847,16 +4915,16 @@ def _build_pbp_context(pbp):
             fourth_conv=float(g.get("fourth_down_converted", pd.Series(dtype=float)).sum()) if "fourth_down_converted" in g.columns else 0.0
             fourth_fail=float(g.get("fourth_down_failed", pd.Series(dtype=float)).sum()) if "fourth_down_failed" in g.columns else 0.0
             rz_tds=float(rz.get("touchdown", pd.Series(dtype=float)).sum()) if not rz.empty and "touchdown" in rz.columns else 0.0
-            rz_drives=max(1.0, float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 1.0)
+            rz_drives=max(1.0, float(rz["model_drive_key"].nunique()) if not rz.empty and "model_drive_key" in rz.columns else float(len(rz))/3.0 if len(rz) else 1.0)
             fg_att=float(g.get("field_goal_attempt", pd.Series(dtype=float)).sum()) if "field_goal_attempt" in g.columns else 0.0
             fg_made=0.0
             if "field_goal_result" in g.columns:
                 fg_made=float(g["field_goal_result"].astype(str).str.upper().isin(["MADE","GOOD"]).sum())
             turnovers=(float(g.get("fumble_lost", pd.Series(dtype=float)).sum()) if "fumble_lost" in g.columns else 0.0) + (float(g.get("interception", pd.Series(dtype=float)).sum()) if "interception" in g.columns else 0.0)
-            drives=max(1, int(g["model_drive"].nunique()) if "model_drive" in g.columns else int(round(gp*10.5)))
+            drives=max(1, int(g["model_drive_key"].nunique()) if "model_drive_key" in g.columns else int(round(gp*10.5)))
             drive_points=0.0
-            if "model_drive_result" in g.columns and "model_drive" in g.columns:
-                dr=g.dropna(subset=["model_drive"]).drop_duplicates(["game_id","model_drive"],keep="last") if "game_id" in g.columns else g.dropna(subset=["model_drive"]).drop_duplicates(["model_drive"],keep="last")
+            if "model_drive_result" in g.columns and "model_drive_key" in g.columns:
+                dr=g.dropna(subset=["model_drive_key"]).drop_duplicates(["model_drive_key"],keep="last")
                 if not dr.empty:
                     results=dr["model_drive_result"].astype(str).str.upper()
                     drive_points=float(results.map(lambda x: 7.0 if "TOUCHDOWN" in x or x=="TD" else 3.0 if "FIELD GOAL" in x or x in {"FG","FIELD_GOAL"} else 2.0 if "SAFETY" in x else 0.0).sum())
@@ -4866,20 +4934,20 @@ def _build_pbp_context(pbp):
                 drive_points=tds*7.0+fg_made*3.0
             # Deep possession / field-position / hidden-yards / game-state features.
             drive_first = pd.DataFrame()
-            if "model_drive" in g.columns:
-                drive_first = g.dropna(subset=["model_drive"]).drop_duplicates(["game_id","model_drive"],keep="first") if "game_id" in g.columns else g.dropna(subset=["model_drive"]).drop_duplicates(["model_drive"],keep="first")
+            if "model_drive_key" in g.columns:
+                drive_first = g.dropna(subset=["model_drive_key"]).drop_duplicates(["model_drive_key"],keep="first")
             start_field=[]
             if not drive_first.empty and "yardline_100_num" in drive_first.columns:
                 start_field=[100-float(x) for x in pd.to_numeric(drive_first["yardline_100_num"],errors="coerce").dropna().tolist()]
             avg_start_own=float(np.mean(start_field)) if start_field else None
             yards_per_drive=float(g.loc[plays_mask,"yards_gained"].sum())/max(1.0,drives) if "yards_gained" in g.columns else None
             plays_per_drive=float(plays)/max(1.0,drives)
-            rz_trip_count=float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 0.0
-            gl_drives=float(gl["model_drive"].nunique()) if not gl.empty and "model_drive" in gl.columns else float(len(gl))/2.0 if len(gl) else 0.0
+            rz_trip_count=float(rz["model_drive_key"].nunique()) if not rz.empty and "model_drive_key" in rz.columns else float(len(rz))/3.0 if len(rz) else 0.0
+            gl_drives=float(gl["model_drive_key"].nunique()) if not gl.empty and "model_drive_key" in gl.columns else float(len(gl))/2.0 if len(gl) else 0.0
             gl_tds=float(gl.get("touchdown",pd.Series(dtype=float)).sum()) if not gl.empty and "touchdown" in gl.columns else 0.0
             fg_settle=0.0
-            if rz_trip_count>0 and "model_drive_result" in rz.columns:
-                rz_last=rz.dropna(subset=["model_drive"]).drop_duplicates(["game_id","model_drive"],keep="last") if "game_id" in rz.columns else rz.dropna(subset=["model_drive"]).drop_duplicates(["model_drive"],keep="last")
+            if rz_trip_count>0 and "model_drive_result" in rz.columns and "model_drive_key" in rz.columns:
+                rz_last=rz.dropna(subset=["model_drive_key"]).drop_duplicates(["model_drive_key"],keep="last")
                 fg_settle=float(rz_last["model_drive_result"].astype(str).str.upper().str.contains("FIELD GOAL|FIELD_GOAL|\bFG\b",regex=True,na=False).sum())
             pressure_events=(float(g.get("qb_hit",pd.Series(dtype=float)).sum()) if "qb_hit" in g.columns else 0.0)+(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)
             pressure_allowed_rate=100*pressure_events/max(1.0,pass_att)
@@ -4977,8 +5045,8 @@ def _build_pbp_context(pbp):
                 "shotgun_rate": round(100*float(g.get("shotgun",pd.Series(dtype=float)).mean()),2) if "shotgun" in g.columns else 0,
                 "no_huddle_rate": round(100*float(g.get("no_huddle",pd.Series(dtype=float)).mean()),2) if "no_huddle" in g.columns else row.get("no_huddle_rate",0),
             })
-            if "model_drive_result" in g.columns and "model_drive" in g.columns:
-                drive_last=g.dropna(subset=["model_drive"]).drop_duplicates(["game_id","model_drive"],keep="last") if "game_id" in g.columns else g.dropna(subset=["model_drive"]).drop_duplicates(["model_drive"],keep="last")
+            if "model_drive_result" in g.columns and "model_drive_key" in g.columns:
+                drive_last=g.dropna(subset=["model_drive_key"]).drop_duplicates(["model_drive_key"],keep="last")
                 results=drive_last["model_drive_result"].astype(str).str.upper()
                 punts=results.str.contains("PUNT",na=False)
                 # A true three-and-out requires drive play count/first-down detail. Use it when present.
@@ -5020,13 +5088,13 @@ def _build_pbp_context(pbp):
             fourth_fail=float(g.get("fourth_down_failed", pd.Series(dtype=float)).sum()) if "fourth_down_failed" in g.columns else 0.0
             rz=g[g["yardline_100_num"].between(1,20,inclusive="both")] if "yardline_100_num" in g.columns else g.iloc[0:0]
             rz_tds=float(rz.get("touchdown",pd.Series(dtype=float)).sum()) if not rz.empty and "touchdown" in rz.columns else 0.0
-            rz_drives=max(1.0,float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 1.0)
+            rz_drives=max(1.0,float(rz["model_drive_key"].nunique()) if not rz.empty and "model_drive_key" in rz.columns else float(len(rz))/3.0 if len(rz) else 1.0)
             takeaways=(float(g.get("fumble_lost",pd.Series(dtype=float)).sum()) if "fumble_lost" in g.columns else 0.0)+(float(g.get("interception",pd.Series(dtype=float)).sum()) if "interception" in g.columns else 0.0)
             def_pass_att=float(pass_mask.sum())
             def_pressure_events=(float(g.get("qb_hit",pd.Series(dtype=float)).sum()) if "qb_hit" in g.columns else 0.0)+(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)
             def_pressure_rate=100*def_pressure_events/max(1.0,def_pass_att)
             def_sack_given_pressure=100*(float(g.get("sack",pd.Series(dtype=float)).sum()) if "sack" in g.columns else 0.0)/max(1.0,def_pressure_events)
-            def_rz_trips=float(rz["model_drive"].nunique()) if not rz.empty and "model_drive" in rz.columns else float(len(rz))/3.0 if len(rz) else 0.0
+            def_rz_trips=float(rz["model_drive_key"].nunique()) if not rz.empty and "model_drive_key" in rz.columns else float(len(rz))/3.0 if len(rz) else 0.0
             def_neutral=g
             if "score_differential" in g.columns:
                 sd=pd.to_numeric(g["score_differential"],errors="coerce")
@@ -5077,7 +5145,11 @@ def _build_pbp_context(pbp):
         ]
         team_totals = {}
         for team, tg in rz.groupby("posteam") if "posteam" in rz.columns else []:
-            team_totals[str(team)] = max(1, len(tg))
+            # Team red-zone opportunity denominator = actual carries + actual targets,
+            # not every red-zone PBP row (timeouts, penalties, spikes, etc.).
+            team_rz_carries = int(tg["rusher_player_name"].notna().sum()) if "rusher_player_name" in tg.columns else 0
+            team_rz_targets = int(tg["receiver_player_name"].notna().sum()) if "receiver_player_name" in tg.columns else 0
+            team_totals[str(team)] = max(1, team_rz_carries + team_rz_targets)
         tmp = {}
         for col, stat in player_sources:
             if col not in rz.columns:
@@ -5109,6 +5181,77 @@ def _build_pbp_context(pbp):
         if "explosive_rush_rate" in trench.columns:
             trench["ol_run_block_proxy_rank"] = trench["explosive_rush_rate"].rank(method="min", ascending=False).astype(int)
     return team_context, team_adv, defense_adv, red_zone, ot, trench
+
+def repair_legacy_drive_context_if_needed(force=False):
+    """One-time migration for v7.53 season-level fixed_drive counting bug.
+
+    Rebuild only PBP-derived fields, preserve every non-PBP baseline field, normalize
+    LA/WAS franchise keys, and fail safe by sanitizing impossible persisted metrics.
+    """
+    raw=load_json(PHASE6_TEAM_CONTEXT_FILE,{}) or load_json(TEAM_CONTEXT_FILE,{})
+    normalized=_normalize_team_context_map(raw)
+    bad=[team for team,ctx in normalized.items() if not _drive_context_sanity(ctx)]
+    missing=sorted(NFL_TEAM_ABBRS-set(normalized))
+    if not force and not bad and not missing:
+        return {"status":"ALREADY_VALID","bad_before":0,"missing_before":[],"teams":len(normalized)}
+    try:
+        pbp=fetch_nflverse_pbp(NFL_LAST_SEASON,force_refresh=False)
+        if pbp is None or pbp.empty:
+            raise RuntimeError("prior-season PBP unavailable")
+        offense, _, defense_adv, red_zone, _, trench=_build_pbp_context(pbp)
+        rebuilt=_normalize_team_context_map(normalized)
+        for team,ctx in (offense or {}).items():
+            tm=_normalize_nfl_team(team)
+            if not tm: continue
+            rec=dict(rebuilt.get(tm) or {})
+            rec.update({k:v for k,v in (ctx or {}).items() if _usable_context_value(v)})
+            rebuilt[tm]=rec
+        if isinstance(defense_adv,pd.DataFrame) and not defense_adv.empty:
+            for _,r in defense_adv.iterrows():
+                tm=_normalize_nfl_team(r.get("team"))
+                if not tm: continue
+                rec=dict(rebuilt.get(tm) or {})
+                for k,v in r.to_dict().items():
+                    if k!="team" and _usable_context_value(v):
+                        rec[k]=v
+                rebuilt[tm]=rec
+        # Validate again before persistence; no impossible drive data is ever saved.
+        final={}
+        for tm,ctx in rebuilt.items():
+            item=dict(ctx)
+            item["team"]=tm
+            item["drive_context_valid"]=_drive_context_sanity(item)
+            item["drive_context_state"]="REBUILT_GAME_DRIVE_KEY" if item["drive_context_valid"] else "REBUILD_INCOMPLETE"
+            if not item["drive_context_valid"]:
+                for key in DRIVE_DERIVED_FIELDS:
+                    item.pop(key,None)
+            final[tm]=item
+        save_json(PHASE6_TEAM_CONTEXT_FILE,final)
+        save_json(TEAM_CONTEXT_FILE,final)
+        # Current pre-Week-1 context is prior-based, so refresh its safe baseline too.
+        current=load_json(CURRENT_TEAM_CONTEXT_FILE,{})
+        current_norm=_normalize_team_context_map(current)
+        for tm,ctx in final.items():
+            cur=dict(current_norm.get(tm) or {})
+            if not cur or not (safe_float(cur.get("current_games"),0) or 0):
+                cur.update(ctx)
+                cur.update({"team":tm,"source_season":NFL_LAST_SEASON,"current_season":NFL_CURRENT_SEASON,"updated_at":now_iso()})
+            current_norm[tm]=cur
+        save_json(CURRENT_TEAM_CONTEXT_FILE,current_norm)
+        bad_after=[team for team,ctx in final.items() if not _drive_context_sanity(ctx)]
+        return {
+            "status":"REPAIRED" if not bad_after else "PARTIAL_REPAIR",
+            "bad_before":len(bad),"bad_after":len(bad_after),
+            "missing_before":missing,"missing_after":sorted(NFL_TEAM_ABBRS-set(final)),
+            "teams":len(final),"pbp_rows":len(pbp),
+            "red_zone_players":len(red_zone) if isinstance(red_zone,pd.DataFrame) else 0,
+        }
+    except Exception as exc:
+        # Do not keep impossible legacy values active if the repair download fails.
+        safe=_sanitize_team_context_map(normalized)
+        save_json(TEAM_CONTEXT_FILE,safe)
+        save_json(PHASE6_TEAM_CONTEXT_FILE,safe)
+        return {"status":"SANITIZED_FALLBACK","bad_before":len(bad),"missing_before":missing,"error":str(exc)[:220]}
 
 def build_phase6_nfl_database(season=NFL_LAST_SEASON, force_refresh=False):
     """Build and persist a full last-season NFL database.
@@ -5540,7 +5683,7 @@ def projection_database_readiness():
         "team_context":_fast_json_items(PHASE6_TEAM_CONTEXT_FILE),
         "player_usage":_fast_csv_data_rows(USAGE_FILE,100),
         "depth_chart":_fast_csv_data_rows(DEPTH_CHART_FILE,100),
-        "injury_players":_fast_json_items(INJURY_FILE),
+        "injury_players":len(load_injury_bank()) if "load_injury_bank" in globals() else _fast_json_items(INJURY_FILE),
     }
     minimums={
         "player_logs":1000,"player_summary":100,"defense_teams":28,
@@ -5548,11 +5691,16 @@ def projection_database_readiness():
         "depth_chart":100,
     }
     missing=[f"{key} {counts[key]}/{minimum}" for key,minimum in minimums.items() if counts[key]<minimum]
-    advisory_minimums={"injury_players":100}
-    warnings=[
-        f"{key} {counts[key]}/{minimum} (advisory only)"
-        for key,minimum in advisory_minimums.items() if counts[key]<minimum
-    ]
+    advisory_minimums={}
+    try:
+        injury_age_h=(time.time()-INJURY_FILE.stat().st_mtime)/3600.0 if INJURY_FILE.exists() else None
+    except Exception:
+        injury_age_h=None
+    warnings=[]
+    if injury_age_h is None:
+        warnings.append("game-week medical source has not been refreshed yet (advisory only)")
+    elif injury_age_h>168:
+        warnings.append(f"game-week medical source is {injury_age_h/24:.1f} days old (advisory only)")
     data={
         "ready":not missing,
         "status":"GAME READY" if not missing else "BLOCKED",
@@ -5761,7 +5909,7 @@ def _normalize_roster_frame(roster):
     out.loc[missing_name, "player"] = (first + " " + last).str.strip()[missing_name]
     out["team"] = _series_from_candidates(
         roster, ["team","recent_team","club_code","club","team_abbr"]
-    ).fillna("").astype(str).str.upper().str.strip()
+    ).fillna("").astype(str).str.upper().str.strip().map(_normalize_nfl_team)
     out["position"] = _series_from_candidates(
         roster, ["position","position_group","depth_chart_position","pos_abb"]
     ).fillna("").astype(str).str.upper().str.strip()
@@ -5809,7 +5957,7 @@ def _normalize_depth_frame(depth, roster_norm):
         base.loc[missing, "player"] = (first + " " + last).str.strip()[missing]
         base["team"] = _series_from_candidates(
             depth, ["club_code","team","recent_team","club","team_abbr"]
-        ).fillna("").astype(str).str.upper().str.strip()
+        ).fillna("").astype(str).str.upper().str.strip().map(_normalize_nfl_team)
         base["position"] = _series_from_candidates(
             depth, ["position","pos_abb","depth_position","position_group"]
         ).fillna("").astype(str).str.upper().str.strip()
@@ -5880,6 +6028,57 @@ def _write_json_template(path, payload=None):
     save_json(path, payload if payload is not None else {})
 
 
+def _compute_ol_continuity(current_roster, prior_season=NFL_LAST_SEASON, force_refresh=False):
+    """Return percentage of last season's top-five OL snap core still on current roster."""
+    out={}
+    try:
+        if current_roster is None or current_roster.empty:
+            return out
+        prev_snaps=fetch_nflverse_snap_counts(int(prior_season),force_refresh=force_refresh)
+        if prev_snaps is None or prev_snaps.empty:
+            return out
+        ps=prev_snaps.copy()
+        pcol=next((c for c in ["player","player_name","pfr_player_name"] if c in ps.columns),None)
+        tcol=next((c for c in ["team","recent_team"] if c in ps.columns),None)
+        poscol=next((c for c in ["position","pos"] if c in ps.columns),None)
+        snapcol=next((c for c in ["offense_snaps","offense","offense_snap_count"] if c in ps.columns),None)
+        pctcol=next((c for c in ["offense_pct","offense_snap_pct","offense_percentage"] if c in ps.columns),None)
+        if not pcol or not tcol:
+            return out
+        ps["_team_norm"]=ps[tcol].map(_normalize_nfl_team)
+        if snapcol:
+            ps["_ol_volume"]=pd.to_numeric(ps[snapcol],errors="coerce").fillna(0)
+        elif pctcol:
+            ps["_ol_volume"]=pd.to_numeric(ps[pctcol],errors="coerce").fillna(0)
+        else:
+            ps["_ol_volume"]=1.0
+        if poscol:
+            ps=ps[ps[poscol].astype(str).str.upper().isin(["C","G","OG","LG","RG","T","OT","LT","RT","OL"])]
+        current_names_by_team={}
+        cr=current_roster.copy()
+        if "position" in cr.columns:
+            cr=cr[cr["position"].astype(str).str.upper().isin(["C","G","OG","LG","RG","T","OT","LT","RT","OL"])]
+        for tm,rg in cr.groupby("team") if "team" in cr.columns else []:
+            tnorm=_normalize_nfl_team(tm)
+            if tnorm:
+                current_names_by_team[tnorm]={norm(x) for x in rg["player"].tolist() if norm(x)}
+        for tm,sg in ps.dropna(subset=["_team_norm"]).groupby("_team_norm"):
+            agg=sg.groupby(pcol)["_ol_volume"].sum().sort_values(ascending=False).head(5)
+            prior=[norm(x) for x in agg.index if norm(x)]
+            if not prior:
+                continue
+            retained=sum(1 for x in prior if x in current_names_by_team.get(tm,set()))
+            out[tm]={
+                "ol_returning_starters_pct":round(100*retained/max(1,len(prior)),1),
+                "ol_returning_core_count":retained,
+                "ol_prior_core_count":len(prior),
+                "ol_continuity_source":f"{prior_season}_snap_core_vs_current_roster",
+            }
+    except Exception as exc:
+        request_log("AUTO_OL_CONTINUITY","ERROR",str(exc)[:180])
+    return out
+
+
 def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_refresh=False):
     """Create every root-level CSV/JSON used by the projection engine.
 
@@ -5894,6 +6093,7 @@ def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_ref
     roster = _normalize_roster_frame(roster_raw)
     depth = _normalize_depth_frame(depth_raw, roster)
     depth.to_csv(DEPTH_CHART_FILE, index=False)
+    preweek_ol_continuity=_compute_ol_continuity(roster,NFL_LAST_SEASON,force_refresh=False)
 
     summary = _read_optional_csv(PHASE6_PLAYER_SUMMARY_FILE)
     logs = _read_optional_csv(PHASE6_PLAYER_LOG_FILE)
@@ -5967,19 +6167,31 @@ def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_ref
         if app_usage_cols:
             summary[app_usage_cols].to_csv(USAGE_FILE, index=False)
 
-    # Current injury hook from roster metadata; live game-week updates may overwrite it.
+    # Separate true medical/practice information from roster transaction/eligibility status.
+    # v7.53 treated CUT/RES/E14/RET as injuries, which inflated injury coverage and could
+    # leak transaction codes into injury-risk logic. Keep both data families, but never mix them.
     injuries = {}
+    roster_availability = {}
     for _, r in roster.iterrows():
-        status = str(r.get("injury_status") or "").strip()
-        practice = str(r.get("practice_status") or "").strip()
-        roster_status = str(r.get("status") or "").strip()
-        if status or practice or (roster_status and roster_status not in {"ACTIVE","ACT"}):
-            injuries[norm(r.get("player"))] = {
+        pkey=norm(r.get("player"))
+        if not pkey:
+            continue
+        status = str(r.get("injury_status") or "").strip().upper()
+        practice = str(r.get("practice_status") or "").strip().upper()
+        roster_status = str(r.get("status") or "").strip().upper()
+        if status or practice:
+            injuries[pkey] = {
                 "player": r.get("player"), "team": r.get("team"),
-                "status": status or roster_status, "practice_status": practice,
-                "updated_at": now_iso(), "source": "current_roster_metadata"
+                "status": status, "practice_status": practice,
+                "updated_at": now_iso(), "source": "current_roster_medical_metadata"
+            }
+        if roster_status and roster_status not in {"ACTIVE","ACT"}:
+            roster_availability[pkey] = {
+                "player":r.get("player"),"team":r.get("team"),"roster_status":roster_status,
+                "updated_at":now_iso(),"source":"current_roster_availability_metadata"
             }
     save_json(INJURY_FILE, injuries)
+    save_json(ROSTER_AVAILABILITY_FILE, roster_availability)
 
     # Quarterback context.
     qb_rows = []
@@ -6020,20 +6232,24 @@ def build_current_season_data_files(current_season=NFL_CURRENT_SEASON, force_ref
     team_context = load_json(PHASE6_TEAM_CONTEXT_FILE, {}) or load_json(TEAM_CONTEXT_FILE, {})
     if isinstance(team_context, dict):
         current_team_context = {}
-        for team, ctx in team_context.items():
-            if team not in NFL_TEAM_ABBRS:
+        normalized_team_context=_sanitize_team_context_map(team_context)
+        for raw_team, ctx in normalized_team_context.items():
+            team=_normalize_nfl_team(raw_team)
+            if not team:
                 continue
             item = dict(ctx) if isinstance(ctx, dict) else {}
+            if team in preweek_ol_continuity:
+                item.update(preweek_ol_continuity[team])
             item.update({"team": team, "source_season": NFL_LAST_SEASON, "current_season": current_season, "updated_at": now_iso()})
             current_team_context[team] = item
         save_json(CURRENT_TEAM_CONTEXT_FILE, current_team_context)
-        if not TEAM_CONTEXT_FILE.exists() or not load_json(TEAM_CONTEXT_FILE, {}):
-            save_json(TEAM_CONTEXT_FILE, team_context)
+        # Persist canonical LA/WAS -> LAR/WSH keys as part of the migration.
+        save_json(TEAM_CONTEXT_FILE, normalized_team_context)
 
     defense = _read_optional_csv(PHASE6_DEFENSE_RANK_FILE)
     defense_map = {}
     if not defense.empty and "team" in defense.columns:
-        defense_map = {str(r.get("team")): r.to_dict() for _, r in defense.iterrows()}
+        defense_map = {_normalize_nfl_team(r.get("team")): r.to_dict() for _, r in defense.iterrows() if _normalize_nfl_team(r.get("team"))}
 
     # 2026 schedule-based travel and matchup rows.
     travel_rows, matchup_rows, personnel_rows = [], [], []
@@ -6506,9 +6722,69 @@ def _lookup_final_inactives(row):
         out["final_inactives_updated_at"]=updated
     return out
 
+DRIVE_DERIVED_FIELDS = {
+    "drives_pg","points_per_drive","yards_per_drive","plays_per_drive","red_zone_trips_pg",
+    "goal_to_go_td_rate","red_zone_fg_settlement_rate","red_zone_td_rate","three_and_out_proxy_rate",
+    "avg_drive_start_own_yardline","def_red_zone_trips_allowed_pg","def_red_zone_td_allowed_rate",
+}
+
+def _normalize_team_context_map(data):
+    out={}
+    if not isinstance(data,dict):
+        return out
+    for raw_team,ctx in data.items():
+        team=_normalize_nfl_team(raw_team)
+        if not team:
+            continue
+        item=dict(ctx) if isinstance(ctx,dict) else {}
+        item["team"]=team
+        # Prefer a canonical current abbreviation over stale LA/WAS keys.
+        if team in out:
+            merged=dict(out[team]); merged.update(item); item=merged
+        out[team]=item
+    return out
+
+def _drive_context_sanity(ctx):
+    """Validate only fields that have football-bounded ranges."""
+    if not isinstance(ctx,dict):
+        return False
+    bounds={
+        "drives_pg":(6.0,18.0),
+        "points_per_drive":(0.0,6.0),
+        "yards_per_drive":(10.0,80.0),
+        "plays_per_drive":(2.0,12.0),
+        "red_zone_td_rate":(0.0,100.0),
+        "goal_to_go_td_rate":(0.0,100.0),
+        "red_zone_fg_settlement_rate":(0.0,100.0),
+        "def_red_zone_td_allowed_rate":(0.0,100.0),
+    }
+    checked=0
+    for key,(lo,hi) in bounds.items():
+        val=safe_float(ctx.get(key))
+        if val is None:
+            continue
+        checked+=1
+        if val < lo or val > hi:
+            return False
+    return checked >= 2
+
+def _sanitize_team_context_map(data):
+    """Never let legacy impossible drive math contaminate live projections."""
+    normalized=_normalize_team_context_map(data)
+    for team,item in normalized.items():
+        valid=_drive_context_sanity(item)
+        item["drive_context_valid"]=bool(valid)
+        if not valid:
+            for key in DRIVE_DERIVED_FIELDS:
+                item.pop(key,None)
+            item["drive_context_state"]="SANITIZED_LEGACY_INVALID"
+        else:
+            item["drive_context_state"]="VALID"
+    return normalized
+
 def load_current_team_context():
     data=load_json(CURRENT_TEAM_CONTEXT_FILE,{})
-    return data if isinstance(data,dict) else {}
+    return _sanitize_team_context_map(data)
 
 def load_weather_context():
     """Optional matchup/team weather JSON.
@@ -7085,7 +7361,7 @@ def enrich_receiving_yards_context(row):
 
 def load_team_context():
     data=load_json(TEAM_CONTEXT_FILE,{})
-    return data if isinstance(data,dict) else {}
+    return _sanitize_team_context_map(data)
 
 def _american_implied_probability(odds):
     odds=safe_float(odds)
@@ -7894,9 +8170,25 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
         cards.append(base)
     return sorted(cards,key=lambda card:(str(card.get("scheduled_at") or "9999"),card.get("matchup","")))
 
+def _injury_record_is_game_week(rec):
+    """Only medical/practice designations belong in injury-risk logic."""
+    if not isinstance(rec,dict):
+        return False
+    source=str(rec.get("source") or "").lower()
+    if source=="verified_manual_injury_override":
+        return True
+    status=" ".join(str(rec.get(k) or "") for k in ["status","injury_status","designation"]).upper()
+    practice=" ".join(str(rec.get(k) or "") for k in ["practice_status","practice_participation"]).upper()
+    note=" ".join(str(rec.get(k) or "") for k in ["injury_note","body_part"]).upper()
+    medical_tokens=("OUT","DOUBTFUL","QUESTIONABLE","INJURED RESERVE","IR","PUP","NFI","INJURY")
+    practice_tokens=("DNP","DID NOT PRACTICE","LIMITED","LP")
+    return bool(any(tok in status for tok in medical_tokens) or any(tok in practice for tok in practice_tokens) or note.strip())
+
 def load_injury_bank():
     data=load_json(INJURY_FILE,{})
-    bank=dict(data) if isinstance(data,dict) else {}
+    raw=dict(data) if isinstance(data,dict) else {}
+    # Migrate/filter old v7.53 roster-only codes (CUT/RES/E14/RET) out of injury coverage.
+    bank={k:v for k,v in raw.items() if _injury_record_is_game_week(v)}
     df=_read_optional_csv(INJURY_OVERRIDE_CSV)
     if not df.empty:
         for _,r in df.iterrows():
@@ -7906,6 +8198,24 @@ def load_injury_bank():
             for k,v in d.items():
                 if _usable_context_value(v): rec[k]=v
             rec["source"]="verified_manual_injury_override"; bank[pkey]=rec
+    return bank
+
+def load_roster_availability_bank():
+    data=load_json(ROSTER_AVAILABILITY_FILE,{})
+    bank=dict(data) if isinstance(data,dict) else {}
+    # Backward-compatible migration from old injury JSON: preserve non-medical roster codes
+    # as availability metadata without treating them as injuries.
+    old=load_json(INJURY_FILE,{})
+    if isinstance(old,dict):
+        for pkey,rec in old.items():
+            if pkey in bank or not isinstance(rec,dict) or _injury_record_is_game_week(rec):
+                continue
+            status=str(rec.get("status") or "").upper().strip()
+            if status:
+                bank[pkey]={
+                    "player":rec.get("player"),"team":rec.get("team"),"roster_status":status,
+                    "updated_at":rec.get("updated_at"),"source":"migrated_legacy_roster_status"
+                }
     return bank
 
 def merge_nfl_context(row):
@@ -8069,13 +8379,24 @@ def merge_nfl_context(row):
     injuries=load_injury_bank()
     inj=injuries.get(norm(row.get("player"))) or injuries.get(str(row.get("player") or ""))
     row["has_injury_context"]=bool(inj)
-    row["injury_context_status"]="MATCHED" if inj else "NOT_LISTED"
+    row["injury_context_status"]="MEDICAL_MATCHED" if inj else "NO_GAME_WEEK_MEDICAL_REPORT"
     if inj and row.get("injury_status") in [None, ""]:
         row["injury_status"] = inj.get("status") if isinstance(inj,dict) else inj
     if isinstance(inj, dict):
         for k in ["practice_status","injury_note","body_part","limited_snap_risk","expected_snap_share"]:
             if _usable_context_value(inj.get(k)):
                 row[k]=inj.get(k)
+
+    roster_rec=load_roster_availability_bank().get(norm(row.get("player")))
+    if isinstance(roster_rec,dict):
+        row["roster_availability_status"]=roster_rec.get("roster_status") or roster_rec.get("status")
+        row["roster_availability_source"]=roster_rec.get("source")
+        _rs=str(row.get("roster_availability_status") or "").upper()
+        if any(tok in _rs for tok in ["CUT","WAIVED","RELEASED","RETIRED","SUSPENDED"]):
+            row["data_integrity_block"]=f"ROSTER AVAILABILITY: {_rs}"
+            row["roster_availability_ready"]=False
+        else:
+            row["roster_availability_ready"]=True
 
     final_inactives=_lookup_final_inactives(row)
     for k,v in final_inactives.items():
@@ -8194,6 +8515,8 @@ def merge_nfl_context(row):
     # workload, or the existing Phase 6/current-week context.
     try:
         row=attach_best_savant_context(row,SAVANT_DIR)
+        if row.get("prop")=="Anytime TD":
+            row=_apply_prior_savant_td_role(row)
     except Exception as exc:
         row.update({
             "savant_status":"MISSING","savant_player_match":False,
@@ -8210,11 +8533,22 @@ def merge_nfl_context(row):
         _rz=safe_float(row.get("red_zone_touch_share"),0) or 0
         _rzc=safe_float(row.get("red_zone_carries"),0) or 0; _rzt=safe_float(row.get("red_zone_targets"),0) or 0
         _games=safe_float(row.get("current_games"),0) or 0
+        _quality=str(row.get("red_zone_data_quality") or "").upper()
         if _rz>0 or _rzc>0 or _rzt>0:
-            quality="CURRENT_PBP" if _games>=1 and str(row.get("red_zone_data_quality") or "").upper()=="CURRENT_PBP" else "PRIOR_PBP"
+            if _games>=1 and _quality=="CURRENT_PBP":
+                quality="CURRENT_PBP"
+            elif "SAVANT" in _quality:
+                quality=_quality
+            elif _quality:
+                quality=_quality
+            else:
+                quality="PRIOR_PBP"
             row["td_role_data_quality"]=quality; row["td_role_data_ready"]=True
+            if str(row.get("data_integrity_block") or "").startswith("TD ROLE DATA MISSING"):
+                row.pop("data_integrity_block",None)
         else:
-            row["data_integrity_block"]="TD ROLE DATA MISSING: no verified current/prior red-zone carry/target/share evidence"
+            if not row.get("data_integrity_block"):
+                row["data_integrity_block"]="TD ROLE DATA MISSING: no verified current/prior red-zone carry/target/share evidence"
             row["td_role_data_quality"]="MISSING"; row["td_role_data_ready"]=False
     row["data_freshness_state"]="CURRENT" if bool(row.get("current_usage_is_true_current")) else "PRIOR_BASED_PRE_WEEK1"
     row["route_data_state"]="CURRENT_ACTUAL" if safe_float(row.get("current_route_participation")) is not None and (safe_float(row.get("current_games"),0) or 0)>=1 else ("PROXY" if _usable_context_value(row.get("route_participation_proxy")) else "PRIOR")
@@ -9720,18 +10054,24 @@ def shared_receiver_opportunity(row, role=None):
         pr=safe_float(row.get("pbp_pass_rate"),safe_float(row.get("pass_rate"),56)) or 56
         attempts=plays*pr/100.0
     games=safe_float(row.get("current_games"),0) or 0
-    route=safe_float(row.get("current_route_participation") if games>=1 else None,
-                     safe_float(row.get("route_participation"),safe_float(row.get("route_participation_proxy"),safe_float(role.get("route"),65))))
-    route_source="CURRENT_ACTUAL" if games>=1 and safe_float(row.get("current_route_participation")) is not None else "PRIOR_ACTUAL"
+    current_route=safe_float(row.get("current_route_participation")) if games>=1 else None
+    prior_route=safe_float(row.get("route_participation"),safe_float(row.get("route_participation_proxy")))
+    route=current_route if current_route is not None else prior_route
+    route_source="CURRENT_ACTUAL" if current_route is not None else ("PRIOR_OR_SAVED_PROXY" if prior_route is not None else "MISSING")
     depth_rank=int(safe_float(row.get("depth_rank"),9) or 9)
     starter=bool(row.get("starter")) or str(row.get("role") or "").upper()=="STARTER" or depth_rank==1
     pre_target_share=safe_float(row.get("current_target_share") if games>=1 else None,safe_float(row.get("target_share"),0)) or 0
     if route is None or (route < 20 and starter and pre_target_share >= 10):
         pos=str(row.get("position") or "").upper()
-        if pos=="WR": route=90 if depth_rank==1 else 78 if depth_rank==2 else 64
-        elif pos=="TE": route=80 if depth_rank==1 else 58
-        elif pos in {"RB","FB"}: route=52 if depth_rank==1 else 32
-        route_source="DEPTH_ROLE_PROXY"
+        proxy=None
+        if pos=="WR": proxy=90 if depth_rank==1 else 78 if depth_rank==2 else 64 if depth_rank<=3 else None
+        elif pos=="TE": proxy=80 if depth_rank==1 else 58 if depth_rank==2 else None
+        elif pos in {"RB","FB"}: proxy=52 if depth_rank==1 else 32 if depth_rank==2 else None
+        if proxy is not None:
+            route=proxy; route_source="DEPTH_ROLE_PROXY"
+    if route is None:
+        route=safe_float(role.get("route"),65) or 65
+        route_source="ROLE_PRIOR_FALLBACK"
     route=clamp(route,5,100)
     routes=attempts*route/100.0
     prior_targets=safe_float(row.get("prior_targets_pg"),safe_float(row.get("targets_pg")))
@@ -12933,6 +13273,7 @@ def _render_phase6_admin():
         st.json(load_json(PHASE6_MANIFEST_FILE, {}))
     if st.button("🛠️ Build / Repair Projection Database", use_container_width=True, key="phase6_use_saved_sidebar"):
         diag = build_phase6_nfl_database(int(season_to_build), force_refresh=False)
+        diag["drive_context_repair"] = repair_legacy_drive_context_if_needed(force=False)
         current_diag = build_current_season_data_files(NFL_CURRENT_SEASON, force_refresh=False)
         diag["current_data"] = current_diag
         try:
@@ -12946,6 +13287,7 @@ def _render_phase6_admin():
         st.json(diag)
     if st.button("🌐 Force Refresh Projection Data", use_container_width=True, key="phase6_force_sidebar"):
         diag = build_phase6_nfl_database(int(season_to_build), force_refresh=True)
+        diag["drive_context_repair"] = repair_legacy_drive_context_if_needed(force=True)
         current_diag = build_current_season_data_files(NFL_CURRENT_SEASON, force_refresh=True)
         diag["current_data"] = current_diag
         try:
@@ -13537,6 +13879,7 @@ def run_game_day_refresh():
     """Explicit one-click preparation: baseline, current context, then live lines."""
     started=time.perf_counter()
     phase6=build_phase6_nfl_database(NFL_LAST_SEASON,force_refresh=False)
+    drive_repair=repair_legacy_drive_context_if_needed(force=False)
     current=build_current_season_data_files(NFL_CURRENT_SEASON,force_refresh=False)
     for cached_fn in [_current_season_context_bank,_online_passing_yards_context_bank,_online_receiving_yards_context_bank]:
         try:
@@ -13564,7 +13907,7 @@ def run_game_day_refresh():
         "ran_at":now_iso(),"seconds":round(time.perf_counter()-started,2),
         "phase6_status":phase6.get("status"),"current_status":current.get("status"),
         "live_rows":len(props),"moneyline_rows":len(moneylines),
-        "database_readiness":readiness,"phase6":phase6,"current":current,
+        "database_readiness":readiness,"phase6":phase6,"drive_context_repair":drive_repair,"current":current,
         "savant_readiness":savant_data_readiness(SAVANT_DIR,NFL_LAST_SEASON),
         "savant_refresh":savant_refresh,
     }
@@ -13844,23 +14187,38 @@ def _render_preseason_rotation_panel():
 
 
 def regular_season_readiness_panel():
-    """Visible regular-season data health panel; never mixes preseason grades."""
+    """Truthful core-vs-live regular-season data health.
+
+    Pre-Week-1 layers that cannot exist yet (2026 game usage / final inactives) are
+    reported separately instead of artificially dragging the historical/core score.
+    """
     db=projection_database_readiness()
     current_players=load_current_usage_bank()
+    prior_players=load_usage_bank()
     current_teams=load_current_team_context()
     depth=load_depth_chart_bank()
     injuries=load_injury_bank()
     finals=load_final_inactives_context()
-    weather=load_weather_context()
-    try:
-        selected=int(NFL_CURRENT_SEASON)
-        savant=_savant_banks(SAVANT_DIR,selected)
-        savant_players=len(savant.get("players",{})); savant_teams=len(savant.get("teams",{}))
-        if not savant_players and not savant_teams:
-            selected=int(NFL_LAST_SEASON); savant=_savant_banks(SAVANT_DIR,selected)
-            savant_players=len(savant.get("players",{})); savant_teams=len(savant.get("teams",{}))
-    except Exception:
-        selected=int(NFL_LAST_SEASON); savant_players=0; savant_teams=0
+
+    true_current=sum(
+        1 for r in current_players.values()
+        if isinstance(r,dict)
+        and (safe_float(r.get("current_games"),0) or 0)>=1
+        and int(safe_float(r.get("source_season"),NFL_CURRENT_SEASON) or NFL_CURRENT_SEASON)==int(NFL_CURRENT_SEASON)
+    )
+    pre_week1=(true_current==0)
+
+    # Savant readiness must count actual required boards, not the outer bank-dict keys.
+    current_savant=savant_data_readiness(SAVANT_DIR,NFL_CURRENT_SEASON)
+    prior_savant=savant_data_readiness(SAVANT_DIR,NFL_LAST_SEASON)
+    if current_savant.get("board_count",0)>0:
+        selected_savant=current_savant
+        savant_label=f"NGS / Savant ({NFL_CURRENT_SEASON}) CURRENT"
+    else:
+        selected_savant=prior_savant
+        savant_label=f"NGS / Savant ({NFL_LAST_SEASON}) PRIOR"
+    savant_required=max(1,int(selected_savant.get("required_count",len(SAVANT_REQUIRED_BOARDS)) or len(SAVANT_REQUIRED_BOARDS)))
+    savant_score=100*int(selected_savant.get("board_count",0) or 0)/savant_required
 
     deep_fields={
         "Possessions":["drives_pg","points_per_drive","yards_per_drive","plays_per_drive","third_down_conversion_rate","red_zone_trips_pg"],
@@ -13869,41 +14227,128 @@ def regular_season_readiness_panel():
         "Game state":["neutral_epa_per_play","neutral_success_rate","neutral_pass_rate","def_neutral_epa_allowed"],
     }
     deep_scores={}
-    if current_teams:
-        for label,fields in deep_fields.items():
-            total=max(1,len(current_teams)*len(fields))
-            have=sum(1 for ctx in current_teams.values() if isinstance(ctx,dict) for f in fields if _usable_context_value(ctx.get(f)))
-            deep_scores[label]=100*have/total
-    else:
-        deep_scores={k:0 for k in deep_fields}
-    route_have=0
-    if current_players:
-        route_have=sum(1 for r in current_players.values() if isinstance(r,dict) and (
-            _usable_context_value(r.get("route_participation")) or _usable_context_value(r.get("route_participation_proxy"))
-        ))
-    skill_score=min(100,100*route_have/max(1,len(current_players))) if current_players else 0
+    for label,fields in deep_fields.items():
+        total=max(1,len(current_teams)*len(fields))
+        have=0
+        for ctx in current_teams.values():
+            if not isinstance(ctx,dict):
+                continue
+            for f in fields:
+                if _usable_context_value(ctx.get(f)):
+                    have+=1
+        deep_scores[label]=100*have/total if current_teams else 0
 
-    checks=[
-        ("Historical core",100 if db.get("ready") else 55),
-        (("Current player usage" if any((safe_float(r.get("current_games"),0) or 0)>=1 for r in current_players.values() if isinstance(r,dict)) else "Current player usage (pre-Week-1 expected 0)"),
-         (min(100,100*sum(1 for r in current_players.values() if isinstance(r,dict) and (safe_float(r.get("current_games"),0) or 0)>=1 and (safe_float(r.get("source_season"),NFL_CURRENT_SEASON) or NFL_CURRENT_SEASON)==NFL_CURRENT_SEASON)/350) if current_players else 0)),
-        ("Current team context",min(100,100*len(current_teams)/32) if current_teams else 0),
-        ("Possession / drive data",deep_scores.get("Possessions",0)),
-        ("OL/DL + pressure data",deep_scores.get("Trenches",0)),
-        ("Hidden yards / special teams",deep_scores.get("Hidden yards",0)),
-        ("Neutral game-state data",deep_scores.get("Game state",0)),
-        ("Skill-role / route coverage",skill_score),
-        ("Depth charts",min(100,100*len(depth)/500) if depth else 0),
-        ("Injuries",min(100,100*len(injuries)/120) if injuries else 0),
-        ("Final inactives",100 if isinstance(finals,dict) and (finals.get("teams") or finals.get("confirmed_matchups")) else 35),
-        (f"NGS / Savant ({selected})" + (" PRIOR" if int(selected)!=int(NFL_CURRENT_SEASON) else " CURRENT"),min(100,55+min(45,savant_teams*1.4)) if savant_players or savant_teams else 0),
-        ("Weather",100 if weather else 55),
+    # Board-relevant route readiness. Count actual/saved route evidence as full,
+    # a current depth-role proxy as partial, and do not grade every fringe roster player.
+    board=(load_last_pulled_board() or {}).get("rows",[]) or []
+    receiving_rows={}
+    for r in board:
+        prop=_canon_prop_label(r.get("prop")) or r.get("prop")
+        if prop not in {"Receiving Yards","Receptions"}:
+            continue
+        if not row_matches_season_mode(r,"REGULAR"):
+            continue
+        key=norm(r.get("player"))
+        if key and key not in receiving_rows:
+            receiving_rows[key]=r
+    route_points=[]
+    if receiving_rows:
+        for key,r in receiving_rows.items():
+            cur=current_players.get(key,{}) if isinstance(current_players,dict) else {}
+            prior=prior_players.get(key,{}) if isinstance(prior_players,dict) else {}
+            d=depth.get(key,{}) if isinstance(depth,dict) else {}
+            route=None
+            for rec in [cur,prior]:
+                if not isinstance(rec,dict):
+                    continue
+                route=safe_float(rec.get("route_participation"),safe_float(rec.get("route_participation_proxy")))
+                if route is not None:
+                    break
+            rank=safe_float(d.get("depth_rank"),99) if isinstance(d,dict) else 99
+            if route is not None:
+                route_points.append(1.0)
+            elif (rank or 99)<=2:
+                route_points.append(0.75)
+            else:
+                route_points.append(0.0)
+    else:
+        # Fallback to likely active skill players, not the entire 899-player roster.
+        for key,rec in current_players.items() if isinstance(current_players,dict) else []:
+            if not isinstance(rec,dict) or str(rec.get("position") or "").upper() not in {"WR","TE","RB","FB"}:
+                continue
+            d=depth.get(key,{}) if isinstance(depth,dict) else {}
+            rank=safe_float(d.get("depth_rank"),99) if isinstance(d,dict) else 99
+            if (rank or 99)>2:
+                continue
+            route=safe_float(rec.get("route_participation"),safe_float(rec.get("route_participation_proxy")))
+            route_points.append(1.0 if route is not None else 0.75)
+    skill_score=100*float(np.mean(route_points)) if route_points else 0
+
+    # Weather readiness is the ability to resolve every game to a stadium/time.
+    # Actual merged forecasts remain fail-soft and are audited per row.
+    weather_games={}
+    for r in board:
+        if not row_matches_season_mode(r,"REGULAR"):
+            continue
+        matchup=str(r.get("matchup") or "")
+        key=matchup or str(r.get("event_id") or r.get("game_id") or "")
+        if not key or key in weather_games:
+            continue
+        home=_weather_home_team(r)
+        when=_weather_game_time(r)
+        weather_games[key]=bool(home in TEAM_STADIUM_COORDS and when is not None)
+    weather_score=100*sum(weather_games.values())/max(1,len(weather_games)) if weather_games else 100*len(TEAM_STADIUM_COORDS)/32
+
+    team_score=min(100,100*len(current_teams)/32) if current_teams else 0
+    depth_score=min(100,100*len(depth)/500) if depth else 0
+
+    core_checks=[
+        ("Historical core",100 if db.get("ready") else 55,0.14),
+        ("Current/prior team coverage",team_score,0.12),
+        ("Possession / drive sanity",deep_scores.get("Possessions",0),0.13),
+        ("OL/DL + pressure",deep_scores.get("Trenches",0),0.13),
+        ("Hidden yards / special teams",deep_scores.get("Hidden yards",0),0.08),
+        ("Neutral game-state",deep_scores.get("Game state",0),0.08),
+        ("Board skill-role / route",skill_score,0.11),
+        ("Depth charts",depth_score,0.08),
+        (savant_label,savant_score,0.09),
+        ("Weather/stadium routing",weather_score,0.04),
     ]
-    # Core/deep modules matter more than optional live hooks in the global score.
-    score=int(round(np.mean([v for _,v in checks]))) if checks else 0
-    deep_floor=min(deep_scores.values()) if deep_scores else 0
-    if deep_floor<35: score=min(score,79)
-    return {"score":score,"checks":checks,"deep_scores":deep_scores,"label":"STRONG" if score>=82 else "USABLE" if score>=70 else "BUILDING"}
+    weight_total=sum(w for _,_,w in core_checks) or 1.0
+    score=int(round(sum(v*w for _,v,w in core_checks)/weight_total))
+
+    # Live layers are separate because zero records can be correct before game week.
+    try:
+        injury_age_h=(time.time()-INJURY_FILE.stat().st_mtime)/3600.0 if INJURY_FILE.exists() else None
+    except Exception:
+        injury_age_h=None
+    injury_source_score=100 if injury_age_h is not None and injury_age_h<=48 else 75 if injury_age_h is not None and injury_age_h<=168 else 35
+    # Before Week 1, a zero-row medical file can be perfectly legitimate. Do not
+    # manufacture a positive/negative readiness grade from file mtime alone.
+    if pre_week1 and not injuries:
+        injury_source_score=None
+    final_confirmed=bool(isinstance(finals,dict) and (finals.get("teams") or finals.get("confirmed_matchups")))
+    final_score=100 if final_confirmed else (None if pre_week1 else 35)
+    current_usage_score=None if pre_week1 else min(100,100*true_current/350)
+    live_checks=[
+        ("2026 game usage",current_usage_score,"PENDING BY DESIGN" if pre_week1 else "LIVE"),
+        ("Game-week medical source",injury_source_score,"PENDING BY DESIGN" if injury_source_score is None else f"{len(injuries)} medical/practice records"),
+        ("Final inactives",final_score,"PENDING BY DESIGN" if pre_week1 and not final_confirmed else "CONFIRMED" if final_confirmed else "PENDING"),
+    ]
+    numeric_live=[v for _,v,_ in live_checks if v is not None]
+    game_day_score=int(round(0.80*score+0.20*np.mean(numeric_live))) if numeric_live else score
+    label="ELITE" if score>=96 else "STRONG" if score>=88 else "USABLE" if score>=75 else "BUILDING"
+    if pre_week1 and score>=90:
+        label="PRE-WEEK-1 READY"
+    return {
+        "score":score,"core_score":score,"game_day_score":game_day_score,
+        "checks":[(name,val) for name,val,_ in core_checks],
+        "live_checks":live_checks,"deep_scores":deep_scores,"label":label,
+        "pre_week1":pre_week1,"true_current_players":true_current,
+        "savant_readiness":selected_savant,"weather_game_count":len(weather_games),
+        "route_candidate_count":len(route_points),
+    }
+
 
 st.markdown(f"""
 <div class='hero-panel'>
@@ -13925,10 +14370,16 @@ if active_season_mode=="PRESEASON":
 else:
     st.caption("Regular-season mode uses the full current NFL workload engine with regular-season-only learning.")
     reg_health=regular_season_readiness_panel()
-    st.markdown(f"**Regular Season Data Readiness: {reg_health['score']}/100 · {reg_health['label']}**")
+    st.markdown(f"**Regular Season Core Data Readiness: {reg_health['core_score']}/100 · {reg_health['label']}**")
+    if reg_health.get("pre_week1"):
+        st.caption("Pre-Week-1: 2026 game usage and final inactives do not exist yet, so they are shown as pending instead of lowering the core data score.")
     with st.expander("Regular-season readiness breakdown",expanded=False):
         st.dataframe(pd.DataFrame([{"Layer":name,"Readiness":round(score,1)} for name,score in reg_health["checks"]]),use_container_width=True,hide_index=True)
-        st.caption("This is a data-health audit only. Preseason results and calibration are excluded from regular-season learning.")
+        live_rows=[{"Live layer":name,"Readiness":"N/A" if score is None else round(score,1),"State":state} for name,score,state in reg_health.get("live_checks",[])]
+        if live_rows:
+            st.markdown("**Live game-week layers**")
+            st.dataframe(pd.DataFrame(live_rows),use_container_width=True,hide_index=True)
+        st.caption("Core score measures usable model data. Live injury/current-season/inactive layers are audited separately. Preseason grades never enter regular-season calibration.")
 
 with st.sidebar:
     st.header("NFL Controls")
@@ -14569,6 +15020,42 @@ def _v749_call_loader(name):
     except Exception as e: return None, str(e)[:500]
 
 
+def _v754_data_sanity_snapshot(merged,banks):
+    current=(banks or {}).get("load_current_team_context") or {}
+    teams=set(current.keys()) if isinstance(current,dict) else set()
+    missing_teams=sorted(NFL_TEAM_ABBRS-teams)
+    invalid_drive=[]
+    drive_samples={}
+    if isinstance(current,dict):
+        for team,ctx in current.items():
+            if not isinstance(ctx,dict):
+                continue
+            if not _drive_context_sanity(ctx):
+                invalid_drive.append(team)
+            drive_samples[team]={
+                k:ctx.get(k) for k in ["drives_pg","plays_per_drive","points_per_drive","yards_per_drive","red_zone_td_rate","def_red_zone_td_allowed_rate","drive_context_state"]
+            }
+    td=[r for r in (merged or []) if r.get("prop")=="Anytime TD"]
+    td_ready=[r for r in td if r.get("td_role_data_ready")]
+    td_quality={}
+    for r in td:
+        q=str(r.get("td_role_data_quality") or "MISSING")
+        td_quality[q]=td_quality.get(q,0)+1
+    weather={}
+    for r in merged or []:
+        src=str(r.get("weather_source") or "MISSING")
+        weather[src]=weather.get(src,0)+1
+    return {
+        "team_context":{"teams":len(teams),"missing":missing_teams,"invalid_drive_teams":sorted(invalid_drive),"samples":drive_samples},
+        "savant_prior":savant_data_readiness(SAVANT_DIR,NFL_LAST_SEASON),
+        "savant_current":savant_data_readiness(SAVANT_DIR,NFL_CURRENT_SEASON),
+        "td_role":{"rows":len(td),"ready":len(td_ready),"blocked":len(td)-len(td_ready),"quality_counts":td_quality},
+        "medical_injury_records":len((banks or {}).get("load_injury_bank") or {}),
+        "roster_availability_records":len((banks or {}).get("load_roster_availability_bank") or {}),
+        "weather_sources":weather,
+    }
+
+
 def _v749_build_audit_zip():
     active_rows = list(globals().get('selected_raw') or [])
     live_rows = list(globals().get('live') or [])
@@ -14588,7 +15075,7 @@ def _v749_build_audit_zip():
         'load_usage_bank','load_current_usage_bank','load_depth_chart_bank','load_role_override_bank','load_market_context_bank',
         'load_travel_context_bank','load_matchup_context_bank','load_qb_context_bank',
         'load_defensive_injury_context','load_final_inactives_context','load_splits_context_bank',
-        'load_personnel_context_bank','load_current_team_context','load_weather_context','load_team_context','load_injury_bank'
+        'load_personnel_context_bank','load_current_team_context','load_weather_context','load_team_context','load_injury_bank','load_roster_availability_bank'
     ]
     banks, loader_errors = {}, {}
     for name in loader_names:
@@ -14624,7 +15111,7 @@ def _v749_build_audit_zip():
         def put(name,obj): z.writestr(name,json.dumps(_v749_audit_safe(obj),indent=2,sort_keys=True))
         put('00_META.json',meta); put('01_LIVE_UNDERDOG_ROWS.json',live_rows); put('02_ACTIVE_ROWS.json',active_rows)
         put('03_MERGED_MODEL_INPUTS.json',merged); put('04_LOADED_DATA_BANKS.json',banks); put('05_LOADER_ERRORS.json',loader_errors)
-        put('06_MERGE_ERRORS.json',merge_errors); put('07_READINESS.json',readiness); put('08_MODEL_SETTINGS.json',settings)
+        put('06_MERGE_ERRORS.json',merge_errors); put('07_READINESS.json',readiness); put('07B_DATA_SANITY.json',_v754_data_sanity_snapshot(merged,banks)); put('08_MODEL_SETTINGS.json',settings)
         _pcache=st.session_state.get('nfl_projection_cache',{})
         put('09_PROJECTION_CACHE.json',_pcache); put('10_MONEYLINE_ROWS.json',globals().get('moneylines',[]))
         _all_proj=[]; _all_err=[]; _seen=set()
@@ -14677,4 +15164,4 @@ with st.sidebar.expander('🧪 FULL LIVE AUDIT DOWNLOAD', expanded=False):
                     st.error(f'Audit failed safely: {str(e)[:600]}')
         if st.session_state.get('v749_audit_blob'):
             _stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
-            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v753_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
+            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v754_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
