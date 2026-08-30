@@ -1103,8 +1103,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.50 — REGULAR DATA INTEGRITY + ROLE ENGINE"
-MODEL_VERSION = "nfl-prop-engine-v7.50.0"
+APP_VERSION = "NFL v7.51 — PRODUCTION DATA + ROLE INTEGRITY"
+MODEL_VERSION = "nfl-prop-engine-v7.51.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1136,6 +1136,10 @@ SPLITS_CONTEXT_FILE = LOCAL_DIR / "nfl_player_splits.csv"
 PERSONNEL_CONTEXT_FILE = LOCAL_DIR / "nfl_personnel_matchups.csv"
 API_CONFIG_FILE = LOCAL_DIR / "nfl_api_config.json"
 FINAL_INACTIVES_FILE = LOCAL_DIR / "nfl_final_inactives.json"
+INJURY_OVERRIDE_CSV = LOCAL_DIR / "injury_overrides.csv"
+FINAL_INACTIVES_CSV = LOCAL_DIR / "final_inactives.csv"
+ROLE_OVERRIDE_CSV = LOCAL_DIR / "role_overrides.csv"
+DEF_INJURY_OVERRIDE_CSV = LOCAL_DIR / "defensive_injury_overrides.csv"
 MANUAL_OVERRIDE_FILE = LOCAL_DIR / "nfl_manual_overrides.json"
 PRESEASON_ROTATION_FILE = LOCAL_DIR / "nfl_preseason_rotations.json"
 PRESEASON_PRIOR_FILE = LOCAL_DIR / "nfl_preseason_efficiency_priors.csv"
@@ -6084,8 +6088,27 @@ def _read_optional_csv(path):
         request_log(path, "CSV_LOAD_ERROR", e)
     return pd.DataFrame()
 
+def _load_prior_red_zone_bank():
+    df=_read_optional_csv(PHASE6_RED_ZONE_FILE)
+    if df.empty: return {}
+    bank={}
+    for _,r in df.iterrows():
+        d={k:r.get(k) for k in df.columns}; pkey=norm(d.get("player"))
+        if not pkey: continue
+        d["red_zone_data_quality"]="PRIOR_PBP"
+        d["red_zone_source_season"]=int(safe_float(d.get("source_season"),NFL_LAST_SEASON) or NFL_LAST_SEASON)
+        bank[pkey]=d
+    return bank
+
 def load_usage_bank():
-    return _records_by_player(USAGE_FILE)
+    base=_records_by_player(USAGE_FILE); rz=_load_prior_red_zone_bank()
+    if not rz: return base
+    out={k:dict(v or {}) for k,v in base.items()}
+    for pkey,r in rz.items():
+        rec=out.setdefault(pkey,{})
+        for k in ["red_zone_touch_share","red_zone_carries","red_zone_targets","red_zone_pass_attempts","goal_line_touches","red_zone_data_quality","red_zone_source_season"]:
+            if _usable_context_value(r.get(k)): rec[k]=r.get(k)
+    return out
 
 def _player_record_quality(row):
     """Prefer a player's full-season/high-volume row over duplicate tiny samples."""
@@ -6158,6 +6181,9 @@ def _lookup_player_record(bank, player, team=None, position=None):
     if len(candidates)>1 and candidates[0][0]==candidates[1][0] and candidates[0][0]==0:
         return {}
     return candidates[0][1]
+
+def load_role_override_bank():
+    return _records_by_player(ROLE_OVERRIDE_CSV)
 
 def load_depth_chart_bank():
     """Optional depth-chart/role file.
@@ -6237,21 +6263,31 @@ def load_qb_context_bank():
 
 def load_defensive_injury_context():
     data=load_json(DEF_INJURY_FILE,{})
-    return data if isinstance(data,dict) else {}
+    out=dict(data) if isinstance(data,dict) else {}
+    df=_read_optional_csv(DEF_INJURY_OVERRIDE_CSV)
+    if not df.empty and "team" in df.columns:
+        for team,g in df.groupby("team"):
+            tm=_normalize_nfl_team(team)
+            if not tm: continue
+            rows=[{k:r.get(k) for k in df.columns} for _,r in g.iterrows()]
+            rec=dict(out.get(tm) or {}); rec["players"]=rows
+            rec["verified_missing_starters"]=sum(1 for d in rows if str(d.get("status") or "").upper() in {"OUT","INACTIVE","IR","DOUBTFUL"})
+            rec["source"]="verified_manual_defensive_injury_override"; out[tm]=rec
+    return out
 
 def load_final_inactives_context():
-    """Optional official inactive confirmation file.
-
-    Expected shape:
-    {
-      "confirmed_matchups": {"BUF @ KC": {"confirmed": true, "updated_at": "..."}},
-      "teams": {"KC": {"confirmed": true, "updated_at": "..."}},
-      "players": {"player name": {"status": "ACTIVE|INACTIVE", "note": "..."}}
-    }
-    Top-level player-name keys are also accepted for quick manual entry.
-    """
     data=load_json(FINAL_INACTIVES_FILE,{})
-    return data if isinstance(data,dict) else {}
+    out=dict(data) if isinstance(data,dict) else {}
+    out.setdefault("players",{}); out.setdefault("teams",{}); out.setdefault("confirmed_matchups",{})
+    df=_read_optional_csv(FINAL_INACTIVES_CSV)
+    if not df.empty:
+        for _,r in df.iterrows():
+            d={k:r.get(k) for k in df.columns}; player=norm(d.get("player")); team=_normalize_nfl_team(d.get("team")); matchup=str(d.get("matchup") or "").upper().strip()
+            confirmed=str(d.get("confirmed") or "").strip().lower() in {"1","true","yes","y"}
+            if player: out["players"][player]={"status":d.get("status") or "","note":d.get("note") or "","team":team,"updated_at":d.get("updated_at") or now_iso(),"source":"verified_manual_final_inactives"}
+            if team and confirmed: out["teams"][team]={"confirmed":True,"updated_at":d.get("updated_at") or now_iso(),"source":"verified_manual_final_inactives"}
+            if matchup and confirmed: out["confirmed_matchups"][matchup]={"confirmed":True,"updated_at":d.get("updated_at") or now_iso(),"source":"verified_manual_final_inactives"}
+    return out
 
 def load_splits_context_bank():
     return _row_key_bank(SPLITS_CONTEXT_FILE, [
@@ -7769,7 +7805,17 @@ def build_moneyline_game_cards(moneyline_rows, prop_rows, team_bank=None, sims=1
 
 def load_injury_bank():
     data=load_json(INJURY_FILE,{})
-    return data if isinstance(data,dict) else {}
+    bank=dict(data) if isinstance(data,dict) else {}
+    df=_read_optional_csv(INJURY_OVERRIDE_CSV)
+    if not df.empty:
+        for _,r in df.iterrows():
+            d={k:r.get(k) for k in df.columns}; pkey=norm(d.get("player"))
+            if not pkey: continue
+            rec=dict(bank.get(pkey) or {})
+            for k,v in d.items():
+                if _usable_context_value(v): rec[k]=v
+            rec["source"]="verified_manual_injury_override"; bank[pkey]=rec
+    return bank
 
 def merge_nfl_context(row):
     """Attach real usage/team/injury context without ever changing the market identity.
@@ -7950,6 +7996,11 @@ def merge_nfl_context(row):
         if _usable_context_value(v):
             row[k]=v
             row["has_depth_chart_context"] = True
+    role_override=_lookup_player_record(load_role_override_bank(),row.get("player"),row.get("team"),row.get("position"))
+    if role_override:
+        for k,v in role_override.items():
+            if k not in {"player","team","position"} and _usable_context_value(v): row[k]=v
+        row["has_verified_role_override"]=True
 
     weather_ctx=_lookup_weather_for_row(row)
     if weather_ctx:
@@ -8067,10 +8118,17 @@ def merge_nfl_context(row):
     if row.get("prop")=="Anytime TD":
         _rz=safe_float(row.get("red_zone_touch_share"),0) or 0
         _rzc=safe_float(row.get("red_zone_carries"),0) or 0; _rzt=safe_float(row.get("red_zone_targets"),0) or 0
-        if _rz<=0 and _rzc<=0 and _rzt<=0:
-            row["data_integrity_block"]="TD ROLE DATA MISSING: no red-zone carry/target/share evidence; TRACK/PASS until populated"
-            row["td_role_data_ready"]=False
-        else: row["td_role_data_ready"]=True
+        _games=safe_float(row.get("current_games"),0) or 0
+        if _rz>0 or _rzc>0 or _rzt>0:
+            quality="CURRENT_PBP" if _games>=1 and str(row.get("red_zone_data_quality") or "").upper()=="CURRENT_PBP" else "PRIOR_PBP"
+            row["td_role_data_quality"]=quality; row["td_role_data_ready"]=True
+        else:
+            row["data_integrity_block"]="TD ROLE DATA MISSING: no verified current/prior red-zone carry/target/share evidence"
+            row["td_role_data_quality"]="MISSING"; row["td_role_data_ready"]=False
+    row["data_freshness_state"]="CURRENT" if bool(row.get("current_usage_is_true_current")) else "PRIOR_BASED_PRE_WEEK1"
+    row["route_data_state"]="CURRENT_ACTUAL" if safe_float(row.get("current_route_participation")) is not None and (safe_float(row.get("current_games"),0) or 0)>=1 else ("PROXY" if _usable_context_value(row.get("route_participation_proxy")) else "PRIOR")
+    row["injury_data_state"]="MATCHED" if row.get("has_injury_context") else "NO_PLAYER_REPORT"
+    row["inactive_data_state"]="CONFIRMED" if row.get("final_inactives_confirmed") is True else "PENDING"
     return row
 
 def apply_real_usage_to_role(row, role):
@@ -9573,6 +9631,16 @@ def shared_receiver_opportunity(row, role=None):
     games=safe_float(row.get("current_games"),0) or 0
     route=safe_float(row.get("current_route_participation") if games>=1 else None,
                      safe_float(row.get("route_participation"),safe_float(row.get("route_participation_proxy"),safe_float(role.get("route"),65))))
+    route_source="CURRENT_ACTUAL" if games>=1 and safe_float(row.get("current_route_participation")) is not None else "PRIOR_ACTUAL"
+    depth_rank=int(safe_float(row.get("depth_rank"),9) or 9)
+    starter=bool(row.get("starter")) or str(row.get("role") or "").upper()=="STARTER" or depth_rank==1
+    pre_target_share=safe_float(row.get("current_target_share") if games>=1 else None,safe_float(row.get("target_share"),0)) or 0
+    if route is None or (route < 20 and starter and pre_target_share >= 10):
+        pos=str(row.get("position") or "").upper()
+        if pos=="WR": route=90 if depth_rank==1 else 78 if depth_rank==2 else 64
+        elif pos=="TE": route=80 if depth_rank==1 else 58
+        elif pos in {"RB","FB"}: route=52 if depth_rank==1 else 32
+        route_source="DEPTH_ROLE_PROXY"
     route=clamp(route,5,100)
     routes=attempts*route/100.0
     prior_targets=safe_float(row.get("prior_targets_pg"),safe_float(row.get("targets_pg")))
@@ -9596,11 +9664,12 @@ def shared_receiver_opportunity(row, role=None):
     conflict=None
     snap=safe_float(row.get("snap_share"))
     pos=str(row.get("position") or "").upper()
-    if route<20 and target_share>=12 and pos in {"WR","TE"}: conflict=f"ROLE DATA CONFLICT: route participation {route:.1f}% vs target share {target_share:.1f}%"
+    if route<20 and target_share>=12 and pos in {"WR","TE"} and route_source!="DEPTH_ROLE_PROXY":
+        conflict=f"ROLE DATA CONFLICT: route participation {route:.1f}% vs target share {target_share:.1f}%"
     if snap is not None and snap>=65 and route<20 and pos in {"WR","TE"}: conflict=f"ROLE DATA CONFLICT: snap share {snap:.1f}% vs route participation {route:.1f}%"
     return {"pass_attempts":attempts,"route_participation":route,"projected_routes":routes,"target_share":target_share,
             "targets_per_route":tprr,"projected_targets":projected_targets,"prior_targets_pg":prior_targets,
-            "current_targets_pg":cur_targets,"current_weight":w,"role_conflict":conflict,"shared_game_opportunity":shared}
+            "current_targets_pg":cur_targets,"current_weight":w,"role_conflict":conflict,"route_source":route_source,"shared_game_opportunity":shared}
 
 def receiving_yards_stat_projection(row, role, cfg):
     """Receiving Yards projection from receiver history + targets × yards/target.
@@ -12361,6 +12430,11 @@ def _render_position_board(rows, position_name):
 
 
 PROJECTION_DATA_TEMPLATES = {
+    "injury_overrides.csv": "player,team,status,practice_status,body_part,expected_snap_share,limited_snap_risk,injury_note,updated_at\n",
+    "final_inactives.csv": "team,matchup,player,status,confirmed,note,updated_at\n",
+    "role_overrides.csv": "player,team,position,snap_share,route_participation,target_share,carries_share,red_zone_touch_share,red_zone_carries,red_zone_targets,goal_line_touches,source,updated_at\n",
+    "defensive_injury_overrides.csv": "team,player,position,depth_rank,status,practice_status,unit,impact_weight,note,updated_at\n",
+
     "nfl_current_player_usage.csv": """player,team,position,snap_share,route_participation,target_share,air_yards_share,red_zone_touch_share,targets_pg,receptions_pg,pass_attempts_pg,completions_pg,receiving_yards_pg,passing_yards_pg,rush_attempts_pg,rushing_yards_pg,yards_per_carry,current_games,last5_targets_pg,last5_receptions_pg,last5_pass_attempts_pg,last5_completions_pg,last5_rush_attempts_pg
 Patrick Mahomes,KC,QB,100,,,,,,,36.8,24.5,,265.4,,,,4,,,37.2,24.9,
 Justin Jefferson,MIN,WR,91,94,29,39,20,9.7,6.4,,,96.2,,,,,4,10.2,6.8,,,
@@ -12666,6 +12740,10 @@ def _render_projection_data_admin():
         ("Player splits", SPLITS_CONTEXT_FILE, ["csv"]),
         ("Personnel matchups", PERSONNEL_CONTEXT_FILE, ["csv"]),
         ("Final inactives", FINAL_INACTIVES_FILE, ["json"]),
+        ("Verified injury overrides", INJURY_OVERRIDE_CSV, ["csv"]),
+        ("Verified final inactives CSV", FINAL_INACTIVES_CSV, ["csv"]),
+        ("Verified role overrides", ROLE_OVERRIDE_CSV, ["csv"]),
+        ("Verified defensive injury overrides", DEF_INJURY_OVERRIDE_CSV, ["csv"]),
         ("Manual news overrides", MANUAL_OVERRIDE_FILE, ["json"]),
         ("API config", API_CONFIG_FILE, ["json"]),
         ("Phase 6 player summary", PHASE6_PLAYER_SUMMARY_FILE, ["csv"]),
@@ -13141,11 +13219,15 @@ def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh
 
     # Current-season play-by-play provides real QB rush decomposition and the
     # team-level possession/trench/special-teams/game-state modules.
-    pbp=pd.DataFrame(); pbp_team_context={}; pbp_player_rush={}
+    pbp=pd.DataFrame(); pbp_team_context={}; pbp_player_rush={}; pbp_red_zone_bank={}
     try:
         pbp=fetch_nflverse_pbp(season, force_refresh=force_refresh)
         if not pbp.empty:
-            pbp_team_context, _, defense_adv, _, _, trench = _build_pbp_context(pbp)
+            pbp_team_context, _, defense_adv, current_red_zone, _, trench = _build_pbp_context(pbp)
+            if isinstance(current_red_zone,pd.DataFrame) and not current_red_zone.empty:
+                for _,rzr in current_red_zone.iterrows():
+                    pkey=(norm(rzr.get("player")),_normalize_nfl_team(rzr.get("team")))
+                    if pkey[0]: pbp_red_zone_bank[pkey]={k:rzr.get(k) for k in current_red_zone.columns}
             # Merge defense rows and trench rows into the same current-team bank.
             if isinstance(pbp_team_context,dict):
                 for _,r in defense_adv.iterrows() if isinstance(defense_adv,pd.DataFrame) and not defense_adv.empty else []:
@@ -13181,10 +13263,12 @@ def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh
         if not player: continue
         g=g.sort_values("week_num"); gp=max(1,len(g)); tail3=g.tail(3); tail5=g.tail(5)
         targets=float(g["targets"].sum()); air=float(g["air_yards"].sum())
-        team_targets=logs[logs["team"].astype(str)==str(team)]["targets"].sum()
-        snap_ctx=snap_bank.get((norm(player),str(team or "")),{})
-        qb_rush=pbp_player_rush.get((norm(player),str(team or "")),{})
-        target_share=round(100*targets/max(1.0,float(team_targets)),2) if team_targets else ""
+        team_slice=logs[logs["team"].astype(str)==str(team)]
+        team_targets=float(team_slice["targets"].sum()); team_air=float(team_slice["air_yards"].sum()) if "air_yards" in team_slice.columns else 0.0; team_carries=float(team_slice["carries"].sum()) if "carries" in team_slice.columns else 0.0
+        snap_ctx=snap_bank.get((norm(player),str(team or "")),{}); qb_rush=pbp_player_rush.get((norm(player),str(team or "")),{}); rz_ctx=pbp_red_zone_bank.get((norm(player),_normalize_nfl_team(team)),{})
+        target_share=round(100*targets/max(1.0,team_targets),2) if team_targets else ""
+        air_yards_share=round(100*air/max(1.0,team_air),2) if team_air else ""
+        carries=float(g["carries"].sum()); carries_share=round(100*carries/max(1.0,team_carries),2) if team_carries else ""
         # A transparent route proxy is retained separately. We do NOT label snap share
         # as actual route participation.
         snap=safe_float(snap_ctx.get("snap_share"))
@@ -13197,7 +13281,8 @@ def _current_week_context_from_nflverse(season=NFL_CURRENT_SEASON, force_refresh
             "snap_share":snap_ctx.get("snap_share",""),"last3_snap_share":snap_ctx.get("last3_snap_share",""),
             "last5_snap_share":snap_ctx.get("last5_snap_share",""),"route_participation":"",
             "route_participation_proxy":route_proxy if route_proxy is not None else "",
-            "target_share":target_share,"air_yards_share":"","red_zone_touch_share":"",
+            "target_share":target_share,"air_yards_share":air_yards_share,"carries_share":carries_share,
+            "red_zone_touch_share":rz_ctx.get("red_zone_touch_share",""),"red_zone_carries":rz_ctx.get("red_zone_carries",""),"red_zone_targets":rz_ctx.get("red_zone_targets",""),"red_zone_pass_attempts":rz_ctx.get("red_zone_pass_attempts",""),"goal_line_touches":rz_ctx.get("goal_line_touches",""),"red_zone_data_quality":"CURRENT_PBP" if rz_ctx else "",
             "targets_pg":round(targets/gp,3),"receptions_pg":round(float(g["receptions"].sum())/gp,3),
             "pass_attempts_pg":round(float(g["attempts"].sum())/gp,3),"completions_pg":round(float(g["completions"].sum())/gp,3),
             "receiving_yards_pg":round(float(g["receiving_yards"].sum())/gp,3),"passing_yards_pg":round(float(g["passing_yards"].sum())/gp,3),
@@ -13602,7 +13687,8 @@ def regular_season_readiness_panel():
 
     checks=[
         ("Historical core",100 if db.get("ready") else 55),
-        ("Current player usage", (min(100,100*sum(1 for r in current_players.values() if isinstance(r,dict) and (safe_float(r.get("current_games"),0) or 0)>=1 and (safe_float(r.get("source_season"),NFL_CURRENT_SEASON) or NFL_CURRENT_SEASON)==NFL_CURRENT_SEASON)/350) if current_players else 0)),
+        (("Current player usage" if any((safe_float(r.get("current_games"),0) or 0)>=1 for r in current_players.values() if isinstance(r,dict)) else "Current player usage (pre-Week-1 expected 0)"),
+         (min(100,100*sum(1 for r in current_players.values() if isinstance(r,dict) and (safe_float(r.get("current_games"),0) or 0)>=1 and (safe_float(r.get("source_season"),NFL_CURRENT_SEASON) or NFL_CURRENT_SEASON)==NFL_CURRENT_SEASON)/350) if current_players else 0)),
         ("Current team context",min(100,100*len(current_teams)/32) if current_teams else 0),
         ("Possession / drive data",deep_scores.get("Possessions",0)),
         ("OL/DL + pressure data",deep_scores.get("Trenches",0)),
@@ -14300,7 +14386,7 @@ def _v749_build_audit_zip():
             merge_errors.append({'player':rr.get('player'),'team':rr.get('team'),'opponent':rr.get('opponent'),'prop':rr.get('prop'),'line':rr.get('line'),'error':str(e)[:500]})
 
     loader_names = [
-        'load_usage_bank','load_current_usage_bank','load_depth_chart_bank','load_market_context_bank',
+        'load_usage_bank','load_current_usage_bank','load_depth_chart_bank','load_role_override_bank','load_market_context_bank',
         'load_travel_context_bank','load_matchup_context_bank','load_qb_context_bank',
         'load_defensive_injury_context','load_final_inactives_context','load_splits_context_bank',
         'load_personnel_context_bank','load_current_team_context','load_weather_context','load_team_context','load_injury_bank'
