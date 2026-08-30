@@ -14250,3 +14250,131 @@ elif active_page == 'Money Line':
 elif active_page == 'Backtest':
     st.markdown("<div class='section-title-pro'>Backtest + Edge Buckets</div>", unsafe_allow_html=True)
     _render_backtest_dashboard(active_season_mode)
+
+
+# MANUAL FULL LIVE AUDIT DOWNLOAD — OFF BY DEFAULT / DIAGNOSTIC ONLY
+# =============================================================================
+def _v749_audit_safe(v, depth=0):
+    if depth > 10: return '<max-depth>'
+    if v is None or isinstance(v, (str, int, bool)): return v
+    if isinstance(v, float): return v if math.isfinite(v) else None
+    if isinstance(v, Path): return str(v)
+    if isinstance(v, (datetime, pd.Timestamp)):
+        try: return v.isoformat()
+        except Exception: return str(v)
+    if isinstance(v, dict): return {str(k): _v749_audit_safe(x, depth+1) for k,x in v.items()}
+    if isinstance(v, (list, tuple, set)): return [_v749_audit_safe(x, depth+1) for x in v]
+    if isinstance(v, pd.DataFrame): return [_v749_audit_safe(x, depth+1) for x in v.to_dict('records')]
+    if isinstance(v, pd.Series): return _v749_audit_safe(v.to_dict(), depth+1)
+    try:
+        if pd.isna(v): return None
+    except Exception: pass
+    try:
+        if isinstance(v, np.integer): return int(v)
+        if isinstance(v, np.floating):
+            x=float(v); return x if math.isfinite(x) else None
+    except Exception: pass
+    return str(v)
+
+
+def _v749_call_loader(name):
+    fn = globals().get(name)
+    if not callable(fn): return None, 'loader unavailable'
+    try: return _v749_audit_safe(fn()), None
+    except Exception as e: return None, str(e)[:500]
+
+
+def _v749_build_audit_zip():
+    active_rows = list(globals().get('selected_raw') or [])
+    live_rows = list(globals().get('live') or [])
+    season_mode = str(globals().get('active_season_mode') or 'REGULAR')
+    merged, merge_errors = [], []
+    merge_fn = globals().get('merge_nfl_context')
+    canon_fn = globals().get('_canon_prop_label')
+    for row in active_rows:
+        rr = dict(row)
+        if callable(canon_fn): rr['prop'] = canon_fn(rr.get('prop')) or rr.get('prop')
+        try:
+            merged.append(_v749_audit_safe(merge_fn(rr) if callable(merge_fn) else rr))
+        except Exception as e:
+            merge_errors.append({'player':rr.get('player'),'team':rr.get('team'),'opponent':rr.get('opponent'),'prop':rr.get('prop'),'line':rr.get('line'),'error':str(e)[:500]})
+
+    loader_names = [
+        'load_usage_bank','load_current_usage_bank','load_depth_chart_bank','load_market_context_bank',
+        'load_travel_context_bank','load_matchup_context_bank','load_qb_context_bank',
+        'load_defensive_injury_context','load_final_inactives_context','load_splits_context_bank',
+        'load_personnel_context_bank','load_current_team_context','load_weather_context','load_team_context','load_injury_bank'
+    ]
+    banks, loader_errors = {}, {}
+    for name in loader_names:
+        data, err = _v749_call_loader(name)
+        banks[name] = data
+        if err: loader_errors[name] = err
+
+    readiness = {}
+    for key, fn_name in [('projection_database','projection_database_readiness'),('regular_season','regular_season_readiness_panel')]:
+        fn=globals().get(fn_name)
+        if callable(fn):
+            try: readiness[key]=_v749_audit_safe(fn())
+            except Exception as e: readiness[key]={'error':str(e)[:500]}
+
+    meta = {
+        'generated_at': globals().get('now_iso', lambda: datetime.now().isoformat())(),
+        'diagnostic_only': True, 'season_mode': season_mode,
+        'app_version': globals().get('APP_VERSION'), 'model_version': globals().get('MODEL_VERSION'),
+        'current_season': globals().get('NFL_CURRENT_SEASON'), 'prior_season': globals().get('NFL_LAST_SEASON'),
+        'live_rows': len(live_rows), 'active_rows': len(active_rows), 'merged_rows': len(merged),
+        'merge_errors': len(merge_errors), 'active_markets': sorted(list(globals().get('ACTIVE_NFL_MARKETS') or [])),
+    }
+    settings = {
+        'PROP_CONFIG': _v749_audit_safe(globals().get('PROP_CONFIG',{})),
+        'ROLE_SAFETY_MINIMUMS': _v749_audit_safe(globals().get('ROLE_SAFETY_MINIMUMS',{})),
+        'session_settings': {k:_v749_audit_safe(st.session_state.get(k)) for k in [
+            'primary_lines_only','team_volume_reconciliation_enabled','advanced_sim_assist_enabled','smart_calibration_enabled'
+        ]}
+    }
+
+    buf=io.BytesIO()
+    with zipfile.ZipFile(buf,'w',zipfile.ZIP_DEFLATED,allowZip64=True) as z:
+        def put(name,obj): z.writestr(name,json.dumps(_v749_audit_safe(obj),indent=2,sort_keys=True))
+        put('00_META.json',meta); put('01_LIVE_UNDERDOG_ROWS.json',live_rows); put('02_ACTIVE_ROWS.json',active_rows)
+        put('03_MERGED_MODEL_INPUTS.json',merged); put('04_LOADED_DATA_BANKS.json',banks); put('05_LOADER_ERRORS.json',loader_errors)
+        put('06_MERGE_ERRORS.json',merge_errors); put('07_READINESS.json',readiness); put('08_MODEL_SETTINGS.json',settings)
+        put('09_PROJECTION_CACHE.json',st.session_state.get('nfl_projection_cache',{})); put('10_MONEYLINE_ROWS.json',globals().get('moneylines',[]))
+        # Actual loaded Savant/NGS pack used by the app, current + prior season.
+        savant_dir=globals().get('SAVANT_DIR'); pack_fn=globals().get('load_savant_pack'); manifest_fn=globals().get('load_savant_manifest')
+        if callable(manifest_fn) and savant_dir is not None:
+            try: put('11_SAVANT_MANIFEST.json',manifest_fn(savant_dir))
+            except Exception as e: z.writestr('11_SAVANT_MANIFEST_ERROR.txt',str(e))
+        if callable(pack_fn) and savant_dir is not None:
+            for label,season in [('current',globals().get('NFL_CURRENT_SEASON')),('prior',globals().get('NFL_LAST_SEASON'))]:
+                try:
+                    pack=pack_fn(savant_dir,season=season) or {}
+                    pmeta={}
+                    for board,frame in pack.items():
+                        if isinstance(frame,pd.DataFrame):
+                            safe_name=re.sub(r'[^a-z0-9_-]+','_',str(board).lower())
+                            z.writestr(f'savant_loaded/{label}_{safe_name}.csv',frame.to_csv(index=False))
+                            pmeta[str(board)]={'rows':len(frame),'columns':list(frame.columns)}
+                    put(f'savant_loaded/{label}_pack_meta.json',pmeta)
+                except Exception as e: z.writestr(f'savant_loaded/{label}_ERROR.txt',str(e))
+    return buf.getvalue(), meta
+
+
+with st.sidebar.expander('🧪 FULL LIVE AUDIT DOWNLOAD', expanded=False):
+    st.caption('OFF by default. Diagnostic export only — it does not change projection formulas or run automatically.')
+    _v749_audit_on = st.toggle('Enable audit download', value=False, key='v749_manual_audit_toggle')
+    if _v749_audit_on:
+        st.caption('One ZIP: live lines + merged model inputs + current/prior usage + team/opponent/depth/injury/weather + Savant/NGS + readiness/config/cache.')
+        if st.button('BUILD AUDIT ZIP', use_container_width=True, key='v749_build_audit_zip'):
+            with st.spinner('Building one audit ZIP from the data loaded by the app…'):
+                try:
+                    _blob,_meta=_v749_build_audit_zip()
+                    st.session_state['v749_audit_blob']=_blob
+                    st.session_state['v749_audit_meta']=_meta
+                    st.success(f"Audit ready · {_meta.get('active_rows',0)} active rows · {_meta.get('merged_rows',0)} merged")
+                except Exception as e:
+                    st.error(f'Audit failed safely: {str(e)[:600]}')
+        if st.session_state.get('v749_audit_blob'):
+            _stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
+            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v749_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
