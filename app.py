@@ -1208,8 +1208,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.54 — FINAL DATA SANITY + TD ROLE + READINESS"
-MODEL_VERSION = "nfl-prop-engine-v7.54.0"
+APP_VERSION = "NFL v7.55 — STRICT MARKET IDENTITY + FINAL DATA SANITY"
+MODEL_VERSION = "nfl-prop-engine-v7.55.0"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -2947,6 +2947,20 @@ def _normalized_market_text(value):
     text = re.sub(r"[^a-z0-9+]+", " ", text)
     return " ".join(text.split())
 
+# Markets that look similar to supported props but require different equations.
+# Never coerce these into a simpler market just because words overlap.
+UNSUPPORTED_MARKET_PATTERNS = (
+    r"\blongest completion\b",
+    r"\bpass(?:ing)? \+ rush(?:ing)? yards\b",
+    r"\brush(?:ing)? \+ (?:rec|receiving) yards\b",
+    r"\b(?:first|last) td scorer\b",
+    r"\b(?:first|last) touchdown scorer\b",
+)
+
+def _is_unsupported_market_label(value):
+    text=_normalized_market_text(value)
+    return bool(text) and any(re.search(p,text) for p in UNSUPPORTED_MARKET_PATTERNS)
+
 def _is_full_game_market_label(value):
     """Reject quarter, half, drive and season markets before stat projection."""
     text=_normalized_market_text(value)
@@ -2973,6 +2987,8 @@ def _market_alias_matches(text, alias):
 
 def prop_name_from_blob(blob):
     b = _normalized_market_text(blob)
+    if _is_unsupported_market_label(b):
+        return None
     # Match the longest/specific aliases first.  This prevents e.g.
     # 'Longest Reception' from being routed to plain 'Receptions'.
     candidates=[]
@@ -3384,15 +3400,25 @@ def _extract_line_value_v2(prop, *objs):
     return _extract_line_value_for_prop(prop, *objs)
 
 def _prop_from_objs(*objs):
-    # Prefer explicit stat/display labels over whole blob so TD promos do not hijack markets.
-    keys=["stat", "stat_type", "stat_type_name", "display_stat", "appearance_stat", "label", "title", "name", "description"]
+    # Explicit labels are authoritative. Do not let a whole-object blob remap a
+    # combo/alternate stat into a supported market because of overlapping words.
+    keys=["display_stat","stat_type_name","stat","stat_type","label","title","name","description"]
+    saw_explicit=False
     for o in objs:
         if not isinstance(o, dict):
             continue
-        text=" ".join([str(o.get(k) or "") for k in keys])
-        prop=prop_name_from_blob(text)
-        if prop:
-            return prop
+        for k in keys:
+            val=o.get(k)
+            if val is None or not str(val).strip():
+                continue
+            saw_explicit=True
+            if _is_unsupported_market_label(val):
+                return None
+            prop=_canon_prop_label(val)
+            if prop:
+                return prop
+    if saw_explicit:
+        return None
     return prop_name_from_blob(" ".join(_blob(o) for o in objs if isinstance(o, dict)))
 
 def _is_probably_nfl_underdog(*objs):
@@ -3539,10 +3565,12 @@ def _extract_underdog_jsonapi_rows(data, source_url):
         player=_get_related(appearance, by_id, by_type, "player") or _get_related(app_stat, by_id, by_type, "player") or _get_related(ou, by_id, by_type, "player")
         game=_get_related(appearance, by_id, by_type, "game", "match", "event") or _get_related(ou, by_id, by_type, "game", "match", "event")
         combo=[line_obj, ou, app_stat, appearance, player, game]
-        prop=_prop_from_objs(*combo)
+        explicit_market_label=_pick_first_string([app_stat,ou,line_obj],["display_stat","stat_type_name","stat","title","label","name"])
+        if _is_unsupported_market_label(explicit_market_label):
+            continue
+        prop=_canon_prop_label(explicit_market_label) if explicit_market_label else _prop_from_objs(*combo)
         if not prop or prop not in PROP_CONFIG:
             continue
-        explicit_market_label=_pick_first_string([app_stat,ou,line_obj],["display_stat","stat_type_name","stat","title","label","name"])
         if not _is_full_game_market_label(explicit_market_label):
             continue
         line=_extract_line_value_v2(prop, line_obj, ou, app_stat)
@@ -3569,6 +3597,8 @@ def _extract_underdog_jsonapi_rows(data, source_url):
             "home_away": _pick_first_string(combo,["home_away", "home_or_away"]),
             "position": position or "",
             "prop": prop,
+            "raw_prop_label": str(explicit_market_label or ""),
+            "line_title": _pick_first_string([line_obj,ou],["title","display_title","label","name"]),
             "line": line,
             "price": _extract_price(line_obj) or _extract_price(ou),
             "source":"Underdog",
@@ -3610,52 +3640,61 @@ def fetch_underdog_nfl_props(cache_bust=0):
         rows.extend(native_rows)
 
         rel_rows=[]; rel_diag={}
-        try:
-            rel_rows, rel_diag = _extract_underdog_jsonapi_rows(data, url)
-        except Exception as e:
-            rel_diag={"relationship_parser_error": str(e)[:220]}
-            rel_rows=[]
-        rows.extend(rel_rows)
+        # The current v6 parser carries explicit market identity and is authoritative.
+        # Relationship/recursive fallbacks are only used when native v6 yields no rows;
+        # mixing parser families caused combo markets to be duplicated into wrong props.
+        if not native_rows:
+            try:
+                rel_rows, rel_diag = _extract_underdog_jsonapi_rows(data, url)
+            except Exception as e:
+                rel_diag={"relationship_parser_error": str(e)[:220]}
+                rel_rows=[]
+            rows.extend(rel_rows)
 
-        # Old flat fallback catches endpoints where line/player/prop are nested together.
+        # Old flat fallback is last resort only when native + relationship parsers fail.
         objects=flatten(data)
         player_bank=_collect_player_bank(objects)
         flat_rows=[]
-        for o in objects:
-            if not isinstance(o, dict):
-                continue
-            blob=_blob(o)
-            if not looks_nfl(o):
-                continue
-            prop=prop_name_from_blob(blob)
-            if not prop or prop not in PROP_CONFIG:
-                continue
-            explicit_market_label=_first_existing(o,["display_stat","stat_type_name","stat","title","label","name","description"])
-            if not _is_full_game_market_label(explicit_market_label):
-                continue
-            line=_extract_line_value_for_prop(prop, o)
-            if line is None or not _valid_market_line(prop, line):
-                continue
-            player=_extract_player_from_obj(o, player_bank)
-            if not player or player.lower() in ["unknown player", "over", "under"]:
-                continue
-            team, position = _extract_team_pos(o, player, player_bank)
-            flat_rows.append({
-                "player":str(player),
-                "team":team,
-                "opp":o.get("opponent") or o.get("opp") or "",
-                "home_away":str(o.get("home_away") or o.get("home_or_away") or ""),
-                "position":position,
-                "prop":prop,
-                "line":line,
-                "price":_extract_price(o),
-                "source":"Underdog",
-                "source_url":url,
-                "matchup":_extract_matchup(o),
-                "underdog_id":str(o.get("id") or o.get("over_under_line_id") or ""),
-                "scheduled_at":o.get("scheduled_at") or o.get("starts_at") or o.get("start_time"),
-                "season_type":o.get("season_type") or o.get("game_type") or o.get("event_type") or "",
-            })
+        if not native_rows and not rel_rows:
+            for o in objects:
+                if not isinstance(o, dict):
+                    continue
+                blob=_blob(o)
+                if not looks_nfl(o):
+                    continue
+                explicit_market_label=_first_existing(o,["display_stat","stat_type_name","stat","title","label","name","description"])
+                if not explicit_market_label or _is_unsupported_market_label(explicit_market_label):
+                    continue
+                prop=_canon_prop_label(explicit_market_label)
+                if not prop or prop not in PROP_CONFIG:
+                    continue
+                if not _is_full_game_market_label(explicit_market_label):
+                    continue
+                line=_extract_line_value_for_prop(prop, o)
+                if line is None or not _valid_market_line(prop, line):
+                    continue
+                player=_extract_player_from_obj(o, player_bank)
+                if not player or player.lower() in ["unknown player", "over", "under"]:
+                    continue
+                team, position = _extract_team_pos(o, player, player_bank)
+                flat_rows.append({
+                    "player":str(player),
+                    "team":team,
+                    "opp":o.get("opponent") or o.get("opp") or "",
+                    "home_away":str(o.get("home_away") or o.get("home_or_away") or ""),
+                    "position":position,
+                    "prop":prop,
+                    "raw_prop_label":str(explicit_market_label),
+                    "line_title":str(o.get("title") or ""),
+                    "line":line,
+                    "price":_extract_price(o),
+                    "source":"Underdog",
+                    "source_url":url,
+                    "matchup":_extract_matchup(o),
+                    "underdog_id":str(o.get("id") or o.get("over_under_line_id") or ""),
+                    "scheduled_at":o.get("scheduled_at") or o.get("starts_at") or o.get("start_time"),
+                    "season_type":o.get("season_type") or o.get("game_type") or o.get("event_type") or "",
+                })
         rows.extend(flat_rows)
 
         url_rows=len(native_rows)+len(rel_rows)+len(flat_rows)
@@ -3783,9 +3822,15 @@ def load_last_pulled_moneylines():
 
 
 def _canon_prop_label(value):
-    """Normalize Underdog/manual market labels into the app's canonical prop names."""
+    """Normalize only supported Underdog/manual market labels into canonical props.
+
+    Similar-but-different markets (combo yardage, longest completion, first/last TD
+    scorer) are deliberately rejected instead of being coerced into another model.
+    """
     raw = str(value or "").strip()
     if not raw:
+        return None
+    if _is_unsupported_market_label(raw):
         return None
     b = _normalized_market_text(raw)
     # Highest-confidence direct mappings first. Underdog uses labels like Pass Yards,
@@ -15128,6 +15173,12 @@ def _v749_build_audit_zip():
         put('09B_ALL_CACHED_PROJECTIONS.json',_all_proj)
         put('09C_PROJECTION_ERRORS_ALL.json',_all_err)
         put('09D_PROJECTION_MARKET_COUNTS.json',_market_counts)
+        _identity_bad=[]
+        for _r in list(globals().get('raw',[]) or []):
+            _lab=str(_r.get('raw_prop_label') or _r.get('line_title') or '')
+            if not _lab or _is_unsupported_market_label(_lab):
+                _identity_bad.append({'player':_r.get('player'),'prop':_r.get('prop'),'line':_r.get('line'),'raw_prop_label':_r.get('raw_prop_label'),'line_title':_r.get('line_title')})
+        put('09E_MARKET_IDENTITY_SANITY.json',{'active_rows':len(globals().get('raw',[]) or []),'unsupported_or_unlabeled_rows':len(_identity_bad),'rows':_identity_bad})
         # Actual loaded Savant/NGS pack used by the app, current + prior season.
         savant_dir=globals().get('SAVANT_DIR'); pack_fn=globals().get('load_savant_pack'); manifest_fn=globals().get('load_savant_manifest')
         if callable(manifest_fn) and savant_dir is not None:
@@ -15164,4 +15215,4 @@ with st.sidebar.expander('🧪 FULL LIVE AUDIT DOWNLOAD', expanded=False):
                     st.error(f'Audit failed safely: {str(e)[:600]}')
         if st.session_state.get('v749_audit_blob'):
             _stamp=datetime.now().strftime('%Y%m%d_%H%M%S')
-            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v754_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
+            st.download_button('⬇️ DOWNLOAD AUDIT ZIP',data=st.session_state['v749_audit_blob'],file_name=f'nfl_v755_full_live_audit_{_stamp}.zip',mime='application/zip',use_container_width=True,key='v749_download_audit_zip')
