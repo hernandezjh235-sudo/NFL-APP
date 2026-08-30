@@ -1103,8 +1103,8 @@ def build_savant_backup_zip(savant_dir) -> bytes:
                 archive.write(path, path.relative_to(root))
     return buffer.getvalue()
 
-APP_VERSION = "NFL v7.51.1 — PRODUCTION PACK AUTO-ROUTE + ROLE INTEGRITY"
-MODEL_VERSION = "nfl-prop-engine-v7.51.1"
+APP_VERSION = "NFL v7.51.2 — PRODUCTION PACK AUTO-ROUTE + ROLE INTEGRITY"
+MODEL_VERSION = "nfl-prop-engine-v7.51.2"
 LOCAL_DIR = Path(os.getenv("STORAGE_DIR", "nfl_engine"))
 LOCAL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -13679,9 +13679,9 @@ def _render_nfl_savant_admin():
             try: rows=len(pd.read_csv(p))
             except Exception: rows=0
         override_status.append({"override_file":fn,"installed":p.exists(),"rows":rows})
-    with st.expander("Production override pack status",expanded=False):
-        st.dataframe(pd.DataFrame(override_status),use_container_width=True,hide_index=True)
-        st.caption("0 rows is valid for a blank template. Only verified real rows should be added; blank templates do not raise readiness by themselves.")
+    st.markdown("**Production override pack status**")
+    st.dataframe(pd.DataFrame(override_status),use_container_width=True,hide_index=True)
+    st.caption("0 rows is valid for a blank template. Only verified real rows should be added; blank templates do not raise readiness by themselves.")
 
 def _render_preseason_rotation_panel():
     st.caption("Coach-plan inputs own preseason workload. Saved shares are reconciled within each position room.")
